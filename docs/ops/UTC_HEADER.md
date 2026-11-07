@@ -65,7 +65,7 @@ Policy items:
 7. ~~**Hello-enforce height for 2300**~~ — **rule signed off 2026-11-07; value not baked.** Same arming commit sets `TESTNET_2300_UTC_HELLO_ENFORCE_FROM_HEIGHT = H_utc − 1_000` (`T + B`). Env overrides stay ignored on 2300. Stays `u64::MAX` in this PR.
 8. ~~**Exact skew signoff**~~ — **DONE (2026-11-07):** 5_000 ms ahead / 60_000 ms behind. Parent monotonicity (child ≥ parent, equal allowed) remains PROPOSED.
 9. ~~**Hello lead window signoff**~~ — **DONE (2026-11-07):** `PROPOSED_UTC_HELLO_LEAD_BLOCKS = 1_000`.
-10. ~~**Release tag / version bump**~~ — **bumped 2026-11-07:** UTC shipped as `2.11.0`. Follow-up `2.11.1` (installer wire-compat for later 2.x, drop dead seed `:19311`). Do not arm 2300.
+10. ~~**Release tag / version bump**~~ — **bumped 2026-11-07:** UTC shipped as `2.11.0`. Follow-up `2.11.1` (installer wire-compat for later 2.x, drop dead seed `:19311`). Follow-up `2.11.2` (unicast recert assist, one help per peer per height). Do not arm 2300.
 
 Downstream (not consensus): explorer 1970 fix (P0, faucet #187), permanent fill IDs + cursor API (P2), public height+hash→UTC API (P3, after live H_utc), Crypto candles (P4; #618 must not claim `utc_committed`).
 
@@ -92,7 +92,7 @@ Recommended operational order: ship this unarmed binary (optional quiet window w
 | Skew numbers (5s ahead / 60s behind) | **signed off 2026-11-07** (unused until armed) |
 | Hello lead window (1_000 blocks) | **signed off 2026-11-07** (unused until Hello-enforce is armed) |
 | Arming heights | **rule signed off** (`H_utc = T+1000+B`, enforce = `H_utc-1000`); not baked |
-| Release tag | **2.11.0 shipped;** follow-up `2.11.1` (installer wire-compat + drop `:19311`) |
+| Release tag | **2.11.0 shipped;** follow-up `2.11.1` (installer wire-compat + drop `:19311`); follow-up `2.11.2` (recert-assist unicast) |
 | Market API / candles ready | **no** |
 | Safe to merge as draft for review | intended |
 | Safe to deploy / arm | **no** |

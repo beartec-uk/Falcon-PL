@@ -12,7 +12,7 @@ default-members = ["crates/fd-pl"]
 exclude = ["tools/bitvm-c1b-export", "vendor/BitVM", "vendor/BitVM/*"]
 
 [workspace.package]
-version = "2.11.1"
+version = "2.11.2"
 edition = "2021"
 license = "LicenseRef-All-Rights-Reserved"
 authors = ["BEARTEC"]

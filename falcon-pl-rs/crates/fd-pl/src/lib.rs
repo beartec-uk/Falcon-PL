@@ -384,7 +384,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.1";
+pub const PRODUCT_VERSION: &str = "2.11.2";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -16675,8 +16675,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.1");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.1");
+        assert_eq!(PRODUCT_VERSION, "2.11.2");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.2");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
