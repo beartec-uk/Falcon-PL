@@ -229,7 +229,7 @@
 //!   3 < 4, the cert-less round-0 proposer looped "no tip cert", and the
 //!   cert-less seats (by design) do not vote view-change: 3 VC voters < 4.
 //!   Cert holders now answer a peer's recert vote for their tip with their
-//!   own recert vote ([`Node::recert_assist`], re-sent every 3 s at most).
+//!   own recert vote ([`Node::recert_assist`], unicast once per asking seat per height).
 //! - **v2.9.58 "lean node":** local only — the state root, wire format, vote
 //!   payloads and certs are byte-identical; no activation height.
 //!   (a) The commitment root no longer re-encodes and re-hashes the ~199 MB
@@ -3495,6 +3495,10 @@ pub struct Node {
     /// peer's recert round for our tip (see [`Self::recert_assist`]). Local.
     pub recert_assist_h: u64,
     pub recert_assist_ms: u64,
+    /// Voters already given a recert assist at [`Self::recert_assist_h`].
+    /// One help per peer per height (827004 stall); cleared when the tip
+    /// height changes. Local only, never snapshotted.
+    pub recert_assist_peers: BTreeSet<String>,
     /// v2.9.79 (671185 stall): signed OKs for **our committed tip** seen on the
     /// wire while we hold no cert for it, keyed round → voter → sig. Lets a
     /// cert-less seat rebuild the original cert from the tip's own sealing
@@ -3878,6 +3882,7 @@ impl Node {
             evicted_since_last_seal: false,
             recert_assist_h: 0,
             recert_assist_ms: 0,
+            recert_assist_peers: BTreeSet::new(),
             tip_cert_votes: BTreeMap::new(),
             tip_cert_votes_h: 0,
             tip_roots: None,
@@ -13233,10 +13238,16 @@ impl Node {
     /// round topped out at 3 < 4 votes forever, the cert-less round-0
     /// proposer could not pack, and cert-less seats may not vote view-change.
     /// Cert holders now join the recert round for their tip (same hash, own
-    /// round slot, so never equivocation), re-sent at most every
-    /// [`Self::RECERT_ASSIST_EVERY_MS`] while peers keep asking.
+    /// round slot, so never equivocation). The node binary unicasts that vote
+    /// plus [`Self::tip_cert_relay`] OKs to the asking seat only. Each voter
+    /// is assisted at most once per tip height (the old global
+    /// [`Self::RECERT_ASSIST_EVERY_MS`] resend filled the Vote lane at
+    /// h=827004 and starved view-change).
     ///
-    /// Returns `(height, hash, signature)` of our recert vote to fan.
+    /// Returns `(height, hash, signature)` of our recert vote to unicast
+    /// to `voter`. `None` for a non-recert round, wrong hash, cert-less
+    /// local seat, a voter we did not record as asking, or a voter already
+    /// assisted at this height.
     pub fn recert_assist(&mut self, ledger_hash: &str, round: u64, voter: &str) -> Option<(u64, String, String)> {
         if round != Self::RECERT_ROUND || voter == self.id || self.tip_height == 0 {
             return None;
@@ -13264,9 +13275,11 @@ impl Node {
         if !self.eligible_voter(&me) {
             return None;
         }
-        if self.recert_assist_h == h
-            && self.now_ms.saturating_sub(self.recert_assist_ms) < Self::RECERT_ASSIST_EVERY_MS
-        {
+        if self.recert_assist_h != h {
+            self.recert_assist_peers.clear();
+            self.recert_assist_h = h;
+        }
+        if self.recert_assist_peers.contains(voter) {
             return None;
         }
         let existing = self
@@ -13288,12 +13301,13 @@ impl Node {
                 sig
             }
         };
-        self.recert_assist_h = h;
+        self.recert_assist_peers.insert(voter.to_string());
         self.recert_assist_ms = self.now_ms;
         Some((h, hash, sig))
     }
 
-    /// Re-send period for [`Self::recert_assist`] (logical ms).
+    /// Historical recert-assist resend window (logical ms). Assist is now
+    /// one-shot per (height, voter); tests still advance `now_ms` by this.
     pub const RECERT_ASSIST_EVERY_MS: u64 = 3_000;
 
     /// v2.9.79 (671185 stall, 2026-10-21): record a signed OK for our
@@ -13405,9 +13419,10 @@ impl Node {
     }
 
     /// Original OKs inside our tip cert, as `(voter, signature, round)`, for a
-    /// cert holder to re-fan as plain `LedgerOk` when a peer asks for a recert.
-    /// Existing wire message, valid signatures, same hash/round as already
-    /// sent: older seats treat them as duplicate votes (mixed-version safe).
+    /// cert holder to unicast as plain `LedgerOk` to a peer that asks for a
+    /// recert. Existing wire message, valid signatures, same hash/round as
+    /// already sent: older seats treat them as duplicate votes (mixed-version
+    /// safe). Never mesh-fan these (827004 stall).
     pub fn tip_cert_relay(&self) -> Vec<(String, String, u64)> {
         let Some(c) = self.certs.get(&self.tip_height) else {
             return Vec::new();

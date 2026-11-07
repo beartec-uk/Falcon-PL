@@ -1178,7 +1178,13 @@ mod tests {
         let assists = deliver_recert(&mut net, &req, true);
         let assisting: BTreeSet<String> = assists.iter().map(|(v, _, _)| v.clone()).collect();
         assert_eq!(assisting, holders.iter().cloned().collect::<BTreeSet<_>>(), "each holder assists once");
-        assert_eq!(assists.len(), holders.len(), "rate-limited: one assist per holder per window");
+        assert_eq!(
+            assists.len(),
+            holders.len() * certless.len(),
+            "one assist per holder per asking voter"
+        );
+        let again = deliver_recert(&mut net, &req, true);
+        assert!(again.is_empty(), "same voters at this height are not assisted again");
         let _ = deliver_recert(&mut net, &assists, true);
         for id in &certless {
             let n = &net.nodes[id];
@@ -1197,7 +1203,7 @@ mod tests {
     fn recert_assist_only_from_cert_holders_for_recert_tip_votes() {
         let mut net = six_after_one(1);
         let order = net.nodes["v1"].lottery_order();
-        let (p, q) = (order[0].clone(), order[1].clone());
+        let (p, q, r) = (order[0].clone(), order[1].clone(), order[2].clone());
         let tip = net.nodes[&p].tip_hash.clone();
         let hgt = net.nodes[&p].tip_height;
         // Not a recert vote → no assist.
@@ -1208,10 +1214,17 @@ mod tests {
         let _ = n.vote_ok_round_ex(&tip, &q, "", Node::RECERT_ROUND);
         assert!(n.certs.contains_key(&hgt));
         assert!(n.recert_assist(&tip, Node::RECERT_ROUND, &q).is_some());
-        // Rate limit, then re-send after the window with the same vote.
+        // One assist per peer per height: same voter stays None even after the
+        // old 3s window.
         assert!(n.recert_assist(&tip, Node::RECERT_ROUND, &q).is_none());
         n.now_ms += Node::RECERT_ASSIST_EVERY_MS;
-        assert!(n.recert_assist(&tip, Node::RECERT_ROUND, &q).is_some());
+        assert!(n.recert_assist(&tip, Node::RECERT_ROUND, &q).is_none());
+        // A different voter at this height still gets one assist.
+        let _ = n.vote_ok_round_ex(&tip, &r, "", Node::RECERT_ROUND);
+        assert!(n.recert_assist(&tip, Node::RECERT_ROUND, &r).is_some());
+        assert!(n.recert_assist(&tip, Node::RECERT_ROUND, &r).is_none());
+        n.now_ms += Node::RECERT_ASSIST_EVERY_MS;
+        assert!(n.recert_assist(&tip, Node::RECERT_ROUND, &r).is_none());
         // Cert-less seat never assists (it recertifies itself).
         n.certs.remove(&hgt);
         n.now_ms += Node::RECERT_ASSIST_EVERY_MS;

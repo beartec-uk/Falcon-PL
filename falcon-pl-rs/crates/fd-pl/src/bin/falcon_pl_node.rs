@@ -794,6 +794,11 @@ fn propose_header(led: &Ledger) -> WireMsg {
 
 fn cons_class(m: &WireMsg) -> ConsClass {
     match m {
+        // Recert assist is help for a cert-less peer, not a live proposal
+        // vote. Keep it off ConsClass::Vote so it cannot starve ViewChange
+        // on a busy cons pipe (827004 stall: fan of recert LedgerOk filled
+        // the vote lane at queued_out > 1e6).
+        WireMsg::LedgerOk { round, .. } if *round == Node::RECERT_ROUND => ConsClass::Other,
         WireMsg::LedgerOk { .. }
         | WireMsg::SkipPacker { .. }
         | WireMsg::ViewChange { .. }
@@ -1223,6 +1228,46 @@ impl Shared {
             }
             false
         });
+    }
+
+    /// Consensus-pipe unicast to one seat: outbound `peer_id` match, else an
+    /// inbound sink with that id. No live socket → skip (never mesh-fan).
+    fn send_cons_seat(
+        &self,
+        fanout: Option<&Arc<Vec<PeerOut>>>,
+        seat: &str,
+        m: &WireMsg,
+        class: ConsClass,
+    ) -> bool {
+        if seat.is_empty() {
+            return false;
+        }
+        let Ok(s) = serde_json::to_string(m) else {
+            return false;
+        };
+        let line = s + "\n";
+        if let Some(fanout) = fanout {
+            for p in fanout.iter() {
+                let id = p.peer_id.lock().clone();
+                if id != seat {
+                    continue;
+                }
+                if p.cons.try_send(line.clone(), class) {
+                    return true;
+                }
+                break;
+            }
+        }
+        let mut hit = false;
+        for s in self.inbound.lock().iter() {
+            if s.id != seat || s.close.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            if s.tx.try_send(line.clone(), class) {
+                hit = true;
+            }
+        }
+        hit
     }
 
     fn outbound_has_seat(fanout: &Arc<Vec<PeerOut>>, id: &str) -> bool {
@@ -6279,25 +6324,32 @@ fn process_msg(
                 let me_id = n.id.clone();
                 drop(n);
                 info!("recert assist h={h} for {voter} (peer lacks tip cert)");
-                fan(WireMsg::LedgerOk {
+                // Unicast to the asking seat only. A mesh fan of the assist
+                // plus every original tip_cert_relay OK filled queued_out
+                // and starved ViewChange (h=827004).
+                let assist_msg = WireMsg::LedgerOk {
                     height: h,
                     ledger_hash: hash.clone(),
                     voter: me_id,
                     signature: sig,
                     round,
-                });
+                };
+                shared.send_cons_seat(fanout, &voter, &assist_msg, ConsClass::Other);
                 // v2.9.79: also relay the original cert's OKs so a cert-less
                 // peer can rebuild it even when the recert round (next
-                // committee) cannot reach quorum. Same throttle as assist.
+                // committee) cannot reach quorum. Other, not Vote: even a
+                // handful of unicasted sealing OKs share this peer's cons
+                // pipe with ViewChange.
                 let relay = shared.node.lock().tip_cert_relay();
                 for (v, s, r) in relay {
-                    fan(WireMsg::LedgerOk {
+                    let relay_msg = WireMsg::LedgerOk {
                         height: h,
                         ledger_hash: hash.clone(),
                         voter: v,
                         signature: s,
                         round: r,
-                    });
+                    };
+                    shared.send_cons_seat(fanout, &voter, &relay_msg, ConsClass::Other);
                 }
                 n = shared.node.lock();
             }

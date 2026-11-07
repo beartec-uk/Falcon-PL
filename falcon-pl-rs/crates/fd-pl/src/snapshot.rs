@@ -544,6 +544,7 @@ impl Node {
             last_apply_fail_tx: None,
             recert_assist_h: 0,
             recert_assist_ms: 0,
+            recert_assist_peers: BTreeSet::new(),
             tip_cert_votes: std::collections::BTreeMap::new(),
             tip_cert_votes_h: 0,
             tip_roots: None,
