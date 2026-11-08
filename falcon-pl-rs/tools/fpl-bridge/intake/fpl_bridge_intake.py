@@ -95,7 +95,9 @@ def funding_info():
     return kv["operator"], int(kv["peg_in_fee"]), int(kv["peg_out_fee"])
 
 
-OP_ADDR, PEG_IN_FEE, PEG_OUT_FEE = funding_info()
+# Lazy: unit tests import this file without a coordinator binary. The service
+# process fills these in main() before serving.
+OP_ADDR, PEG_IN_FEE, PEG_OUT_FEE = None, 0, 0
 SEAT_TOKENS = json.load(open(os.path.join(STATE, "seats.json"))) if os.path.exists(os.path.join(STATE, "seats.json")) else {}
 
 
@@ -124,14 +126,51 @@ def gdir(r):
     return os.path.join(GRAPHS, "req-" + r["id"])
 
 
+def spent_deposit_txids(status):
+    """Lowercased BTC4 spent_deposits from a falcon-pl-ctl status JSON object.
+
+    Matches fpl-operator ledger.rs btc4_rail: status or status["body"], rails[]
+    where asset == "BTC4".
+    """
+    if not isinstance(status, dict):
+        return set()
+    body = status.get("body")
+    root = body if isinstance(body, dict) else status
+    spent = set()
+    for rail in root.get("rails") or []:
+        if not isinstance(rail, dict) or rail.get("asset") != "BTC4":
+            continue
+        for txid in rail.get("spent_deposits") or []:
+            if isinstance(txid, str) and txid:
+                spent.add(txid.lower())
+    return spent
+
+
+def request_minted(req, spent):
+    """True when this request's peg-in confirm txid has been consumed on the BTC4 rail."""
+    txid = (req.get("peg_in_confirm_txid") or "").strip().lower()
+    return bool(txid) and txid in spent
+
+
+def reserved_kickoff_set(reqs):
+    """Kickoff outpoints still pinned by a live request.
+
+    Minted requests release their kickoff after the peg-in proof is consumed
+    (BTC4 spent_deposits). awaiting_mint still reserves: the ceremony graph may
+    still need that unspent outpoint until mint completes.
+    """
+    return {r.get("kickoff") for r in reqs
+            if r.get("kickoff") and r.get("state") not in ("failed", "expired", "minted")}
+
+
 def reserved_kickoffs():
-    return {r.get("kickoff") for r in all_reqs() if r.get("kickoff") and r["state"] not in ("failed", "expired")}
+    return reserved_kickoff_set(all_reqs())
 
 
 def reserved_fundings(exclude_id=None):
     """Depositor funding outpoints already bound to a live request (one coin -> one request)."""
     return {r.get("funding") for r in all_reqs()
-            if r.get("funding") and r["id"] != exclude_id and r["state"] not in ("failed", "expired")}
+            if r.get("funding") and r["id"] != exclude_id and r.get("state") not in ("failed", "expired", "minted")}
 
 
 def outpoint_unspent(txid, vout):
@@ -149,16 +188,27 @@ def pick_kickoff(need):
     return (f"{utxos[0]['txid']}:{utxos[0]['vout']}", utxos[0]["value"]) if utxos else (None, 0)
 
 
+def falcon_ctl_status():
+    """falcon-pl-ctl status JSON, or {} if unset/unavailable."""
+    ctl = E("FPL_FALCON_CTL")
+    if not ctl:
+        return {}
+    try:
+        args = [ctl] + (["--addr", E("FPL_FALCON_RPC")] if E("FPL_FALCON_RPC") else []) + ["status"]
+        return json.loads(run(args).stdout or "{}")
+    except Exception:
+        return {}
+
+
 def ledger_bound(dep_txid):
     """All ACTIVE operators have a binding (graph or cosign) for this peg-in confirm txid."""
     if NET == "regtest" and E("FPL_INTAKE_REGTEST_NO_LEDGER") == "1":
         return True  # regtest e2e only; testnet4 always requires the ledger bindings
-    ctl = E("FPL_FALCON_CTL")
-    if not ctl:
+    if not E("FPL_FALCON_CTL"):
         return False
-    args = [ctl] + (["--addr", E("FPL_FALCON_RPC")] if E("FPL_FALCON_RPC") else []) + ["status"]
-    st = json.loads(run(args).stdout or "{}")
-    bo = st.get("body", st).get("bridge_operators") or {}
+    st = falcon_ctl_status()
+    root = st.get("body") if isinstance(st.get("body"), dict) else st
+    bo = (root or {}).get("bridge_operators") or {}
     active = [o.get("btc_xonly_hex") for o in (bo.get("operators") or {}).values() if str(o.get("status", "")).lower() == "active"]
     g = bo.get("graphs") or {}
     return bool(active) and all(f"{dep_txid.lower()}:{x}" in g for x in active)
@@ -183,7 +233,17 @@ def step(r):
         amt = r["funding_sats"] - PEG_IN_FEE
         ko, kv = pick_kickoff(amt + PEG_OUT_FEE)
         if not ko:
-            changed = s != "waiting_operator_liquidity"; r["state"] = "waiting_operator_liquidity"; return changed
+            changed = s != "waiting_operator_liquidity"
+            reason = (
+                "waiting_operator_liquidity: no confirmed unreserved operator kickoff "
+                f"UTXO large enough for this deposit plus peg-out fee (need {amt + PEG_OUT_FEE} sats); "
+                "intake does not aggregate smaller coins"
+            )
+            if r.get("last_error") != reason:
+                r["last_error"] = reason
+                changed = True
+            r["state"] = "waiting_operator_liquidity"
+            return changed
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "request.json"), "w") as f:
             json.dump({"id": r["id"], "depositor_account": r["account"], "depositor_pubkey": r["depositor_pubkey"],
@@ -201,7 +261,9 @@ def step(r):
             lg3 = open(os.path.join(d, "participant.log"), "a")
             subprocess.Popen([EX + "/fpl_ceremony_participant", "--dir", d, "--id", E("FPL_LOCAL_SEAT"), "--timeout-secs", "86400"],
                              stdout=lg3, stderr=lg3, start_new_session=True, cwd=d)
-        r.update(state="ceremony_pubkeys", kickoff=ko, kickoff_sats=kv); return True
+        r.update(state="ceremony_pubkeys", kickoff=ko, kickoff_sats=kv)
+        r.pop("last_error", None)
+        return True
     if s == "ceremony_pubkeys" and os.path.exists(os.path.join(d, "depositor_request.json")):
         q = json.load(open(os.path.join(d, "depositor_request.json")))
         r.update(state="awaiting_signature", deposit_txid=q.get("deposit_txid"), peg_in_confirm_txid=q.get("peg_in_confirm_txid")); return True
@@ -226,13 +288,19 @@ def step(r):
             if r["confirmations"] >= 6:
                 ns = "awaiting_mint"
             r["state"] = ns; return True
+    if s == "awaiting_mint":
+        spent = spent_deposit_txids(falcon_ctl_status())
+        if request_minted(r, spent):
+            r["state"] = "minted"
+            return True
+        return False
     return False
 
 
 def worker():
     while True:
         for r in all_reqs():
-            if r["state"] in ("expired", "failed", "awaiting_mint"):
+            if r["state"] in ("expired", "failed", "minted"):
                 continue
             try:
                 with LOCK:
@@ -432,6 +500,7 @@ def serve(addr, cls):
 
 
 if __name__ == "__main__":
+    OP_ADDR, PEG_IN_FEE, PEG_OUT_FEE = funding_info()
     log("intake", NET, "operator funding", OP_ADDR, "seats", SEATS)
     threading.Thread(target=worker, daemon=True).start()
     if E("FPL_SEAT_LISTEN"):
