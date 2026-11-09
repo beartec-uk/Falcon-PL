@@ -1060,16 +1060,22 @@ struct Shared {
     snap_pin_ms: std::sync::atomic::AtomicU64,
     /// sha → unix-ms of the last chunk served for it (v2.9.67 retention).
     served_shas: Mutex<std::collections::HashMap<String, u64>>,
-    /// Joiner: snapshot source → unix-ms until which its offers are skipped (v2.9.68).
+    /// Joiner: stalled/slow *archive/hub* sources → unix-ms until skipped (v2.9.68).
+    /// Never cleared by the all-slow path (only expiry).
     slow_snap_src: Mutex<std::collections::HashMap<String, u64>>,
+    /// Joiner: seats that answered SnapshotNo not-archive/not-hub (separate from stall).
+    /// May be cleared when every archive/hub is stalled so other seats can be tried.
+    snap_nonserve: Mutex<std::collections::HashMap<String, u64>>,
     /// Server: (requester, sha) → unix-ms of the last push (v2.9.69).
+    /// Key uses session Hello id (not shared wire_from).
     snap_pushed: Mutex<std::collections::HashMap<String, u64>>,
     /// Joiner: NeedLedgers target rotation / backoff (v2.9.72).
     ledger_slow: Mutex<fd_pl::catchup_slow::LedgerSlowList>,
     /// `--join` and neither hub nor archive: the only role that marks
     /// NeedLedgers targets slow (seats never change catch-up routing).
     joiner: bool,
-    /// Seat id for the inbound TCP session currently dispatching wire msgs.
+    /// Legacy shared last-peer tag (outbound only). Prefer `session_peer` args to
+    /// `dispatch_wire` / `process_msg` — inbound must not race this mutex.
     wire_from: Arc<parking_lot::Mutex<String>>,
     /// Peer id or dial address → refuse new sessions until this instant.
     blackhole: Mutex<std::collections::HashMap<String, std::time::Instant>>,
@@ -1090,6 +1096,76 @@ struct Shared {
     gap_dish: Mutex<u64>,
     /// Open height and last hold printed for the walk-ready trace.
     gap_walk: Mutex<(u64, String)>,
+}
+
+
+/// Catch-up *control* (must land): Offer / SnapshotNo. Data may be paced.
+fn is_snap_control(m: &WireMsg) -> bool {
+    matches!(m, WireMsg::SnapshotOffer { .. } | WireMsg::SnapshotNo { .. })
+}
+
+#[allow(dead_code)]
+fn is_snap_data(m: &WireMsg) -> bool {
+    matches!(m, WireMsg::SnapshotChunk { .. })
+}
+
+/// Max wait for lane room for a snapshot control reply (Offer / SnapshotNo).
+/// Bounded: the session read loop (votes included) waits behind it, so keep
+/// it well under the 6.6 s round-0 silence timeout.
+const SNAP_CONTROL_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Offer / SnapshotNo onto a catch-up lane, waiting (async, bounded) for room.
+/// Data chunks are deferred under pressure, but a lost Offer leaves the joiner
+/// without the sha/size it needs to resume, so control waits up to
+/// [`SNAP_CONTROL_WAIT`] while the writer drains. Returns (sent, polls).
+async fn reply_send_control_wait(
+    tx: &mpsc::Sender<String>,
+    line: String,
+    pieces: Option<Vec<String>>,
+) -> (bool, u32) {
+    let start = tokio::time::Instant::now();
+    let mut polls = 0u32;
+    loop {
+        if reply_send_pieced(tx, line.clone(), pieces.clone()) {
+            return (true, polls);
+        }
+        if tx.is_closed() || start.elapsed() >= SNAP_CONTROL_WAIT {
+            return (false, polls);
+        }
+        polls += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+static CATCH_DEFER_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CATCH_DEFER_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CATCH_DEFER_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A catch-up data reply (SnapshotChunk / LedgersBatch) did not fit the lane.
+/// Kept at WARN (rate-limited, with a running total) so operators still see
+/// lane pressure; the joiner re-requests the chunk / range.
+fn note_catch_defer(dir: &str, r: &WireMsg, peer: &str) {
+    let total = CATCH_DEFER_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if let Some(sup) = should_log_reply_dropped(unix_ms(), &CATCH_DEFER_LAST_MS, &CATCH_DEFER_SUPPRESSED) {
+        let kind = match r {
+            WireMsg::SnapshotChunk { .. } => "SnapshotChunk",
+            WireMsg::LedgersBatch { .. } => "LedgersBatch",
+            _ => "other",
+        };
+        warn!("{dir} catch-up reply deferred (catch-up lane full) kind={kind} to={peer} total={total} (+{sup} suppressed)");
+    }
+}
+
+/// Try-send catch-up control with short busy-wait retries (sync path / tests).
+#[allow(dead_code)]
+fn reply_send_control(tx: &mpsc::Sender<String>, line: String, pieces: Option<Vec<String>>) -> bool {
+    for _ in 0..64 {
+        if reply_send_pieced(tx, line.clone(), pieces.clone()) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    false
 }
 
 /// v2.10.3: send pieces (all fit) or the legacy line on a plain reply channel.
@@ -1387,6 +1463,19 @@ impl Shared {
                     .map(|p| p.source_peer.clone())
                     .unwrap_or_default();
                 if !src.is_empty() {
+                    // Live inbound session from the offering seat first. An
+                    // outbound PeerOut keeps its Hello id after the dial rule
+                    // refused / shed that socket, so try_send there could queue
+                    // hole-fill requests into a dead session (5–13 s joins in
+                    // the loopback rehearsal, nothing reached the archive).
+                    for s in self.inbound.lock().iter() {
+                        if s.id == src
+                            && !s.close.load(std::sync::atomic::Ordering::Relaxed)
+                            && s.tx.try_send(line.clone(), ConsClass::Other)
+                        {
+                            return;
+                        }
+                    }
                     for p in fanout.iter() {
                         if *p.peer_id.lock() == src && p.catchq.try_send(line.clone(), ConsClass::Other) {
                             return;
@@ -1394,49 +1483,89 @@ impl Shared {
                     }
                 }
             }
-            let mut sent = false;
-            // v2.9.68: an archive this joiner found too slow is skipped, so
-            // the request falls through to the hubs / other seeds.
+            // Stalled archives/hubs (slow_snap_src) and non-servers (snap_nonserve)
+            // are separate. Computed before any send so the inbound-archive path
+            // honours the cooldown too (an offer from a stalled source is
+            // discarded by the joiner, so asking it only re-pushed chunks).
             let slow: Vec<String> = {
                 let now = unix_ms();
-                let mut m = self.slow_snap_src.lock();
-                m.retain(|_, until| *until > now);
-                let slow: Vec<String> = m.keys().cloned().collect();
-                // v2.9.70: if every archive and hub is on the slow list, ask
-                // them anyway (and forget the marks) rather than ask no one.
-                let any_fast = archives.iter().chain(hubs.iter()).any(|id| !slow.contains(id));
+                let mut stalled = self.slow_snap_src.lock();
+                let mut nonserve = self.snap_nonserve.lock();
+                let skip = fd_pl::snap_skip_ids(&mut stalled, &mut nonserve, now);
+                let any_fast = archives
+                    .iter()
+                    .chain(hubs.iter())
+                    .any(|id| !fd_pl::is_snap_skipped(&skip, id));
                 if any_fast {
-                    slow
+                    skip
                 } else {
-                    // v2.9.74: archives and hubs are all slow. Try the other
-                    // seats (2.9.74 seats serve their join pin) one at a time
-                    // before forgetting the marks.
+                    // Archives/hubs all stalled (or skipped). Try other seats;
+                    // forget nonserve marks only so non-servers can be re-probed later.
                     let other = fanout.iter().find_map(|p| {
                         let id = p.peer_id.lock().clone();
                         let other = !id.is_empty()
-                            && !slow.contains(&id)
+                            && !fd_pl::is_snap_skipped(&skip, &id)
                             && !archives.contains(&id)
                             && !hubs.contains(&id);
                         other.then_some(id)
                     });
                     if other.is_some() && ask_all {
-                        drop(m);
+                        let skip2 = fd_pl::all_slow_forget_nonserve_only(&mut stalled, &mut nonserve, now);
+                        drop(stalled);
+                        drop(nonserve);
                         for p in fanout.iter() {
                             let id = p.peer_id.lock().clone();
-                            if id.is_empty() || slow.contains(&id) || archives.contains(&id) || hubs.contains(&id) {
+                            if id.is_empty()
+                                || fd_pl::is_snap_skipped(&skip2, &id)
+                                || archives.contains(&id)
+                                || hubs.contains(&id)
+                            {
                                 continue;
                             }
                             if p.catchq.try_send(line.clone(), ConsClass::Other) {
-                                info!("NeedSnapshot → seat {id} (archives/hubs slow)");
+                                info!("NeedSnapshot → seat {id} (archives/hubs stalled; nonserve cleared)");
                                 return;
                             }
                         }
                         return;
                     }
-                    m.clear();
-                    Vec::new()
+                    // No other seat: clear nonserve and cap each stalled mark to
+                    // a short backoff. The stashed download resumes from the
+                    // stalled source after SNAP_ALL_STALLED_RETRY_MS — not a
+                    // 600 s freeze, not the old immediate clear() hot retry.
+                    fd_pl::all_slow_cap_stalled(
+                        &mut stalled,
+                        &mut nonserve,
+                        now,
+                        fd_pl::SNAP_ALL_STALLED_RETRY_MS,
+                    )
                 }
             };
+            let mut sent = false;
+            // Higher-id seats never dial a lower-id archive (dial rule): the archive
+            // session is inbound-only. NeedLedgers already prefers inbound archives;
+            // NeedSnapshot must too or tip-0 joiners pull forever with no Offer.
+            if !archives.is_empty() {
+                let sinks: Vec<_> = self.inbound.lock().iter().cloned().collect();
+                for s in &sinks {
+                    if !archives.iter().any(|a| a == &s.id) || fd_pl::is_snap_skipped(&slow, &s.id) {
+                        continue;
+                    }
+                    if s.close.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    if s.tx.try_send(line.clone(), ConsClass::Other) {
+                        sent = true;
+                        info!("NeedSnapshot → inbound archive {}", s.id);
+                        if !ask_all {
+                            return;
+                        }
+                    }
+                }
+            }
+            if sent && !ask_all {
+                return;
+            }
             for p in fanout.iter() {
                 let id = p.peer_id.lock().clone();
                 if !archives.iter().any(|a| a == &id) || slow.contains(&id) {
@@ -1476,6 +1605,23 @@ impl Shared {
                         sent = true;
                         if !ask_all {
                             info!("NeedSnapshot → seed (no archive or hub tag)");
+                            return;
+                        }
+                    }
+                }
+                // And inbound sessions (higher-id joiner ↔ lower-id archive).
+                let sinks: Vec<_> = self.inbound.lock().iter().cloned().collect();
+                for s in &sinks {
+                    if slow.contains(&s.id) {
+                        continue;
+                    }
+                    if s.close.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    if s.tx.try_send(line.clone(), ConsClass::Other) {
+                        sent = true;
+                        info!("NeedSnapshot → inbound {}", s.id);
+                        if !ask_all {
                             return;
                         }
                     }
@@ -2370,6 +2516,14 @@ async fn main() -> Result<()> {
     if matches!(scheme, CryptoScheme::HmacDev) && !args.allow_dev_crypto && !args.gen_keys_only {
         bail!("hmac-dev refused without --allow-dev-crypto (checklist A8)");
     }
+    let _ = TEST_HOOKS.set(test_hooks_allowed(
+        std::env::var("FALCON_PL_TEST_HOOKS").as_deref() == Ok("1"),
+        matches!(scheme, CryptoScheme::HmacDev),
+        args.network_id,
+    ));
+    if test_hooks_on() {
+        warn!("TEST HOOKS ENABLED (isolated rehearsal only; hmac-dev, network {})", args.network_id);
+    }
     let allow_admin = if args.allow_admin_wire {
         true
     } else if args.lock_public_wire || !args.admin_sock.is_empty() {
@@ -2835,6 +2989,7 @@ async fn main() -> Result<()> {
         snap_pin_ms: std::sync::atomic::AtomicU64::new(0),
         served_shas: Mutex::new(std::collections::HashMap::new()),
         slow_snap_src: Mutex::new(std::collections::HashMap::new()),
+        snap_nonserve: Mutex::new(std::collections::HashMap::new()),
         snap_pushed: Mutex::new(std::collections::HashMap::new()),
         ledger_slow: Mutex::new(fd_pl::catchup_slow::LedgerSlowList::new()),
         joiner: args.join && !args.hub && !args.archive,
@@ -3412,7 +3567,12 @@ async fn main() -> Result<()> {
                             // v2.9.70: a stalled source is skipped like a slow
                             // one, so NeedSnapshot reaches the hubs next round.
                             if !p.source_peer.is_empty() {
-                                info!("snapshot source {} stalled — skip it for {}s", p.source_peer, SNAP_SLOW_SKIP_MS / 1000);
+                                info!(
+                                    "snapshot source {} stalled — skip it for up to {}s ({}s if it is the only source)",
+                                    p.source_peer,
+                                    SNAP_SLOW_SKIP_MS / 1000,
+                                    fd_pl::SNAP_ALL_STALLED_RETRY_MS / 1000
+                                );
                                 shared_c
                                     .slow_snap_src
                                     .lock()
@@ -3459,18 +3619,15 @@ async fn main() -> Result<()> {
                             >= fd_pl::Node::SNAPSHOT_RETRY_MS
                         {
                             p.last_req_ms = now;
-                            (
-                                // v2.9.62: holes below the highest chunk only
-                                // (the push is still sending the tail).
-                                p.retry_indices(
-                                    fd_pl::Node::SNAPSHOT_PIPE_WINDOW,
-                                    now,
-                                    fd_pl::Node::SNAPSHOT_TAIL_RETRY_MS,
-                                ),
-                                false,
-                                true,
-                                p.sha256.clone(),
-                            )
+                            // v2.9.62: holes below the highest chunk only
+                            // (the push is still sending the tail).
+                            let idx = p.retry_indices(
+                                fd_pl::Node::SNAPSHOT_PIPE_WINDOW,
+                                now,
+                                fd_pl::Node::SNAPSHOT_TAIL_RETRY_MS,
+                            );
+                            p.note_requested(&idx);
+                            (idx, false, true, p.sha256.clone())
                         } else {
                             (Vec::new(), false, true, p.sha256.clone())
                         }
@@ -3497,6 +3654,13 @@ async fn main() -> Result<()> {
                     info!("snapshot pull stalled — retry NeedSnapshot");
                     shared_c.fan_catchup(&fanout, &WireMsg::NeedSnapshot {});
                 } else {
+                    if !retry_chunks.is_empty() {
+                        debug!(
+                            "snapshot hole-fill request n={} first={:?}",
+                            retry_chunks.len(),
+                            retry_chunks.first()
+                        );
+                    }
                     for index in retry_chunks {
                         shared_c.fan_catchup(
                             &fanout,
@@ -4156,7 +4320,9 @@ async fn peer_session(
     let fanout_r = fanout.clone();
     // Split directed replies: catch-up (LedgersBatch) must never be starved by
     // TxsBatch / Ok spam under load (v2.6.0 multi-host tip=0 freeze).
-    let (catchup_tx, mut catchup_rx) = mpsc::channel::<String>(512);
+    let (catchup_tx, mut catchup_rx) =
+        mpsc::channel::<String>(catch_lane_cap("FALCON_PL_TEST_OUTBOUND_CATCH_CAP", 512));
+    let catch_drain = catch_drain_delay();
     let (reply_tx, mut reply_rx) = mpsc::channel::<String>(WIRE_QUEUE_CAP.max(TX_QUEUE_CAP / 4));
     // v2.9.60: when the Hello gate refuses the peer the read task stores the
     // reason here and exits; the write loop stops (its reply channels close),
@@ -4203,8 +4369,19 @@ async fn peer_session(
                         }
                     }
                 }
-                *shared_r.wire_from.lock() = peer_id.lock().clone();
-                for reply in dispatch_wire(&shared_r, msg, Some(&fanout_r), false, false) {
+                let session_peer = peer_id.lock().clone();
+                // Keep legacy tag for any residual readers; session_peer is authoritative.
+                *shared_r.wire_from.lock() = session_peer.clone();
+                let budget = fd_pl::snap_push_budget(catchup_tx.capacity(), snapshot_push_max());
+                for reply in dispatch_wire(
+                    &shared_r,
+                    msg,
+                    Some(&fanout_r),
+                    false,
+                    false,
+                    &session_peer,
+                    budget,
+                ) {
                     if let Ok(s) = serde_json::to_string(&reply) {
                         let out = s + "\n";
                         let is_catchup = matches!(
@@ -4214,10 +4391,18 @@ async fn peer_session(
                                 | WireMsg::SnapshotChunk { .. }
                                 | WireMsg::SnapshotNo { .. }
                         );
-                        let pieces = shared_r.pieces_for(&peer_id.lock().clone(), &out);
+                        let pieces = shared_r.pieces_for(&session_peer, &out);
                         if is_catchup {
-                            if !reply_send_pieced(&catchup_tx, out, pieces) {
-                                warn!("LedgersBatch reply dropped (catchup queue full)");
+                            if is_snap_control(&reply) {
+                                let (ok, polls) = reply_send_control_wait(&catchup_tx, out, pieces).await;
+                                if !ok {
+                                    warn!("snapshot control reply failed after {polls} waits (catchup queue full)");
+                                } else if polls > 0 {
+                                    info!("snapshot control reply sent after {polls} waits (lane full) to={session_peer}");
+                                }
+                            } else if !reply_send_pieced(&catchup_tx, out, pieces) {
+                                // Data: skip under pressure; joiner hole-fills / retries.
+                                note_catch_defer("outbound", &reply, &session_peer);
                             }
                         } else {
                             let _ = reply_send_pieced(&reply_tx, out, pieces);
@@ -4312,6 +4497,9 @@ async fn peer_session(
                         }
                         if line.len() > LARGE_LINE {
                             Shared::clear_large_out(&fanout, &who);
+                        }
+                        if let Some(d) = catch_drain {
+                            tokio::time::sleep(d).await;
                         }
                     }
                     None => break,
@@ -4631,7 +4819,11 @@ async fn handle_inbound(
     // queue with Ok/Err/tx replies dropped them on a busy hub (v3: ~100
     // "inbound reply dropped"/s), so a restarted seat that dials the hub
     // never got a ledger back and stalled until a second restart.
-    let (catch_reply_tx, mut catch_reply_rx) = mpsc::channel::<String>(INBOUND_CATCHUP_REPLY_CAP);
+    let (catch_reply_tx, mut catch_reply_rx) = mpsc::channel::<String>(catch_lane_cap(
+        "FALCON_PL_TEST_INBOUND_CATCH_CAP",
+        INBOUND_CATCHUP_REPLY_CAP,
+    ));
+    let catch_drain_w = catch_drain_delay();
     let close_w = close_me.clone();
     let shed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shed_w = shed.clone();
@@ -4686,6 +4878,9 @@ async fn handle_inbound(
                             if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound").await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
+                            }
+                            if let Some(d) = catch_drain_w {
+                                tokio::time::sleep(d).await;
                             }
                         }
                         None => break,
@@ -4821,13 +5016,33 @@ async fn handle_inbound(
             }
         }
         let was_hello = matches!(msg, WireMsg::Hello { .. });
-        let replies = dispatch_wire(&shared, msg, Some(&fanout), true, false);
+        // Session peer is Hello-validated `seen_id` only (immutable for this call).
+        let session_peer = seen_id.as_str();
+        let budget = fd_pl::snap_push_budget(catch_reply_tx.capacity(), snapshot_push_max());
+        let replies = dispatch_wire(
+            &shared,
+            msg,
+            Some(&fanout),
+            true,
+            false,
+            session_peer,
+            budget,
+        );
         for r in replies {
             let out = serde_json::to_string(&r)? + "\n";
-            let pieces = shared.pieces_for(&seen_id, &out);
+            let pieces = shared.pieces_for(session_peer, &out);
             if is_catchup_reply(&r) {
-                if !reply_send_pieced(&catch_reply_tx, out, pieces) {
-                    warn!("inbound catch-up reply dropped (catch-up lane full)");
+                if is_snap_control(&r) {
+                    // Offer / SnapshotNo: retry so resume control is not lost.
+                    let (ok, polls) = reply_send_control_wait(&catch_reply_tx, out, pieces).await;
+                    if !ok {
+                        warn!("inbound snapshot control reply failed after {polls} waits (lane full) to={session_peer}");
+                    } else if polls > 0 {
+                        info!("inbound snapshot control reply sent after {polls} waits (lane full) to={session_peer}");
+                    }
+                } else if !reply_send_pieced(&catch_reply_tx, out, pieces) {
+                    // SnapshotChunk / LedgersBatch: credit-aware skip under pressure.
+                    note_catch_defer("inbound", &r, session_peer);
                 }
             } else if should_drop_inbound_reply(inbound_registered, was_hello, &r) {
                 // Hello'd mesh peer: it discards Ok/Err (process_msg -> None),
@@ -4921,7 +5136,7 @@ async fn handle_admin(
                 continue;
             }
         };
-        let replies = dispatch_wire(&shared, msg, Some(&fanout), true, true);
+        let replies = dispatch_wire(&shared, msg, Some(&fanout), true, true, "admin", SNAPSHOT_PUSH_MAX);
         for r in replies {
             let out = serde_json::to_string(&r)? + "\n";
             writer.write_all(out.as_bytes()).await?;
@@ -5012,6 +5227,86 @@ fn refresh_archive_serve_snapshot(shared: &Shared) {
     }
 }
 
+/// Isolated-rehearsal hooks (snapshot transport tests). Enabled only when
+/// `FALCON_PL_TEST_HOOKS=1` AND the scheme is hmac-dev (`--allow-dev-crypto`)
+/// AND `--network-id` is not 2300. Otherwise every hook below is a no-op and
+/// production values apply. Set once in `main`.
+static TEST_HOOKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn test_hooks_on() -> bool {
+    *TEST_HOOKS.get().unwrap_or(&false)
+}
+
+fn test_hooks_allowed(env_on: bool, hmac_dev: bool, network_id: u32) -> bool {
+    env_on && hmac_dev && network_id != 2300
+}
+
+fn test_hook_u64(name: &str) -> Option<u64> {
+    if !test_hooks_on() {
+        return None;
+    }
+    std::env::var(name).ok()?.parse::<u64>().ok()
+}
+
+/// Max chunks bulk-pushed after an Offer. Default [`SNAPSHOT_PUSH_MAX`];
+/// test hook `FALCON_PL_SNAPSHOT_PUSH_MAX` clamps to 0..=default.
+fn snapshot_push_max() -> u32 {
+    test_hook_u64("FALCON_PL_SNAPSHOT_PUSH_MAX")
+        .map(|n| (n.min(SNAPSHOT_PUSH_MAX as u64)) as u32)
+        .unwrap_or(SNAPSHOT_PUSH_MAX)
+}
+
+/// Join-snap chunk size. Default [`fd_pl::Node::SNAPSHOT_CHUNK_BYTES`];
+/// test hook `FALCON_PL_SNAPSHOT_CHUNK_BYTES` clamps to 16 KiB..=default.
+fn snapshot_chunk_bytes() -> usize {
+    const DEFAULT: usize = fd_pl::Node::SNAPSHOT_CHUNK_BYTES;
+    test_hook_u64("FALCON_PL_SNAPSHOT_CHUNK_BYTES")
+        .map(|n| (n.min(DEFAULT as u64) as usize).max(16 * 1024))
+        .unwrap_or(DEFAULT)
+}
+
+/// Catch-up reply lane capacity (test hook clamps 16..=default).
+fn catch_lane_cap(name: &str, default: usize) -> usize {
+    test_hook_u64(name)
+        .map(|n| (n.min(default as u64) as usize).max(16))
+        .unwrap_or(default)
+}
+
+/// Test hook: delay after each catch-lane line written (simulates a slow
+/// socket so the lane fills). Off unless set; capped at 1 s.
+fn catch_drain_delay() -> Option<std::time::Duration> {
+    test_hook_u64("FALCON_PL_TEST_CATCH_DRAIN_MS")
+        .filter(|&ms| ms > 0)
+        .map(|ms| std::time::Duration::from_millis(ms.min(1_000)))
+}
+
+static SNAP_TEST_STALL_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test hook: the archive silently withholds chunks
+/// `>= FALCON_PL_TEST_SNAP_STALL_FROM_CHUNK` for `FALCON_PL_TEST_SNAP_STALL_MS`
+/// after the first such request, then serves normally (controlled stall →
+/// joiner abort/stash → stalled cooldown → resume).
+fn snap_test_withhold(index: u32) -> bool {
+    let Some(from) = test_hook_u64("FALCON_PL_TEST_SNAP_STALL_FROM_CHUNK") else {
+        return false;
+    };
+    let dur = test_hook_u64("FALCON_PL_TEST_SNAP_STALL_MS").unwrap_or(0);
+    if (index as u64) < from || dur == 0 {
+        return false;
+    }
+    let now = unix_ms();
+    let start = match SNAP_TEST_STALL_START.compare_exchange(
+        0,
+        now,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    ) {
+        Ok(_) => now,
+        Err(s) => s,
+    };
+    now.saturating_sub(start) < dur
+}
+
 fn serve_snap_chunk(shared: &Shared, sha256: &str, index: u32) -> Result<WireMsg, String> {
     // v2.9.67: any seat with hashed serve files (archive or hub) serves an
     // offered sha by hash until retention drops it, so a pin rotation no
@@ -5081,7 +5376,7 @@ fn serve_snap_chunk(shared: &Shared, sha256: &str, index: u32) -> Result<WireMsg
     if !sha_ok {
         return Err("snap hash changed".into());
     }
-    let chunk_sz = fd_pl::Node::SNAPSHOT_CHUNK_BYTES;
+    let chunk_sz = snapshot_chunk_bytes();
     let total = (nbytes as usize).div_ceil(chunk_sz).max(1) as u32;
     let start = index as u64 * chunk_sz as u64;
     if start > nbytes {
@@ -5115,18 +5410,31 @@ fn dispatch_wire(
     fanout: Option<&Arc<Vec<PeerOut>>>,
     relay_state: bool,
     from_admin: bool,
+    // Validated Hello id for this TCP session (immutable for the call). Empty
+    // until Hello; never read from shared `wire_from` for attribution.
+    session_peer: &str,
+    // Max SnapshotChunk to bulk-push after Offer (0 = Offer only). Caller
+    // derives this from catch-up lane free capacity.
+    push_budget: u32,
 ) -> Vec<WireMsg> {
     let push = matches!(msg, WireMsg::NeedSnapshot {});
     let mut out = Vec::new();
-    if let Some(r) = process_msg(shared, msg, fanout, relay_state, from_admin) {
+    if let Some(r) = process_msg(shared, msg, fanout, relay_state, from_admin, session_peer) {
         let extra = if push {
             if let WireMsg::SnapshotOffer { sha256, chunks, .. } = &r {
-                let who = shared.wire_from.lock().clone();
+                let who = session_peer;
                 let now = unix_ms();
                 let mut m = shared.snap_pushed.lock();
                 m.retain(|_, t| now.saturating_sub(*t) < SNAPSHOT_REPUSH_MS);
                 let key = format!("{who}|{sha256}");
-                if !who.is_empty() && m.contains_key(&key) {
+                // Unknown session (no Hello yet): Offer only — never key as empty.
+                if who.is_empty() {
+                    None
+                } else if m.contains_key(&key) {
+                    // Recent push to this requester+sha: Offer only; joiner hole-fills.
+                    None
+                } else if push_budget == 0 {
+                    // Offer only; do not mark pushed so a later pull can ship chunks.
                     None
                 } else {
                     m.insert(key, now);
@@ -5140,11 +5448,13 @@ fn dispatch_wire(
         };
         out.push(r);
         if let Some((sha, n)) = extra {
-            // v2.9.68: push only what fits the reply queue (inbound cap 64
-            // lines). Pushing all ~385 chunks dropped ~330 of them per request
-            // (42k "inbound reply dropped" on v3) and starved the joiner's
-            // hole-fill requests. The joiner pulls the rest by window.
-            for i in 0..n.min(SNAPSHOT_PUSH_MAX) {
+            // Cap by SNAPSHOT_PUSH_MAX and caller credit (lane free slots).
+            let n_push = n.min(snapshot_push_max()).min(push_budget);
+            for i in 0..n_push {
+                if snap_test_withhold(i) {
+                    debug!("snapshot push withheld from chunk {i} (test stall hook)");
+                    break;
+                }
                 match serve_snap_chunk(shared, &sha, i) {
                     Ok(c) => out.push(c),
                     Err(reason) => {
@@ -5168,6 +5478,7 @@ fn process_msg(
     relay_state: bool,
     // Unix admin socket bypasses the TCP allow_admin_wire gate.
     from_admin: bool,
+    session_peer: &str,
 ) -> Option<WireMsg> {
     let fan = |m: WireMsg| {
         if let Some(f) = fanout {
@@ -5510,7 +5821,7 @@ fn process_msg(
             let nserve = batch.len();
             drop(n);
             if nserve > 0 {
-                let asker = shared.wire_from.lock().clone();
+                let asker = session_peer.to_string();
                 let busy = shared.inbound.lock().iter().any(|s| {
                     s.id == asker
                         && s.tx.used.load(std::sync::atomic::Ordering::Relaxed) > PIPE_PAUSE_BYTES
@@ -5630,13 +5941,13 @@ fn process_msg(
                     reason: "no snapshot file yet".into(),
                 });
             };
-            let chunk = fd_pl::Node::SNAPSHOT_CHUNK_BYTES as u32;
+            let chunk = snapshot_chunk_bytes() as u32;
             let chunks = meta.bytes.div_ceil(chunk as u64).max(1) as u32;
             info!(
                 "snapshot serving tip={} bytes={} chunks={chunks} to={}",
                 meta.tip,
                 meta.bytes,
-                shared.wire_from.lock().clone()
+                session_peer
             );
             Some(WireMsg::SnapshotOffer {
                 tip_height: meta.tip,
@@ -5648,8 +5959,15 @@ fn process_msg(
             })
         }
         WireMsg::NeedSnapshotChunk { sha256, index } => {
+            if snap_test_withhold(index) {
+                debug!("snapshot chunk {index} withheld to={session_peer} (test stall hook)");
+                return None;
+            }
             match serve_snap_chunk(shared, &sha256, index) {
-                Ok(m) => Some(m),
+                Ok(m) => {
+                    debug!("snapshot chunk serve idx={index} to={session_peer}");
+                    Some(m)
+                }
                 Err(reason) => Some(WireMsg::SnapshotNo { reason }),
             }
         }
@@ -5699,7 +6017,7 @@ fn process_msg(
                     }
                     info!("snapshot offer taken tip={tip_height} lag={lag} (ledger pull stalled)");
                 }
-                let source_peer = shared.wire_from.lock().clone();
+                let source_peer = session_peer.to_string();
                 {
                     let now = unix_ms();
                     let mut slow = shared.slow_snap_src.lock();
@@ -5733,6 +6051,8 @@ fn process_msg(
                     a
                 };
                 let window = asm.request_window(fd_pl::Node::SNAPSHOT_PIPE_WINDOW);
+                let mut asm = asm;
+                asm.note_requested(&window);
                 *pull = Some(asm);
                 window
             };
@@ -5743,6 +6063,12 @@ fn process_msg(
                     sha256: sha256.clone(),
                     index,
                 });
+            }
+            // Test hook: re-ask right behind the hole-fill window so the
+            // archive must queue an Offer while that lane is full.
+            if test_hook_u64("FALCON_PL_TEST_REASK_AFTER_OFFER") == Some(1) {
+                info!("snapshot re-ask after offer (test hook)");
+                fan(WireMsg::NeedSnapshot {});
             }
             None
         }
@@ -5759,6 +6085,7 @@ fn process_msg(
                     return None;
                 }
             };
+            let mut refill: Option<(String, Vec<u32>)> = None;
             let finished = {
                 let mut pull = shared.snap_pull.lock();
                 let Some(p) = pull.as_mut() else {
@@ -5767,7 +6094,15 @@ fn process_msg(
                 if p.sha256 != sha256 {
                     return None;
                 }
-                match p.insert(index, raw, unix_ms()) {
+                let ins = p.insert(index, raw, unix_ms());
+                debug!("snapshot chunk recv idx={index} got={}/{}", p.got(), p.total);
+                if matches!(ins, Ok(SnapInsert::Progress)) {
+                    let more = p.pipeline_refill(index, fd_pl::Node::SNAPSHOT_PIPE_WINDOW, SNAPSHOT_PUSH_MAX);
+                    if !more.is_empty() {
+                        refill = Some((p.sha256.clone(), more));
+                    }
+                }
+                match ins {
                     Ok(SnapInsert::Complete) => true,
                     Ok(SnapInsert::Progress) | Ok(SnapInsert::Duplicate) => false,
                     Err(e) => {
@@ -5776,6 +6111,14 @@ fn process_msg(
                     }
                 }
             };
+            if let Some((sha, idx)) = refill {
+                for index in idx {
+                    fan(WireMsg::NeedSnapshotChunk {
+                        sha256: sha.clone(),
+                        index,
+                    });
+                }
+            }
             if !finished {
                 return None;
             }
@@ -5844,15 +6187,14 @@ fn process_msg(
         }
         WireMsg::SnapshotNo { reason } => {
             warn!("snapshot rejected: {reason}");
-            // v2.9.74: a seat that does not serve (pre-2.9.74, or not at tip)
-            // is skipped like a slow source, so the seat rotation moves on.
+            // Non-servers go to snap_nonserve (not stalled-archive cooldown).
             if reason == "not archive" || reason == "not hub" {
-                let who = shared.wire_from.lock().clone();
+                let who = session_peer;
                 if !who.is_empty() {
                     shared
-                        .slow_snap_src
+                        .snap_nonserve
                         .lock()
-                        .insert(who, unix_ms() + SNAP_SLOW_SKIP_MS);
+                        .insert(who.to_string(), unix_ms() + SNAP_SLOW_SKIP_MS);
                 }
             }
             if reason == "no snapshot file yet" {
@@ -7181,6 +7523,25 @@ fn crate_lc_vote_rounds(keys_dir: &str) -> u64 {
 }
 
 #[cfg(test)]
+mod test_hook_gate_tests {
+    use super::*;
+
+    #[test]
+    fn test_hooks_never_on_mainnet_or_real_crypto() {
+        assert!(!test_hooks_allowed(true, true, 2300));
+        assert!(!test_hooks_allowed(true, false, 2200));
+        assert!(!test_hooks_allowed(false, true, 2200));
+        assert!(test_hooks_allowed(true, true, 2200));
+        // Gate unset in unit tests → production defaults.
+        assert_eq!(snapshot_chunk_bytes(), fd_pl::Node::SNAPSHOT_CHUNK_BYTES);
+        assert_eq!(snapshot_push_max(), SNAPSHOT_PUSH_MAX);
+        assert_eq!(catch_lane_cap("FALCON_PL_TEST_INBOUND_CATCH_CAP", 512), 512);
+        assert!(catch_drain_delay().is_none());
+        assert!(!snap_test_withhold(400));
+    }
+}
+
+#[cfg(test)]
 mod large_gate_tests {
     use super::*;
 
@@ -7285,6 +7646,7 @@ mod inbound_ack_tests {
             snap_pin_ms: std::sync::atomic::AtomicU64::new(0),
             served_shas: parking_lot::Mutex::new(std::collections::HashMap::new()),
             slow_snap_src: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            snap_nonserve: parking_lot::Mutex::new(std::collections::HashMap::new()),
             snap_pushed: parking_lot::Mutex::new(std::collections::HashMap::new()),
             ledger_slow: parking_lot::Mutex::new(fd_pl::catchup_slow::LedgerSlowList::default()),
             joiner: false,
@@ -7526,10 +7888,59 @@ mod inbound_ack_tests {
             matches!(verdict, HelloGate::Close(_)),
             "expected HelloGate::Close on wrong network_id"
         );
-        let replies = dispatch_wire(&shared, bad_hello, None, true, false);
+        let replies = dispatch_wire(&shared, bad_hello, None, true, false, "test-peer", 0);
         assert_eq!(replies.len(), 1);
         assert!(matches!(replies[0], WireMsg::Err { .. }));
         assert!(!should_drop_inbound_reply(false, true, &replies[0]));
+    }
+
+    #[test]
+    fn session_peer_repush_keys_are_isolated() {
+        let shared = test_shared("v1");
+        // Without a real pin / archive flag, NeedSnapshot returns SnapshotNo —
+        // still exercises session_peer path without touching shared wire_from.
+        *shared.wire_from.lock() = "stale-v6".into();
+        let a = dispatch_wire(
+            &shared,
+            WireMsg::NeedSnapshot {},
+            None,
+            false,
+            false,
+            "crypto-dashboard",
+            0,
+        );
+        let b = dispatch_wire(
+            &shared,
+            WireMsg::NeedSnapshot {},
+            None,
+            false,
+            false,
+            "other-joiner",
+            0,
+        );
+        assert!(!a.is_empty() && !b.is_empty());
+        // wire_from must remain untouched by dispatch (session_peer only).
+        assert_eq!(shared.wire_from.lock().as_str(), "stale-v6");
+        // Distinct session peers must not collide on empty repush keying.
+        assert!(matches!(a[0], WireMsg::SnapshotNo { .. }));
+        assert!(matches!(b[0], WireMsg::SnapshotNo { .. }));
+    }
+
+    #[test]
+    fn snapshot_no_not_archive_marks_nonserve_not_stalled() {
+        let shared = test_shared("v1");
+        let _ = process_msg(
+            &shared,
+            WireMsg::SnapshotNo {
+                reason: "not archive".into(),
+            },
+            None,
+            false,
+            false,
+            "v12",
+        );
+        assert!(shared.slow_snap_src.lock().is_empty());
+        assert!(shared.snap_nonserve.lock().contains_key("v12"));
     }
 
     #[test]
@@ -7575,6 +7986,8 @@ mod inbound_ack_tests {
                 None,
                 false,
                 true,
+                "admin",
+                0,
             );
             assert_eq!(replies.len(), 1);
             match &replies[0] {
