@@ -16,12 +16,10 @@ were already published have not been changed.
 
 Acknowledgements
 ----------------
-BEARTEC LTD gratefully acknowledges the following projects and people, whose
-open-source work Falcon PL builds on:
-
-  * OpenZeppelin (https://github.com/OpenZeppelin)
-  * rukafe0x
-  * ZKNox
+BEARTEC LTD acknowledges OpenZeppelin (https://github.com/OpenZeppelin),
+rukafe0x and ZKNox. Their work was used only in a separate, unrelated
+Starknet/Falcon Challenge experiment; it is not included in Falcon PL
+production builds.
 
 Not covered by the generated list below:
   * BitVM (https://github.com/BitVM/BitVM, MIT) is fetched at build time by
