@@ -1,5 +1,7 @@
 # BTC4 later-height fork-slot replacement (activation block 860,000)
 
+Ships as product and installer version **2.11.3**.
+
 Gate: `params_v2::TESTNET_2300_BTC4_FORK_SLOT_HEIGHT = 860_000` (2300); other
 networks `FPL_BTC4_FORK_SLOT_FROM_HEIGHT` (default never). Active when
 `tip + 1 >= 860,000`.
