@@ -377,6 +377,19 @@ pub const TESTNET_2300_EMPTY_BLOCK_FROM_HEIGHT: u64 = TESTNET_2300_V2_10_FROM_HE
 /// BTC4 `RailHeader` txs exactly like 2.10.0.
 pub const TESTNET_2300_BTC4_FORK_FIX_HEIGHT: u64 = 775_000;
 
+/// Later-height BTC4 fork-slot replacement (2300). When both `btc_fork` and
+/// `btc_fork_alt` are leftover earlier-height forks, a new main-ancestral fork
+/// that starts above the alt tip replaces the alt slot even if its 1-header
+/// work is not strictly greater (the leftover alt cannot be extended through
+/// that later height). Replays the 2026-11-10 stall: leftover forks at 160182
+/// blocked the canonical walk from ancestor 160185 ("BTC fork has less work
+/// than the competing branch").
+///
+/// H = 860,000: above live tip 855,159 on 10 Nov 2026 21:15 GMT (~4.8k
+/// blocks). All seats must run this binary before H; a 2.11.2 seat rejects
+/// the header this rule accepts. Non-2300: `FPL_BTC4_FORK_SLOT_FROM_HEIGHT`.
+pub const TESTNET_2300_BTC4_FORK_SLOT_HEIGHT: u64 = 860_000;
+
 /// v2.10.3 (TBD): Hello minimum-release activation (2300). From this local tip
 /// a peer must advertise `release_version >= HELLO_MIN_RELEASE`. Local only
 /// (session admission), not consensus. **PLACEHOLDER / TBD**: `u64::MAX` = never.
@@ -445,6 +458,15 @@ pub fn btc4_fork_fix_from_height(network_id: u32) -> u64 {
         return TESTNET_2300_BTC4_FORK_FIX_HEIGHT;
     }
     env_u64("FPL_BTC4_FORK_FIX_FROM_HEIGHT").unwrap_or(u64::MAX)
+}
+
+/// Later-height BTC4 fork-slot replacement (`u64::MAX` = never). Non-2300
+/// networks may set `FPL_BTC4_FORK_SLOT_FROM_HEIGHT` (devnets / tests).
+pub fn btc4_fork_slot_from_height(network_id: u32) -> u64 {
+    if network_id == NETWORK_ID_PUBLIC_TESTNET_2300 {
+        return TESTNET_2300_BTC4_FORK_SLOT_HEIGHT;
+    }
+    env_u64("FPL_BTC4_FORK_SLOT_FROM_HEIGHT").unwrap_or(u64::MAX)
 }
 
 /// External-address activation height (`u64::MAX` = never). Non-2300 networks

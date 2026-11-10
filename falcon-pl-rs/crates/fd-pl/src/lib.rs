@@ -3690,6 +3690,8 @@ pub struct Node {
     pub empty_block_from_height: u64,
     /// v2.10.1: [`crate::params_v2::btc4_fork_fix_from_height`]; runtime only.
     pub btc4_fork_fix_from_height: u64,
+    /// Later-height BTC4 fork-slot replacement; runtime only.
+    pub btc4_fork_slot_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::btc4_lend_scale_from_height`]; runtime only.
     pub btc4_lend_scale_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::orderbook_from_height`] (= the single
@@ -3827,6 +3829,7 @@ impl Node {
         let external_addrs_from_height = crate::params_v2::external_addrs_from_height(cfg.network_id);
         let empty_block_from_height = crate::params_v2::empty_block_from_height(cfg.network_id);
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
+        let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
         let btc4_lend_scale_from_height = crate::params_v2::btc4_lend_scale_from_height(cfg.network_id);
         let orderbook_from_height = crate::params_v2::orderbook_from_height(cfg.network_id);
         let hello_min_release_from_height = crate::params_v2::hello_min_release_from_height(cfg.network_id);
@@ -3966,6 +3969,7 @@ impl Node {
             external_addrs_from_height,
             empty_block_from_height,
             btc4_fork_fix_from_height,
+            btc4_fork_slot_from_height,
             btc4_lend_scale_from_height,
             orderbook_from_height,
             hello_min_release_from_height,
@@ -4295,6 +4299,11 @@ impl Node {
     /// v2.10.1: BTC4 fork-fix rules for the ledger being applied now (`tip + 1`).
     pub fn btc4_fork_fix_open(&self) -> bool {
         self.tip_height.saturating_add(1) >= self.btc4_fork_fix_from_height
+    }
+
+    /// Later-height BTC4 fork-slot replacement for the ledger being applied now (`tip + 1`).
+    pub fn btc4_fork_slot_open(&self) -> bool {
+        self.tip_height.saturating_add(1) >= self.btc4_fork_slot_from_height
     }
 
     /// v2.10.4: BTC4 lend markets pin 1e8 raw/coin for the ledger applied now.
@@ -6946,7 +6955,8 @@ impl Node {
         // credited only for real progress (tip advance or winning reorg).
         let strict = self.rv2_open();
         let fork_fix = self.btc4_fork_fix_open();
-        let progressed = self.bridge.rail_mut(asset)?.submit_header_ex2(header, strict, fork_fix)?;
+        let slot_fix = self.btc4_fork_slot_open();
+        let progressed = self.bridge.rail_mut(asset)?.submit_header_ex3(header, strict, fork_fix, slot_fix)?;
         if let Some(w) = watcher {
             if progressed {
                 self.watcher_credit(w, 1, true);
@@ -7879,13 +7889,14 @@ impl Node {
                     let mut probe = self.btc_admission_probe(rail, &tx.account, tx.sequence);
                     let strict = self.rv2_open();
                     let fork_fix = self.btc4_fork_fix_open();
-                    if let Err(e) = probe.submit_header_ex2(crate::bridge::RailHeader {
+                    let slot_fix = self.btc4_fork_slot_open();
+                    if let Err(e) = probe.submit_header_ex3(crate::bridge::RailHeader {
                         height: *height,
                         hash: hash.clone(),
                         parent_hash: parent_hash.clone(),
                         merkle_root: merkle_root.clone(),
                         raw: raw.clone(),
-                    }, strict, fork_fix) {
+                    }, strict, fork_fix, slot_fix) {
                         if Self::is_permanent_tx_failure(&e) {
                             return Err(e);
                         }
@@ -8000,6 +8011,7 @@ impl Node {
         let mut probe = rail.clone();
         let strict = self.rv2_open();
         let fork_fix = self.btc4_fork_fix_open();
+        let slot_fix = self.btc4_fork_slot_open();
         for sibs in by_seq.values() {
             let mut ok = false;
             for t in sibs {
@@ -8013,13 +8025,13 @@ impl Node {
                         raw,
                     } if asset == &rail.asset => {
                         if probe
-                            .submit_header_ex2(crate::bridge::RailHeader {
+                            .submit_header_ex3(crate::bridge::RailHeader {
                                 height: *height,
                                 hash: hash.clone(),
                                 parent_hash: parent_hash.clone(),
                                 merkle_root: merkle_root.clone(),
                                 raw: raw.clone(),
-                            }, strict, fork_fix)
+                            }, strict, fork_fix, slot_fix)
                             .is_ok()
                         {
                             ok = true;
