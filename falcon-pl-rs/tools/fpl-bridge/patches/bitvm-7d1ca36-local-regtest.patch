@@ -116,7 +116,7 @@ new file mode 100644
 index 0000000..d8d5627
 --- /dev/null
 +++ b/bridge/examples/fpl_ceremony_coordinator.rs
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,532 @@
 +//! Standalone ceremony coordinator (holds NO verifier key).
 +//!
 +//! Builds the peg-in + peg-out graphs for one deposit using the n-of-n keys
@@ -374,6 +374,10 @@ index 0000000..d8d5627
 +    e.contains("already in block chain") || e.contains("txn-already-known") || e.contains("txn-already-in-mempool") || e.contains("-27")
 +}
 +
++fn is_spent_input(e: &str) -> bool {
++    e.contains("inputs-missingorspent") || e.contains("bad-txns-inputs-missingorspent")
++}
++
 +macro_rules! retry {
 +    ($name:expr, $call:expr) => {{
 +        loop {
@@ -533,7 +537,21 @@ index 0000000..d8d5627
 +        "timeouts" => {
 +            // operator stalls after kickoff 1: anyone claims via the presigned timeouts
 +            retry!("START_TIME_TIMEOUT", { client.broadcast_start_time_timeout(&po, spk.clone()).await });
-+            retry!("KICK_OFF_TIMEOUT", { client.broadcast_kick_off_timeout(&po, spk.clone()).await });
++            loop {
++                match client.broadcast_kick_off_timeout(&po, spk.clone()).await {
++                    Ok(t) => { println!("TX KICK_OFF_TIMEOUT {t}"); break }
++                    Err(e) => {
++                        let es = format!("{e:?}");
++                        if is_done(&es) { println!("TX KICK_OFF_TIMEOUT already broadcast"); break }
++                        if is_spent_input(&es) {
++                            println!("TX KICK_OFF_TIMEOUT skipped: kickoff input already spent (PegOutConfirm or KickOff1)");
++                            break
++                        }
++                        println!("waiting: KICK_OFF_TIMEOUT: {}", &es[..es.len().min(240)]);
++                        tokio::time::sleep(Duration::from_secs(120)).await;
++                    }
++                }
++            }
 +            let r = client.broadcast_take_1(&po).await;
 +            println!("take1 after timeouts (must fail): {:?}", r.as_ref().map(|t| t.to_string()).map_err(|e| format!("{e:?}").chars().take(200).collect::<String>()));
 +        }
@@ -610,7 +628,21 @@ index 0000000..d8d5627
 +        }
 +        "timeouts" => {
 +            retry!("START_TIME_TIMEOUT", { client.broadcast_start_time_timeout(&po, spk.clone()).await });
-+            retry!("KICK_OFF_TIMEOUT", { client.broadcast_kick_off_timeout(&po, spk.clone()).await });
++            loop {
++                match client.broadcast_kick_off_timeout(&po, spk.clone()).await {
++                    Ok(t) => { println!("TX KICK_OFF_TIMEOUT {t}"); break }
++                    Err(e) => {
++                        let es = format!("{e:?}");
++                        if is_done(&es) { println!("TX KICK_OFF_TIMEOUT already broadcast"); break }
++                        if is_spent_input(&es) {
++                            println!("TX KICK_OFF_TIMEOUT skipped: kickoff input already spent (PegOutConfirm or KickOff1)");
++                            break
++                        }
++                        println!("waiting: KICK_OFF_TIMEOUT: {}", &es[..es.len().min(240)]);
++                        tokio::time::sleep(Duration::from_secs(120)).await;
++                    }
++                }
++            }
 +        }
 +        "disprove" => fpl_disprove_flow(&mut client, &po, dir).await,
 +        s => panic!("unknown scenario {s}"),
