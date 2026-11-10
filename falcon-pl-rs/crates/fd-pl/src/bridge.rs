@@ -482,14 +482,32 @@ impl RailState {
     /// left more than [`BTC_FORK_STALE_N`] headers behind a heavier main chain.
     /// `fork_fix == false` is exactly the 2.10.0 behaviour.
     pub fn submit_header_ex2(&mut self, h: RailHeader, strict: bool, fork_fix: bool) -> Result<bool, String> {
+        self.submit_header_ex3(h, strict, fork_fix, false)
+    }
+
+    /// Later-height alt-slot replacement on top of [`Self::submit_header_ex2`].
+    /// `slot_fix` (BTC4 rail at or after `btc4_fork_slot_from_height`) lets a
+    /// new main-ancestral fork that starts *above* the current alt tip replace
+    /// `btc_fork_alt` even when its 1-header work is not strictly greater —
+    /// the leftover alt cannot be extended through that later height, so it
+    /// would otherwise permanently occupy the only competing slot.
+    /// `slot_fix == false` is exactly the 2.10.1 behaviour.
+    pub fn submit_header_ex3(
+        &mut self,
+        h: RailHeader,
+        strict: bool,
+        fork_fix: bool,
+        slot_fix: bool,
+    ) -> Result<bool, String> {
         if !strict || !self.is_btc() {
             return self.submit_header(h).map(|_| true);
         }
         let fork_fix = fork_fix && self.asset == RAIL_BTC4;
-        self.submit_btc_header_strict(h, fork_fix)
+        let slot_fix = slot_fix && fork_fix;
+        self.submit_btc_header_strict(h, fork_fix, slot_fix)
     }
 
-    fn submit_btc_header_strict(&mut self, mut h: RailHeader, fork_fix: bool) -> Result<bool, String> {
+    fn submit_btc_header_strict(&mut self, mut h: RailHeader, fork_fix: bool, slot_fix: bool) -> Result<bool, String> {
         if h.raw.is_empty() {
             return Err("BTC rail requires 80-byte Bitcoin header".into());
         }
@@ -602,6 +620,19 @@ impl RailState {
                     if !self.btc_fork_alt.is_empty() {
                         let alt: u128 = self.btc_fork_alt.iter().map(header_work).fold(0, u128::saturating_add);
                         if btc_spv::header_work_bits(parsed.bits) <= alt {
+                            // Leftover earlier-height alt cannot be extended
+                            // to include this later fork (it would have to
+                            // pass through heights already on a different
+                            // parent). Replace the slot so the submitter can
+                            // accumulate the later branch.
+                            if slot_fix {
+                                if let Some(alt_tip) = self.btc_fork_alt.last() {
+                                    if h.height > alt_tip.height {
+                                        self.btc_fork_alt = vec![h];
+                                        return Ok(false);
+                                    }
+                                }
+                            }
                             return Err("BTC fork has less work than the competing branch".into());
                         }
                     }

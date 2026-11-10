@@ -33,7 +33,7 @@
 # (and an interactive confirmation unless --yes). Docs: docs/PUBLIC_NODE.md in the Falcon-PL repo.
 set -euo pipefail
 
-INSTALLER_VERSION="2.11.2"
+INSTALLER_VERSION="2.11.3"
 RELEASE_REPO="${FALCON_RELEASE_REPO:-beartec-jpg/falcon-pl-releases}"
 # Pinned minisign public key of the Falcon PL release key (key id 8ACFFC29EE09FAEC).
 # A valid SHA256SUMS.minisig is REQUIRED. FALCON_MINISIGN_PUBKEY="" disables the check, but only together

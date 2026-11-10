@@ -154,3 +154,146 @@ fn activation_height_gate() {
     assert!(h > crate::params_v2::TESTNET_2300_V2_10_FROM_HEIGHT);
     assert_eq!(crate::params_v2::btc4_fork_fix_from_height(crate::NETWORK_ID_PUBLIC_TESTNET_2300), h);
 }
+
+/// Live 2026-11-10 stall geometry, scaled to the real heights:
+/// main 160180..=160187, leftover 1-header pending + alt at 160182 (equal
+/// difficulty-1 work), canonical walk from ancestor 160185.
+struct LeftoverStall {
+    r: RailState,
+    ancestor: btc_spv::ParsedHeader, // 160185
+    fork_parent: btc_spv::ParsedHeader, // 160181
+    leftover_pending: btc_spv::ParsedHeader,
+    leftover_alt: btc_spv::ParsedHeader,
+    real: Vec<btc_spv::ParsedHeader>, // 160186, 160187, 160188
+}
+
+fn leftover_stall(fork_fix: bool) -> LeftoverStall {
+    let mut r = RailState::new(RAIL_BTC4);
+    let mut prev = "00".repeat(32);
+    let mut at = std::collections::BTreeMap::new();
+    for (i, h) in (160_180u64..=160_182).enumerate() {
+        let p = mine(&prev, 0x10 + i as u8, 1_700_100_000 + i as u32);
+        assert!(r.submit_header_ex2(rh(h, &p), true, fork_fix).unwrap());
+        prev = p.hash_display.clone();
+        at.insert(h, p);
+    }
+    let fork_parent = at[&160_181].clone();
+    let leftover_pending = mine(&fork_parent.hash_display, 0xb1, 1_700_100_050);
+    assert!(
+        !r.submit_header_ex2(rh(160_182, &leftover_pending), true, fork_fix).unwrap(),
+        "equal work: pending only"
+    );
+    let leftover_alt = mine(&fork_parent.hash_display, 0xb2, 1_700_100_051);
+    if fork_fix {
+        assert!(!r.submit_header_ex2(rh(160_182, &leftover_alt), true, fork_fix).unwrap());
+        assert_eq!(r.btc_fork_alt.len(), 1);
+        assert_eq!(r.btc_fork.len(), 1);
+    }
+    for (i, h) in (160_183u64..=160_187).enumerate() {
+        let p = mine(&prev, 0x20 + i as u8, 1_700_100_100 + i as u32);
+        assert!(r.submit_header_ex2(rh(h, &p), true, fork_fix).unwrap());
+        prev = p.hash_display.clone();
+        at.insert(h, p);
+    }
+    assert_eq!(r.tip_height, 160_187);
+    // 5 headers past 160182; BTC_FORK_STALE_N = 6, so leftovers stay.
+    assert_eq!(r.btc_fork.len(), 1);
+    if fork_fix {
+        assert_eq!(r.btc_fork_alt.len(), 1);
+    }
+    let ancestor = at[&160_185].clone();
+    let mut real = vec![];
+    let mut p = ancestor.hash_display.clone();
+    for i in 0..3u32 {
+        let h = mine(&p, 0xc0 + i as u8, 1_700_100_200 + i);
+        p = h.hash_display.clone();
+        real.push(h);
+    }
+    LeftoverStall { r, ancestor, fork_parent, leftover_pending, leftover_alt, real }
+}
+
+#[test]
+fn leftover_early_forks_block_later_canonical_walk_without_slot_fix() {
+    let mut s = leftover_stall(true);
+    let e = s.r.submit_header_ex2(rh(160_186, &s.real[0]), true, true).unwrap_err();
+    assert_eq!(e, "BTC fork has less work than the competing branch");
+    let e = s.r.submit_header_ex3(rh(160_186, &s.real[0]), true, true, false).unwrap_err();
+    assert_eq!(e, "BTC fork has less work than the competing branch");
+    assert_eq!(s.r.tip_height, 160_187);
+    assert_eq!(s.r.btc_fork.len(), 1);
+    assert_eq!(s.r.btc_fork_alt.len(), 1);
+    assert_eq!(s.r.btc_fork[0].hash, s.leftover_pending.hash_display);
+    assert_eq!(s.r.btc_fork_alt[0].hash, s.leftover_alt.hash_display);
+}
+
+#[test]
+fn slot_fix_replaces_stale_alt_and_reorgs_onto_later_canonical_walk() {
+    let mut s = leftover_stall(true);
+    // 160186: later-height start replaces leftover alt; tip stays.
+    assert!(!s.r.submit_header_ex3(rh(160_186, &s.real[0]), true, true, true).unwrap());
+    assert_eq!(s.r.tip_height, 160_187);
+    assert_eq!(s.r.btc_fork_alt.len(), 1);
+    assert_eq!(s.r.btc_fork_alt[0].hash, s.real[0].hash_display);
+    assert_eq!(s.r.btc_fork[0].hash, s.leftover_pending.hash_display);
+
+    // 160187: extend alt (2 headers) > pending (1) -> promote; vs main
+    // suffix from 186 (2 headers) equal work, no switch.
+    assert!(!s.r.submit_header_ex3(rh(160_187, &s.real[1]), true, true, true).unwrap());
+    assert_eq!(s.r.tip_height, 160_187);
+    assert_eq!(s.r.btc_fork.len(), 2);
+    assert!(s.r.btc_fork_alt.is_empty());
+
+    // 160188: 3-header pending > 2-header main suffix -> reorg onto real chain.
+    assert!(s.r.submit_header_ex3(rh(160_188, &s.real[2]), true, true, true).unwrap());
+    assert_eq!(s.r.tip_height, 160_188);
+    assert_eq!(s.r.tip_hash, s.real[2].hash_display);
+    assert_eq!(s.r.headers.get(&160_185).unwrap().hash, s.ancestor.hash_display);
+    assert_eq!(s.r.headers.get(&160_186).unwrap().hash, s.real[0].hash_display);
+    assert_eq!(s.r.headers.get(&160_187).unwrap().hash, s.real[1].hash_display);
+    assert!(s.r.btc_fork.is_empty() && s.r.btc_fork_alt.is_empty());
+}
+
+#[test]
+fn slot_fix_still_rejects_same_or_earlier_height_weaker_fork() {
+    let mut s = leftover_stall(true);
+    let extra = mine(&s.fork_parent.hash_display, 0xb3, 1_700_100_060);
+    let e = s.r.submit_header_ex3(rh(160_182, &extra), true, true, true).unwrap_err();
+    assert_eq!(e, "BTC fork has less work than the competing branch");
+    assert_eq!(s.r.btc_fork_alt[0].hash, s.leftover_alt.hash_display);
+}
+
+/// Three independent rails apply the same header sequence (a multi-seat
+/// consensus rehearsal of the live stall + repair). They must finish with
+/// identical tip, hashes, and fork slots.
+#[test]
+fn slot_fix_multi_rail_consensus_rehearsal() {
+    let seq = leftover_stall(true);
+    let rails: Vec<RailState> = (0..3).map(|_| leftover_stall(true).r).collect();
+    let mut rails = rails;
+    for r in rails.iter_mut() {
+        assert!(!r.submit_header_ex3(rh(160_186, &seq.real[0]), true, true, true).unwrap());
+        assert!(!r.submit_header_ex3(rh(160_187, &seq.real[1]), true, true, true).unwrap());
+        assert!(r.submit_header_ex3(rh(160_188, &seq.real[2]), true, true, true).unwrap());
+    }
+    let tip = rails[0].tip_hash.clone();
+    assert_eq!(rails[0].tip_height, 160_188);
+    for r in &rails {
+        assert_eq!(r.tip_height, 160_188);
+        assert_eq!(r.tip_hash, tip);
+        assert_eq!(r.headers.get(&160_186).unwrap().hash, seq.real[0].hash_display);
+        assert!(r.btc_fork.is_empty() && r.btc_fork_alt.is_empty());
+        assert_eq!(serde_json::to_string(r).unwrap(), serde_json::to_string(&rails[0]).unwrap());
+    }
+}
+
+#[test]
+fn slot_fix_activation_height_gate() {
+    let h = crate::params_v2::TESTNET_2300_BTC4_FORK_SLOT_HEIGHT;
+    assert!(h > crate::params_v2::TESTNET_2300_BTC4_FORK_FIX_HEIGHT);
+    assert_eq!(h, 860_000);
+    assert_eq!(
+        crate::params_v2::btc4_fork_slot_from_height(crate::NETWORK_ID_PUBLIC_TESTNET_2300),
+        h
+    );
+}
+
