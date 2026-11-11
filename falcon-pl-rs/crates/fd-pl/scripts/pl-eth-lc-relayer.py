@@ -54,6 +54,12 @@ scan_unminted_v3_deposits: ALERT unminted V3 deposit <id> age=<s>s when a V3
 Deposit is older than ETH_V3_UNMINTED_SEC (default 1800) and its id is not in
 body.eth_v3_resolutions. Each V3 scan ends with a 'V3 deposit scan' summary line.
 Both alerts repeat, throttled by ETH_ALERT_EVERY_SEC (default 600).
+Discord (optional): if DISCORD_HEALTH_WEBHOOK_URL (the node alerts' env var)
+is set when the daemon starts, each unminted deposit (V1/V2 by txid, V3 by
+deposit_id) is posted once, and one recovery note is posted when it mints.
+Posted keys persist in ETH_DISCORD_STATE (default
+run/bridge/eth-unminted-discord.json), so a restart does not repost. Unset
+means no Discord at all. `discord-test` sends one labelled TEST message.
 The scan's ETH_SCAN_BUDGET_SEC is split: eth_getLogs stops starting spans at
 75% of it, and the timestamp lookups for logs already fetched get their own
 allowance (at most 64 distinct blocks per cycle). A short timestamp pass
@@ -77,6 +83,7 @@ receipt MPT against a header walk that ends at that head.
   pl-eth-lc-relayer.py update
   pl-eth-lc-relayer.py daemon
   pl-eth-lc-relayer.py mint --account dave --txid 0x...
+  pl-eth-lc-relayer.py discord-test
 """
 from __future__ import annotations
 
@@ -87,6 +94,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -100,6 +108,7 @@ _SCRIPT = Path(__file__).resolve()
 if str(_SCRIPT.parent) not in sys.path:
     sys.path.insert(0, str(_SCRIPT.parent))
 from eth_bridge_config import BEACON_RPC, ETH_RPC, FALCON_QC_BRIDGE, SEPOLIA_USDC  # noqa: E402
+import fpl_discord_notify  # noqa: E402
 
 ROOT = Path(os.environ.get("PL_ROOT", str(Path.home() / "falcon-pl-public-testnet-2300")))
 CTL = Path(os.environ.get("FPL_CTL", str(ROOT / "bin/falcon-pl-ctl")))
@@ -2641,6 +2650,7 @@ def scan_unminted_deposits(st: dict, now: float | None = None) -> list[str]:
     lines = unminted_deposit_alerts(deposits, spent, now)
     for line in lines:
         print(line, flush=True)
+    discord_sync_unminted("eth:v12", lines, spent, UNMINTED_DEPOSIT_SEC, "V1/V2")
     return lines
 
 
@@ -2754,6 +2764,7 @@ def scan_unminted_v3_deposits(st: dict | None, now: float | None = None) -> list
     lines = v3_unminted_alerts(_v3_seen, resolved, now, V3_UNMINTED_SEC)
     for line in lines:
         print(line, flush=True)
+    discord_sync_unminted("eth:v3", lines, resolved, V3_UNMINTED_SEC, "V3")
     print(
         f"V3 deposit scan bridge={V3_BRIDGE} blocks={lo}..{head_n} spans={spans} "
         f"deposits={len(_v3_seen)} resolved={len(resolved)} unminted={len(lines)} "
@@ -2761,6 +2772,61 @@ def scan_unminted_v3_deposits(st: dict | None, now: float | None = None) -> list
         flush=True,
     )
     return lines
+
+
+DISCORD_TEST_LABEL = "TEST: Falcon relayer unminted-deposit alert (no action needed)"
+DISCORD_STATE = Path(
+    os.environ.get("ETH_DISCORD_STATE", str(ROOT / "run/bridge/eth-unminted-discord.json"))
+)
+# Set by init_discord() when the daemon starts; None = Discord off.
+_discord: fpl_discord_notify.DiscordAlerts | None = None
+_ALERT_ID_RE = re.compile(r"^ALERT unminted (?:V3 )?deposit ([0-9a-fA-F]+) ")
+
+
+def init_discord(**kw) -> fpl_discord_notify.DiscordAlerts | None:
+    """Read DISCORD_HEALTH_WEBHOOK_URL once. Unset: Discord stays off (no-op)."""
+    global _discord
+    d = fpl_discord_notify.DiscordAlerts(DISCORD_STATE, source="eth-lc-relayer", **kw)
+    _discord = d if d.enabled else None
+    print(f"discord alerts {'on' if _discord else 'off'} ({fpl_discord_notify.WEBHOOK_ENV})", flush=True)
+    return _discord
+
+
+def discord_sync_unminted(prefix: str, lines: list[str], minted: set[str], threshold: int, label: str) -> None:
+    """Post each newly stuck deposit once; post a recovery once it has minted.
+
+    Only called after a scan really ran (not when throttled), and a recovery
+    needs positive evidence (txid in spent_deposits / deposit_id in
+    eth_v3_resolutions), so an incomplete scan never clears an alert.
+    """
+    d = _discord
+    if d is None:
+        return
+    try:
+        mins = max(1, int(threshold) // 60)
+        for line in lines:
+            m = _ALERT_ID_RE.match(line)
+            if not m:
+                continue
+            dep = m.group(1).lower()
+            d.fire(
+                f"{prefix}:{dep}",
+                f"ETH/USDC {label} deposit unminted over {mins} min",
+                line.removeprefix("ALERT ")[:1500],
+            )
+        for key in d.active_keys(prefix + ":"):
+            dep = key.rsplit(":", 1)[-1]
+            if dep in minted:
+                d.resolve(key, f"{label} deposit {dep} minted")
+        d.forget_stale()
+        d.flush()
+    except Exception as e:  # never let Discord break the relayer loop
+        print(f"WARN discord {type(e).__name__}: {e}", flush=True)
+
+
+def cmd_discord_test() -> int:
+    d = fpl_discord_notify.DiscordAlerts(DISCORD_STATE, source="eth-lc-relayer")
+    return 0 if d.send_test(DISCORD_TEST_LABEL) else 1
 
 
 def announce_beacon() -> None:
@@ -2791,6 +2857,9 @@ def main() -> int:
     # refuses watcher-eth-lc.
     global ACCOUNT
     cmd = args.cmd
+    if cmd == "discord-test":
+        # No signer, node or beacon needed: one labelled message, then exit.
+        return cmd_discord_test()
     ACCOUNT = resolve_account(cmd)
     if cmd == "mint":
         assert_mint_account()
@@ -2802,6 +2871,7 @@ def main() -> int:
     elif cmd == "update":
         cmd_update(soft=True)
     elif cmd == "daemon":
+        init_discord()
         cmd_daemon()
     elif cmd == "mint":
         if not args.account or not args.txid:
@@ -2810,7 +2880,7 @@ def main() -> int:
     elif cmd == "selfcheck":
         cmd_selfcheck()
     else:
-        raise SystemExit("bootstrap | update | daemon | mint | selfcheck")
+        raise SystemExit("bootstrap | update | daemon | mint | selfcheck | discord-test")
     return 0
 
 
