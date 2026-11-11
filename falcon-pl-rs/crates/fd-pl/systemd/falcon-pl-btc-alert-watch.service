@@ -1,0 +1,38 @@
+# Read-only BTC4 Discord alert watcher (stale headers, submitter down/failing,
+# unminted deposits). Not a committee seat, not a signer: it never submits a
+# tx and never talks to bitcoind. See docs/DISCORD_ALERTS.md.
+# The webhook comes only from /etc/falcon-pl-alerts/discord.env (root 0600,
+# key DISCORD_HEALTH_WEBHOOK_URL). Missing file or key = watcher exits 0.
+[Unit]
+Description=Falcon PL BTC4 Discord alert watch (read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# root only to read the intake request files (fpl-bridge-intake runs as root).
+User=root
+EnvironmentFile=-/etc/falcon-pl-alerts/discord.env
+Environment=PL_ROOT=/home/falcon/falcon-pl-public-testnet-2300
+Environment=FPL_CTL=/home/falcon/falcon-pl-public-testnet-2300/bin/falcon-pl-ctl
+Environment=FPL_RPC=127.0.0.1:19301
+Environment=BTC4_EXPLORER=https://mempool.space/testnet4/api
+Environment=BTC_SUBMITTER_UNITS=falcon-pl-btc4-header-submitter.service
+Environment=BTC_INTAKE_STATE=/opt/fpl-operator/intake
+Environment=BTC_DISCORD_STATE=/var/lib/falcon-pl-btc-alert-watch/discord.json
+StateDirectory=falcon-pl-btc-alert-watch
+StateDirectoryMode=0700
+ExecStart=/usr/bin/python3 /home/falcon/falcon-pl-public-testnet-2300/scripts/pl-btc-alert-watch.py
+Restart=on-failure
+RestartSec=30
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/falcon-pl-btc-alert-watch
+StandardOutput=append:/home/falcon/falcon-pl-public-testnet-2300/logs/btc-alert-watch.log
+StandardError=append:/home/falcon/falcon-pl-public-testnet-2300/logs/btc-alert-watch.log
+
+[Install]
+WantedBy=multi-user.target
