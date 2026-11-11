@@ -69,6 +69,8 @@ struct Config {
     btc_pubkey_hex: String,
     payout_address: String,
     fee_rate: u64,
+    /// PEG_OUT fee rate (sat/vB, floor 2): paid ON TOP of the exact withdrawal amount.
+    pegout_fee_rate: u64,
     quorum: Option<usize>,
     intent_wait_secs: u64,
     payout_deadline_secs: u64,
@@ -144,7 +146,8 @@ impl Config {
             btc_xonly_hex: g("FPL_OP_BTC_XONLY", ""),
             btc_pubkey_hex: g("FPL_OP_BTC_PUBKEY", "").to_ascii_lowercase(),
             payout_address: g("FPL_OP_PAYOUT_ADDRESS", ""),
-            fee_rate: n("FPL_OP_FEE_RATE", 1),
+            fee_rate: n("FPL_OP_FEE_RATE", MIN_FEE_RATE).max(MIN_FEE_RATE),
+            pegout_fee_rate: n("FPL_OP_PEGOUT_FEE_RATE", MIN_FEE_RATE).max(MIN_FEE_RATE),
             quorum: g("FPL_OP_QUORUM", "").parse().ok(),
             intent_wait_secs: n("FPL_OP_INTENT_WAIT_SECS", 60),
             payout_deadline_secs: n("FPL_OP_PAYOUT_DEADLINE_SECS", 6 * 3600),
@@ -687,6 +690,22 @@ fn available_capacity(cfg: &Config, wallet: u64, st: &State) -> u64 {
     wallet.saturating_sub(committed).saturating_sub(cfg.min_wallet_reserve_sats)
 }
 
+/// Floor for operator-paid fee rates (sat/vB): 0.125-1 sat/vB payouts sat unconfirmed on testnet4.
+pub(crate) const MIN_FEE_RATE: u64 = 2;
+/// PEG_OUT vsize estimate (1 P2WSH(P2PK) input, 1 output), as upstream MIN_RELAY_FEE_PEG_OUT.
+pub(crate) const PEG_OUT_VSIZE: u64 = 122;
+
+/// Sats the PEG_OUT itself pays in fees at `rate` sat/vB.
+pub(crate) fn pegout_fee_sats(rate: u64) -> u64 {
+    rate.max(MIN_FEE_RATE) * PEG_OUT_VSIZE
+}
+
+/// PEG_OUT input the operator funds: the EXACT withdrawal amount (ledger M1 attest requires an
+/// output of exactly the burn amount to the dest) plus the PEG_OUT fee on top.
+pub(crate) fn payout_funding_sats(amount: u64, pegout_fee_rate: u64) -> u64 {
+    amount + pegout_fee_sats(pegout_fee_rate)
+}
+
 fn fronted_amount(cfg: &Config, amount: u64) -> u64 {
     amount - (amount as u128 * cfg.payout_fee_bps as u128 / 10_000) as u64
 }
@@ -986,6 +1005,7 @@ fn run_graph_steps(n: &Node, c: &ClaimState, claims_file: &Path) -> Result<(), S
         ("FPL_CLAIM_AMOUNT".to_string(), c.amount.to_string()),
         ("FPL_CLAIM_DEST".to_string(), c.dest.clone()),
         ("FPL_PAYOUT_OUTPOINT".to_string(), c.payout_txid.clone()),
+        ("FPL_PEG_OUT_FEE_SAT_PER_VB".to_string(), n.cfg.pegout_fee_rate.to_string()),
         ("FPL_DEPOSIT_DIR".to_string(), c.deposit_dir.clone()),
         ("FPL_FALCON_CLAIMS".to_string(), claims_file.to_string_lossy().to_string()),
         ("FPL_NETWORK".to_string(), n.cfg.network.clone()),
@@ -1071,7 +1091,7 @@ fn operate(n: &Node, st: &mut State, ledger: &[LedgerClaim], h: &mut Health, sta
             }
         }
         if e.phase == "seen" {
-            let fronted = fronted_amount(&n.cfg, lc.amount);
+            let fronted = payout_funding_sats(lc.amount, n.cfg.pegout_fee_rate);
             if available_capacity(&n.cfg, h.btc_wallet_sats, st) < fronted {
                 st.claims.get_mut(&lc.note_id).unwrap().detail = "insufficient operator BTC; will retry".into();
                 continue;
@@ -1111,7 +1131,7 @@ fn operate(n: &Node, st: &mut State, ledger: &[LedgerClaim], h: &mut Health, sta
             st.claims.get_mut(&lc.note_id).unwrap().detail = format!("dry-run: won; would fund PEG_OUT with {fronted} sats for {} using deposit {}", lc.dest, e.deposit_outpoint);
             continue;
         }
-        match front_payout(&n.cfg, fronted) {
+        match front_payout(&n.cfg, payout_funding_sats(lc.amount, n.cfg.pegout_fee_rate)) {
             Ok(op) => {
                 log(&format!("claim {}: funded PEG_OUT input {op}", lc.note_id));
                 deposits::bind_claim(&n.cfg.graphs(), &lc.note_id, Path::new(&e.deposit_dir));
@@ -1217,14 +1237,14 @@ fn check_payout(n: &Node, r: &Record, lc: &LedgerClaim, recs: &[Record]) -> Opti
     // Err("tx-not-found: ..") only for a genuine RPC -5 with synced txindex; Err("unavailable: ..")
     // when bitcoind and esplora can't tell (never grounds for a challenge: skip and retry next poll).
     let verify = |txid: &str| -> Result<(), String> {
-        let spk = payout::expected_payout_spk(&lc.dest, lc.open_height, &lc.note_id, &n.cfg.network)?;
+
         let min = payout::min_payout(lc.amount, n.cfg.max_peer_fee_bps, n.cfg.pegout_fee_allow_sats);
         let outs = match btc_tx_lookup(&n.cfg, txid) {
             TxLookup::Found(outs, _) => outs,
             TxLookup::NotFound => return Err(format!("tx-not-found: {txid}")),
             TxLookup::Unavailable(e) => return Err(format!("unavailable: {e}")),
         };
-        payout::payout_matches(&outs, &spk, min).map(|_| ())
+        payout::payout_ok(&outs, &lc.dest, lc.open_height, &lc.note_id, lc.amount, min, &n.cfg.network).map(|_| ())
     };
     match r.kind.as_str() {
         "PegOut" => match verify(&pegout_txid(r)) {
@@ -1513,7 +1533,9 @@ FPL_OP_CHALLENGE_VK_DIR=
 FPL_OP_BTC_XONLY=
 FPL_OP_BTC_PUBKEY=
 FPL_OP_PAYOUT_ADDRESS=
-FPL_OP_FEE_RATE=1
+FPL_OP_FEE_RATE=2
+# PEG_OUT fee (sat/vB, min 2), paid on top of the exact withdrawal amount
+FPL_OP_PEGOUT_FEE_RATE=2
 # cross-check quorum (default ceil(2/3) of other registered operators)
 #FPL_OP_QUORUM=
 FPL_OP_INTENT_WAIT_SECS=60
@@ -1807,6 +1829,11 @@ mod tests {
         let mut cfg = Config::load(Path::new("/nonexistent"));
         cfg.payout_fee_bps = 30;
         assert_eq!(fronted_amount(&cfg, 100_000), 99_700);
+        // PEG_OUT fee is paid on top of the exact amount, at >= 2 sat/vB
+        assert_eq!(pegout_fee_sats(0), 244);
+        assert_eq!(pegout_fee_sats(1), 244);
+        assert_eq!(pegout_fee_sats(5), 610);
+        assert_eq!(payout_funding_sats(50_000, 2), 50_244);
     }
 }
 

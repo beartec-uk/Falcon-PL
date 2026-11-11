@@ -78,9 +78,20 @@ fn merkle_root_display(txids_display: &[String]) -> Result<String, String> {
     Ok(btc_spv::display_hex(&level[0]))
 }
 
-fn btc_rail(status: &Value) -> Result<&Value, String> {
+/// Bitcoin rail holding `note` (BTC4 = Testnet4 BitVM2 rail, or legacy BTC).
+/// Before this fix only the legacy "BTC" rail was searched, so every BTC4
+/// claim failed with "claim not in status" and could never be attested.
+fn btc_rail<'a>(status: &'a Value, note: &str) -> Result<&'a Value, String> {
     let b = status.get("body").unwrap_or(status);
-    b["rails"].as_array().into_iter().flatten().find(|r| r["asset"].as_str().map_or(false, |a| a.eq_ignore_ascii_case("btc"))).ok_or_else(|| "no BTC rail in status".into())
+    let rails: Vec<&Value> = b["rails"].as_array().into_iter().flatten()
+        .filter(|r| r["asset"].as_str().map_or(false, |a| a.eq_ignore_ascii_case("btc4") || a.eq_ignore_ascii_case("btc")))
+        .collect();
+    if rails.is_empty() {
+        return Err("no BTC/BTC4 rail in status".into());
+    }
+    rails.into_iter()
+        .find(|r| r["bitvm2_claims"].as_array().into_iter().flatten().any(|c| c["note_id"].as_str() == Some(note)))
+        .ok_or_else(|| "claim not in status".into())
 }
 
 fn input() -> Result<Value, String> {
@@ -89,7 +100,7 @@ fn input() -> Result<Value, String> {
     let pegout_display = req("--pegout-txid")?.to_ascii_lowercase();
     let b = status.get("body").unwrap_or(&status);
     let ledger_height = b["height"].as_u64().or(b["tip_height"].as_u64()).ok_or("status has no height")?;
-    let rail = btc_rail(&status)?;
+    let rail = btc_rail(&status, &note)?;
     let c = rail["bitvm2_claims"].as_array().into_iter().flatten().find(|c| c["note_id"].as_str() == Some(note.as_str())).ok_or("claim not in status")?;
     let dest = c["dest"].as_str().ok_or("claim.dest")?;
     let amount = c["amount"].as_u64().ok_or("claim.amount")?;
@@ -198,5 +209,21 @@ mod tests {
         assert_eq!(pick_checkpoint(&c, 100, 193, None).unwrap().0, 128);
         assert!(pick_checkpoint(&c, 193, 400, None).is_err());
         assert_eq!(pick_checkpoint(&c, 0, 400, Some(64)).unwrap().0, 64);
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use super::btc_rail;
+    use serde_json::json;
+    #[test]
+    fn finds_btc4_claim() {
+        let st = json!({"body": {"rails": [
+            {"asset": "BTC", "bitvm2_claims": [{"note_id": "old"}]},
+            {"asset": "BTC4", "bitvm2_claims": [{"note_id": "n4"}]}]}});
+        assert_eq!(btc_rail(&st, "n4").unwrap()["asset"], "BTC4");
+        assert_eq!(btc_rail(&st, "old").unwrap()["asset"], "BTC");
+        assert!(btc_rail(&st, "missing").is_err());
+        assert!(btc_rail(&json!({"rails": [{"asset": "ETH"}]}), "n4").is_err());
     }
 }

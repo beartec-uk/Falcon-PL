@@ -113,7 +113,7 @@ index e752301..58ec566 100644
 +fpl-tn4-timelocks = []
 diff --git a/bridge/examples/fpl_ceremony_coordinator.rs b/bridge/examples/fpl_ceremony_coordinator.rs
 new file mode 100644
-index 0000000..d8d5627
+index 0000000..041e1f9
 --- /dev/null
 +++ b/bridge/examples/fpl_ceremony_coordinator.rs
 @@ -0,0 +1,532 @@
@@ -2461,10 +2461,10 @@ index 0000000..943a550
 +}
 diff --git a/bridge/src/fpl_watcher.rs b/bridge/src/fpl_watcher.rs
 new file mode 100644
-index 0000000..113bcc4
+index 0000000..e7594e2
 --- /dev/null
 +++ b/bridge/src/fpl_watcher.rs
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,323 @@
 +//! FPL patch (M3): permissionless challenger / disprover watcher.
 +//!
 +//! Needs no n-of-n key and no operator key: anyone running it with a small
@@ -2512,7 +2512,18 @@ index 0000000..113bcc4
 +    },
 +    /// Bitcoin Core JSON-RPC of a node that mines (our own testnet4 miner,
 +    /// started with acceptnonstdtxn=1). Credentials from env vars.
-+    BitcoindRpc { name: String, url: String, user_env: String, pass_env: String },
++    /// If the env vars are unset, the login is read from the node's own local config:
++    /// `conf` (rpcuser=/rpcpassword= lines) or `cookie` (`user:pass` .cookie file). Never logged.
++    BitcoindRpc {
++        name: String,
++        url: String,
++        user_env: String,
++        pass_env: String,
++        #[serde(default)]
++        conf: Option<String>,
++        #[serde(default)]
++        cookie: Option<String>,
++    },
 +}
 +fn default_ct() -> String {
 +    "text/plain".into()
@@ -2564,9 +2575,8 @@ index 0000000..113bcc4
 +                let body = r.text().await.unwrap_or_default();
 +                if st.is_success() { Ok(body) } else { Err(format!("{st}: {body}")) }
 +            }
-+            SubmitChannel::BitcoindRpc { url, user_env, pass_env, .. } => {
-+                let user = std::env::var(user_env).map_err(|_| format!("{user_env} unset"))?;
-+                let pass = std::env::var(pass_env).map_err(|_| format!("{pass_env} unset"))?;
++            SubmitChannel::BitcoindRpc { url, user_env, pass_env, conf, cookie, .. } => {
++                let (user, pass) = rpc_login(user_env, pass_env, conf.as_deref(), cookie.as_deref())?;
 +                let body = serde_json::json!({"jsonrpc":"1.0","id":"fpl","method":"sendrawtransaction","params":[hex, 0]});
 +                let r = http.post(url).basic_auth(user, Some(pass)).header("Content-Type", "application/json").body(body.to_string()).send().await.map_err(|e| e.to_string())?;
 +                let v: serde_json::Value = serde_json::from_str(&r.text().await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -2574,6 +2584,29 @@ index 0000000..113bcc4
 +            }
 +        }
 +    }
++}
++
++/// RPC login: env vars first, then rpcuser/rpcpassword from a bitcoin.conf, then a .cookie file.
++pub fn rpc_login(user_env: &str, pass_env: &str, conf: Option<&str>, cookie: Option<&str>) -> Result<(String, String), String> {
++    if let (Ok(u), Ok(p)) = (std::env::var(user_env), std::env::var(pass_env)) {
++        return Ok((u, p));
++    }
++    if let Some(path) = conf {
++        if let Ok(text) = std::fs::read_to_string(path) {
++            let get = |k: &str| text.lines().map(str::trim).find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()));
++            if let (Some(u), Some(p)) = (get("rpcuser="), get("rpcpassword=")) {
++                return Ok((u, p));
++            }
++        }
++    }
++    if let Some(path) = cookie {
++        if let Ok(text) = std::fs::read_to_string(path) {
++            if let Some((u, p)) = text.trim().split_once(':') {
++                return Ok((u.to_string(), p.to_string()));
++            }
++        }
++    }
++    Err(format!("{user_env} unset and no rpc login in conf/cookie"))
 +}
 +
 +/// 400k WU standardness limit.
@@ -2689,6 +2722,11 @@ index 0000000..113bcc4
 +        }
 +        WatchAction::TryDisprove => {
 +            st.tried_disprove = true;
++            // FPL fix: build every attempt from a FRESH copy of the graph. `disprove` appends the
++            // reward input/output + witness to the graph's stored tx, so retrying on the same
++            // graph grew the tx by ~956k WU per attempt (265M WU after 278 retries: unminable).
++            let mut fresh = graph.clone();
++            let graph = &mut fresh;
 +            let built = match graph.disprove(c, who.reward_spk.clone(), vk).await {
 +                Ok(tx) => Ok(tx),
 +                Err(e) => {
@@ -2716,6 +2754,8 @@ index 0000000..113bcc4
 +        WatchAction::TryDisproveChain => {
 +            if !st.tried_disprove_chain {
 +                st.tried_disprove_chain = true;
++                let mut fresh = graph.clone();
++                let graph = &mut fresh;
 +                match graph.disprove_chain(c, who.reward_spk.clone()).await {
 +                    Ok(tx) => {
 +                        let (ok, att) = submit(cfg, &tx).await;
@@ -2728,6 +2768,25 @@ index 0000000..113bcc4
 +        _ => {}
 +    }
 +    a
++}
++
++#[cfg(test)]
++mod fpl_rpc_login_tests {
++    use super::rpc_login;
++    #[test]
++    fn login_from_conf_then_cookie() {
++        let d = std::env::temp_dir().join(format!("fplw-{}", std::process::id()));
++        std::fs::create_dir_all(&d).unwrap();
++        let conf = d.join("bitcoin.conf");
++        std::fs::write(&conf, "testnet4=1\n[testnet4]\nrpcuser=u1\nrpcpassword=p1\n").unwrap();
++        let ck = d.join(".cookie");
++        std::fs::write(&ck, "__cookie__:abc\n").unwrap();
++        let e = ("FPLW_TEST_U_UNSET", "FPLW_TEST_P_UNSET");
++        assert_eq!(rpc_login(e.0, e.1, Some(conf.to_str().unwrap()), None).unwrap(), ("u1".into(), "p1".into()));
++        assert_eq!(rpc_login(e.0, e.1, None, Some(ck.to_str().unwrap())).unwrap(), ("__cookie__".into(), "abc".into()));
++        assert!(rpc_login(e.0, e.1, None, None).is_err());
++        let _ = std::fs::remove_dir_all(&d);
++    }
 +}
 diff --git a/bridge/src/graphs/base.rs b/bridge/src/graphs/base.rs
 index 1a73a51..505b64f 100644
@@ -3697,6 +3756,91 @@ index 3983570..e4dd35f 100644
      pub fn add_inputs_and_output(
          &mut self,
          inputs: &Vec<InputWithScript>,
+diff --git a/bridge/src/transactions/peg_out.rs b/bridge/src/transactions/peg_out.rs
+index a134b43..a17cc3f 100644
+--- a/bridge/src/transactions/peg_out.rs
++++ b/bridge/src/transactions/peg_out.rs
+@@ -66,17 +66,19 @@ impl PegOutTransaction {
+             witness: Witness::default(),
+         };
+ 
+-        let total_output_amount = input_0.amount - Amount::from_sat(MIN_RELAY_FEE_PEG_OUT);
++        // FPL: pay the EXACT withdrawal amount to the withdrawer's own address (the Falcon ledger's
++        // M1 attest requires an output of exactly the burn amount to the claim dest), with the
++        // PEG_OUT fee paid on top by the operator at >= 2 sat/vB (fpl_peg_out_fee). Upstream paid
++        // input - 16 sats (0.13 sat/vB) to an inscription P2WSH the ledger cannot attest.
++        let fee = Amount::from_sat(fpl_peg_out_fee());
++        let total_output_amount = core::cmp::min(
++            peg_out_event.amount,
++            input_0.amount.checked_sub(fee).unwrap_or(Amount::ZERO),
++        );
+ 
+         let _output_0 = TxOut {
+             value: total_output_amount,
+-            script_pubkey: generate_pay_to_pubkey_hash_with_inscription_script_address(
+-                network,
+-                &peg_out_event.withdrawer_public_key_hash,
+-                peg_out_event.timestamp,
+-                &peg_out_event.withdrawer_chain_address,
+-            )
+-            .script_pubkey(),
++            script_pubkey: fpl_withdrawer_script_pubkey(network, peg_out_event),
+         };
+ 
+         PegOutTransaction {
+@@ -114,3 +116,52 @@ impl BaseTransaction for PegOutTransaction {
+         "PegOut"
+     }
+ }
++
++/// FPL: PEG_OUT fee rate in sat/vB from `FPL_PEG_OUT_FEE_SAT_PER_VB` (set by fpl-operatord from
++/// FPL_OP_PEGOUT_FEE_RATE), floor and default 2 sat/vB.
++pub fn fpl_peg_out_fee_rate() -> u64 {
++    std::env::var("FPL_PEG_OUT_FEE_SAT_PER_VB")
++        .ok()
++        .and_then(|v| v.trim().parse::<u64>().ok())
++        .unwrap_or(FPL_MIN_PEG_OUT_FEE_RATE)
++        .max(FPL_MIN_PEG_OUT_FEE_RATE)
++}
++
++/// FPL: absolute PEG_OUT fee in sats (paid on top of the withdrawal amount).
++pub fn fpl_peg_out_fee() -> u64 {
++    fpl_peg_out_fee_rate() * FPL_PEG_OUT_VSIZE
++}
++
++pub const FPL_MIN_PEG_OUT_FEE_RATE: u64 = 2;
++pub const FPL_PEG_OUT_VSIZE: u64 = 122;
++
++/// FPL: the withdrawer's own scriptPubKey: the ledger dest address when it parses on `network`,
++/// otherwise P2WPKH of the 20-byte pubkey hash.
++pub fn fpl_withdrawer_script_pubkey(network: Network, ev: &PegOutEvent) -> ScriptBuf {
++    use bitcoin::hashes::Hash;
++    use core::str::FromStr;
++    match bitcoin::Address::from_str(&ev.withdrawer_destination_address)
++        .ok()
++        .and_then(|a| a.require_network(network).ok())
++    {
++        Some(a) => a.script_pubkey(),
++        None => ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
++            ev.withdrawer_public_key_hash.to_byte_array(),
++        )),
++    }
++}
++
++#[cfg(test)]
++mod fpl_peg_out_tests {
++    use super::*;
++    #[test]
++    fn fee_floor_and_override() {
++        std::env::remove_var("FPL_PEG_OUT_FEE_SAT_PER_VB");
++        assert_eq!(fpl_peg_out_fee(), 244);
++        std::env::set_var("FPL_PEG_OUT_FEE_SAT_PER_VB", "1");
++        assert_eq!(fpl_peg_out_fee(), 244);
++        std::env::set_var("FPL_PEG_OUT_FEE_SAT_PER_VB", "5");
++        assert_eq!(fpl_peg_out_fee(), 610);
++        std::env::remove_var("FPL_PEG_OUT_FEE_SAT_PER_VB");
++    }
++}
 diff --git a/bridge/src/utils.rs b/bridge/src/utils.rs
 index 6caf9c6..7c53968 100644
 --- a/bridge/src/utils.rs
