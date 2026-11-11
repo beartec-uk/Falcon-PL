@@ -113,10 +113,10 @@ index e752301..58ec566 100644
 +fpl-tn4-timelocks = []
 diff --git a/bridge/examples/fpl_ceremony_coordinator.rs b/bridge/examples/fpl_ceremony_coordinator.rs
 new file mode 100644
-index 0000000..041e1f9
+index 0000000..661cb99
 --- /dev/null
 +++ b/bridge/examples/fpl_ceremony_coordinator.rs
-@@ -0,0 +1,532 @@
+@@ -0,0 +1,537 @@
 +//! Standalone ceremony coordinator (holds NO verifier key).
 +//!
 +//! Builds the peg-in + peg-out graphs for one deposit using the n-of-n keys
@@ -502,7 +502,12 @@ index 0000000..041e1f9
 +        }
 +    };
 +    let _ = req;
-+    let payout = Input { outpoint: OutPoint::from_str(&payout_op).unwrap(), amount: need };
++    // The operator funds amount + PEG_OUT fee (fpl-operatord payout_funding_sats); the PEG_OUT
++    // input must carry the REAL prevout value (segwit sighash commits to it), so read it from chain.
++    let payout_outpoint = OutPoint::from_str(&payout_op).unwrap();
++    let funded = client.esplora.get_tx(&payout_outpoint.txid).await.ok().flatten()
++        .and_then(|t| t.output.get(payout_outpoint.vout as usize).map(|o| o.value));
++    let payout = Input { outpoint: payout_outpoint, amount: bridge::transactions::peg_out::fpl_payout_input_amount(funded, need) };
 +    let po = peg_out.clone();
 +    let _ = &po;
 +    // resume after a crash: the PEG_OUT may already be on chain (same event timestamp => same tx);
@@ -2461,10 +2466,10 @@ index 0000000..943a550
 +}
 diff --git a/bridge/src/fpl_watcher.rs b/bridge/src/fpl_watcher.rs
 new file mode 100644
-index 0000000..e7594e2
+index 0000000..cd35b24
 --- /dev/null
 +++ b/bridge/src/fpl_watcher.rs
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,347 @@
 +//! FPL patch (M3): permissionless challenger / disprover watcher.
 +//!
 +//! Needs no n-of-n key and no operator key: anyone running it with a small
@@ -2725,14 +2730,15 @@ index 0000000..e7594e2
 +            // FPL fix: build every attempt from a FRESH copy of the graph. `disprove` appends the
 +            // reward input/output + witness to the graph's stored tx, so retrying on the same
 +            // graph grew the tx by ~956k WU per attempt (265M WU after 278 retries: unminable).
++            // A SUBMITTED attempt is kept (keep_if_submitted) so fpl_watch_txids() tracks the
++            // finalized Disprove txid and sees its confirmation; a failed one is discarded.
 +            let mut fresh = graph.clone();
-+            let graph = &mut fresh;
-+            let built = match graph.disprove(c, who.reward_spk.clone(), vk).await {
++            let built = match fresh.disprove(c, who.reward_spk.clone(), vk).await {
 +                Ok(tx) => Ok(tx),
 +                Err(e) => {
 +                    // proof verifies: check it is bound to THIS payout (SHA256 binding leaf)
 +                    st.log.push(format!("chunk disprove n/a ({e:?}); trying binding leaf"));
-+                    graph.fpl_binding_disprove(c, who.reward_spk.clone()).await
++                    fresh.fpl_binding_disprove(c, who.reward_spk.clone()).await
 +                }
 +            };
 +            match built {
@@ -2744,6 +2750,7 @@ index 0000000..e7594e2
 +                        tx.weight().to_wu(),
 +                        att
 +                    ));
++                    keep_if_submitted(graph, fresh, ok);
 +                    if !ok {
 +                        st.tried_disprove = false; // retry next step
 +                    }
@@ -2755,11 +2762,11 @@ index 0000000..e7594e2
 +            if !st.tried_disprove_chain {
 +                st.tried_disprove_chain = true;
 +                let mut fresh = graph.clone();
-+                let graph = &mut fresh;
-+                match graph.disprove_chain(c, who.reward_spk.clone()).await {
++                match fresh.disprove_chain(c, who.reward_spk.clone()).await {
 +                    Ok(tx) => {
 +                        let (ok, att) = submit(cfg, &tx).await;
 +                        st.log.push(format!("disprove_chain {} ok={ok} {:?}", tx.compute_txid(), att));
++                        keep_if_submitted(graph, fresh, ok);
 +                    }
 +                    Err(e) => st.log.push(format!("no disprove_chain: {e:?}")),
 +                }
@@ -2768,6 +2775,28 @@ index 0000000..e7594e2
 +        _ => {}
 +    }
 +    a
++}
++
++/// Retry hygiene: each attempt is built on a clone; only a submitted attempt replaces the graph.
++pub fn keep_if_submitted<T>(graph: &mut T, attempt: T, submitted: bool) {
++    if submitted {
++        *graph = attempt;
++    }
++}
++
++#[cfg(test)]
++mod fpl_keep_tests {
++    use super::keep_if_submitted;
++    #[test]
++    fn failed_attempt_discarded_submitted_kept() {
++        let mut g = vec![1u8];
++        let mut a = g.clone();
++        a.push(2);
++        keep_if_submitted(&mut g, a.clone(), false);
++        assert_eq!(g, vec![1], "failed attempt must not grow the graph");
++        keep_if_submitted(&mut g, a, true);
++        assert_eq!(g, vec![1, 2], "submitted attempt is tracked");
++    }
 +}
 +
 +#[cfg(test)]
@@ -3757,7 +3786,7 @@ index 3983570..e4dd35f 100644
          &mut self,
          inputs: &Vec<InputWithScript>,
 diff --git a/bridge/src/transactions/peg_out.rs b/bridge/src/transactions/peg_out.rs
-index a134b43..a17cc3f 100644
+index a134b43..572b0db 100644
 --- a/bridge/src/transactions/peg_out.rs
 +++ b/bridge/src/transactions/peg_out.rs
 @@ -66,17 +66,19 @@ impl PegOutTransaction {
@@ -3788,7 +3817,7 @@ index a134b43..a17cc3f 100644
          };
  
          PegOutTransaction {
-@@ -114,3 +116,52 @@ impl BaseTransaction for PegOutTransaction {
+@@ -114,3 +116,69 @@ impl BaseTransaction for PegOutTransaction {
          "PegOut"
      }
  }
@@ -3806,6 +3835,12 @@ index a134b43..a17cc3f 100644
 +/// FPL: absolute PEG_OUT fee in sats (paid on top of the withdrawal amount).
 +pub fn fpl_peg_out_fee() -> u64 {
 +    fpl_peg_out_fee_rate() * FPL_PEG_OUT_VSIZE
++}
++
++/// FPL: PEG_OUT input amount = the funded prevout value when known (segwit sighash commits to
++/// it), else the withdrawal amount plus the PEG_OUT fee the operator funds on top.
++pub fn fpl_payout_input_amount(funded: Option<Amount>, withdrawal: Amount) -> Amount {
++    funded.unwrap_or(withdrawal + Amount::from_sat(fpl_peg_out_fee()))
 +}
 +
 +pub const FPL_MIN_PEG_OUT_FEE_RATE: u64 = 2;
@@ -3830,6 +3865,17 @@ index a134b43..a17cc3f 100644
 +#[cfg(test)]
 +mod fpl_peg_out_tests {
 +    use super::*;
++    #[test]
++    fn payout_input_is_funded_value() {
++        // (no env reads here: fee_floor_and_override mutates the fee env var in parallel)
++        let w = Amount::from_sat(50_000);
++        let funded = fpl_payout_input_amount(Some(Amount::from_sat(50_244)), w);
++        assert_eq!(funded.to_sat(), 50_244, "real prevout value, not the withdrawal amount");
++        // exact withdrawal amount out, the 244-sat (2 sat/vB) fee from the funded surplus
++        assert_eq!(core::cmp::min(w, funded - Amount::from_sat(244)).to_sat(), 50_000);
++        assert!(fpl_payout_input_amount(None, w) > w, "fallback funds the fee on top");
++    }
++
 +    #[test]
 +    fn fee_floor_and_override() {
 +        std::env::remove_var("FPL_PEG_OUT_FEE_SAT_PER_VB");
@@ -3940,7 +3986,7 @@ index e53722b..9dc3e40 100644
  
      // checked in assert_commit_2 single tx test
 diff --git a/bridge/tests/bridge/client/musig2_peg_out.rs b/bridge/tests/bridge/client/musig2_peg_out.rs
-index 4fa7adf..1177f3b 100644
+index 4fa7adf..7b4454c 100644
 --- a/bridge/tests/bridge/client/musig2_peg_out.rs
 +++ b/bridge/tests/bridge/client/musig2_peg_out.rs
 @@ -454,6 +454,7 @@ async fn create_peg_out_graph() -> (
@@ -4171,7 +4217,7 @@ index 4fa7adf..1177f3b 100644
 +        standard: vec![SubmitChannel::Esplora { url: std::env::var("FPL_ESPLORA_URL").unwrap_or("http://127.0.0.1:8094/regtest/api".into()) }],
 +        nonstandard: vec![
 +            SubmitChannel::MinerHttp { name: "unreachable-pool".into(), url: "http://127.0.0.1:9/submit".into(), auth_env: None, content_type: "text/plain".into() },
-+            SubmitChannel::BitcoindRpc { name: "own-miner".into(), url: "http://127.0.0.1:18543".into(), user_env: "FPL_MINER_RPC_USER".into(), pass_env: "FPL_MINER_RPC_PASS".into() },
++            SubmitChannel::BitcoindRpc { name: "own-miner".into(), url: "http://127.0.0.1:18543".into(), user_env: "FPL_MINER_RPC_USER".into(), pass_env: "FPL_MINER_RPC_PASS".into(), conf: None, cookie: None },
 +        ],
 +    };
 +    let vk = crate::bridge::helper::get_valid_proof().vk;
@@ -4262,7 +4308,7 @@ index 4fa7adf..1177f3b 100644
 +    let who = WatcherIdentity { challenge_inputs: vec![InputWithScript { outpoint: w_out, amount: w_amt, script: &w_script }], challenge_keypair: wk, reward_spk: w_script.clone() };
 +    let cfg = SubmitConfig {
 +        standard: vec![SubmitChannel::Esplora { url: "http://127.0.0.1:8094/regtest/api".into() }],
-+        nonstandard: vec![SubmitChannel::BitcoindRpc { name: "own-miner".into(), url: "http://127.0.0.1:18543".into(), user_env: "FPL_MINER_RPC_USER".into(), pass_env: "FPL_MINER_RPC_PASS".into() }],
++        nonstandard: vec![SubmitChannel::BitcoindRpc { name: "own-miner".into(), url: "http://127.0.0.1:18543".into(), user_env: "FPL_MINER_RPC_USER".into(), pass_env: "FPL_MINER_RPC_PASS".into(), conf: None, cookie: None }],
 +    };
 +    let vk = proof.vk.clone();
 +    let mut st = GraphWatchState::default();
@@ -4552,7 +4598,7 @@ index 4fa7adf..1177f3b 100644
 +    let who = WatcherIdentity { challenge_inputs: vec![InputWithScript { outpoint: w_out, amount: w_amt, script: &w_script }], challenge_keypair: wk, reward_spk: w_script.clone() };
 +    let cfg = SubmitConfig {
 +        standard: vec![SubmitChannel::Esplora { url: "http://127.0.0.1:8094/regtest/api".into() }],
-+        nonstandard: vec![SubmitChannel::BitcoindRpc { name: "own-miner".into(), url: "http://127.0.0.1:18543".into(), user_env: "FPL_MINER_RPC_USER".into(), pass_env: "FPL_MINER_RPC_PASS".into() }],
++        nonstandard: vec![SubmitChannel::BitcoindRpc { name: "own-miner".into(), url: "http://127.0.0.1:18543".into(), user_env: "FPL_MINER_RPC_USER".into(), pass_env: "FPL_MINER_RPC_PASS".into(), conf: None, cookie: None }],
 +    };
 +    let vk = crate::bridge::helper::get_valid_proof().vk;
 +    let mut wgraph = c.client.data().peg_out_graphs.iter().find(|g| bridge::graphs::base::BaseGraph::id(*g) == &peg_out_graph_id).unwrap().clone();

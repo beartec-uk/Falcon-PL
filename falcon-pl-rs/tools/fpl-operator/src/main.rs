@@ -686,7 +686,7 @@ fn deposit_unspent(cfg: &Config, outpoint: &str) -> bool {
 /// (claims we sent an intent for but have not funded yet; funded payouts have
 /// already left the wallet) minus the configured reserve.
 fn available_capacity(cfg: &Config, wallet: u64, st: &State) -> u64 {
-    let committed: u64 = st.claims.values().filter(|c| c.phase == "intent").map(|c| fronted_amount(cfg, c.amount)).sum();
+    let committed: u64 = st.claims.values().filter(|c| c.phase == "intent").map(|c| payout_funding_sats(c.amount, cfg.pegout_fee_rate)).sum();
     wallet.saturating_sub(committed).saturating_sub(cfg.min_wallet_reserve_sats)
 }
 
@@ -1114,7 +1114,7 @@ fn operate(n: &Node, st: &mut State, ledger: &[LedgerClaim], h: &mut Health, sta
             continue;
         }
         // only operators whose advertised capacity covered the amount are eligible
-        let winner = gossip::intent_winner_eligible(&n.store.lock().unwrap(), &lc.note_id, fronted_amount(&n.cfg, lc.amount));
+        let winner = gossip::intent_winner_eligible(&n.store.lock().unwrap(), &lc.note_id, payout_funding_sats(lc.amount, n.cfg.pegout_fee_rate));
         if winner.as_ref().map(|w| w.0.as_str()) != Some(n.signer.xonly.as_str()) {
             let e = st.claims.get_mut(&lc.note_id).unwrap();
             e.phase = "lost".into();
@@ -1122,7 +1122,8 @@ fn operate(n: &Node, st: &mut State, ledger: &[LedgerClaim], h: &mut Health, sta
             e.deposit_outpoint.clear();
             continue;
         }
-        let fronted = fronted_amount(&n.cfg, lc.amount);
+        // what leaves the wallet: exact amount + PEG_OUT fee (the ledger attest needs the exact amount)
+        let fronted = payout_funding_sats(lc.amount, n.cfg.pegout_fee_rate);
         if let Some(why) = front_blocked(n.cfg.attest_ready(), n.cfg.allow_unattested) {
             st.claims.get_mut(&lc.note_id).unwrap().detail = why;
             continue;
@@ -1231,13 +1232,25 @@ fn watch(n: &Node, st: &mut State, ledger: &[LedgerClaim]) {
 }
 
 /// Payout checks for a record whose withdrawal exists in the ledger with the same binding.
+/// True when `txid` is the advertised PEG_OUT of a claim other than `note_id`.
+fn pegout_reused(recs: &[Record], note_id: &str, txid: &str) -> bool {
+    !txid.is_empty()
+        && recs.iter().any(|p| {
+            p.kind == "PegOut" && p.note_id != note_id && p.data.get("peg_out_txid").map_or(false, |t| t.eq_ignore_ascii_case(txid))
+        })
+}
+
 fn check_payout(n: &Node, r: &Record, lc: &LedgerClaim, recs: &[Record]) -> Option<String> {
     let past_deadline = |ts: u64| now() > ts + n.cfg.payout_deadline_secs;
     let pegout_txid = |rec: &Record| rec.data.get("peg_out_txid").cloned().unwrap_or_default();
     // Err("tx-not-found: ..") only for a genuine RPC -5 with synced txindex; Err("unavailable: ..")
     // when bitcoind and esplora can't tell (never grounds for a challenge: skip and retry next poll).
     let verify = |txid: &str| -> Result<(), String> {
-
+        // one Bitcoin payout settles ONE claim (the ledger refuses reuse too): an exact-amount
+        // plain-address payout already advertised for another note does not count for this one
+        if pegout_reused(recs, &lc.note_id, txid) {
+            return Err(format!("PEG_OUT {txid} already advertised for another claim"));
+        }
         let min = payout::min_payout(lc.amount, n.cfg.max_peer_fee_bps, n.cfg.pegout_fee_allow_sats);
         let outs = match btc_tx_lookup(&n.cfg, txid) {
             TxLookup::Found(outs, _) => outs,
@@ -1834,6 +1847,27 @@ mod tests {
         assert_eq!(pegout_fee_sats(1), 244);
         assert_eq!(pegout_fee_sats(5), 610);
         assert_eq!(payout_funding_sats(50_000, 2), 50_244);
+    }
+
+    #[test]
+    fn capacity_reserves_full_funding_for_intents() {
+        let mut cfg = Config::load(Path::new("/nonexistent"));
+        cfg.min_wallet_reserve_sats = 0;
+        cfg.pegout_fee_rate = 2;
+        let mut st = State::default();
+        st.claims.insert("n".into(), ClaimState { phase: "intent".into(), amount: 50_000, ..Default::default() });
+        // an intent reserves amount + PEG_OUT fee (50_244), not the old fee-deducted amount
+        assert_eq!(available_capacity(&cfg, 100_000, &st), 100_000 - 50_244);
+    }
+
+    #[test]
+    fn pegout_reuse_across_claims_detected() {
+        let rec = |note: &str, t: &str| Record { v: 1, kind: "PegOut".into(), note_id: note.into(), binding: String::new(),
+            data: [("peg_out_txid".to_string(), t.to_string())].into_iter().collect(), signer: "s".into(), ts: 0, sig: String::new() };
+        let recs = vec![rec("a", "AB"), rec("b", "cd")];
+        assert!(pegout_reused(&recs, "b", "ab"), "a's payout cannot settle b");
+        assert!(!pegout_reused(&recs, "a", "ab"), "own record is fine");
+        assert!(!pegout_reused(&recs, "c", ""));
     }
 }
 
