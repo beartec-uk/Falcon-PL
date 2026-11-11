@@ -98,6 +98,28 @@ pub fn payout_matches(outs: &[(u64, String)], spk: &str, min: u64) -> Result<u64
     }
 }
 
+/// The claim dest's own scriptPubKey (hex): P2WPKH `0014<pkh>` for bech32, P2PKH for base58.
+pub fn plain_dest_spk(dest: &str, network: &str) -> Result<String, String> {
+    let pkh = dest_pubkey_hash(dest, network)?;
+    let l = dest.to_ascii_lowercase();
+    let bech = l.starts_with("tb1") || l.starts_with("bc1") || l.starts_with("bcrt1");
+    Ok(if bech { format!("0014{}", hex::encode(pkh)) } else { format!("76a914{}88ac", hex::encode(pkh)) })
+}
+
+/// PEG_OUT acceptance for watchers. Accepts EITHER
+///  * the ledger M1 rule (fd-pl `attest_bitvm2_claim_v2`): an output paying EXACTLY `amount` to the
+///    claim dest's own scriptPubKey (current operator kits, PEG_OUT fee paid on top by the operator), or
+///  * the legacy upstream inscription script with at least `min` (PEG_OUTs already in flight from
+///    older kits; the ledger cannot attest these, but they did pay the withdrawer's key).
+pub fn payout_ok(outs: &[(u64, String)], dest: &str, open_height: u64, note_id: &str, amount: u64, min: u64, network: &str) -> Result<u64, String> {
+    let plain = plain_dest_spk(dest, network)?;
+    if outs.iter().any(|(v, s)| *v == amount && s.eq_ignore_ascii_case(&plain)) {
+        return Ok(amount);
+    }
+    let legacy = expected_payout_spk(dest, open_height, note_id, network)?;
+    payout_matches(outs, &legacy, min).map_err(|e| format!("{e}; and no output pays exactly {amount} sats to the dest {dest}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +153,20 @@ mod tests {
         assert!(payout_matches(&[(9_950, spk.clone())], &spk, 9_909).is_ok());
         assert!(payout_matches(&[(9_000, spk.clone())], &spk, 9_909).is_err());
         assert!(payout_matches(&[(10_000, other)], &spk, 9_909).is_err());
+    }
+    #[test]
+    fn plain_dest_exact_amount_accepted() {
+        let d = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        let plain = plain_dest_spk(d, "testnet4").unwrap();
+        assert_eq!(plain, "0014751e76e8199196d454941c45d1b3a323f1433bd6");
+        assert_eq!(plain_dest_spk("mrCDrCybB6J1vRfbwM5hemdJz73FwDBC8r", "testnet4").unwrap().len(), 50);
+        // exact amount to the dest: OK (ledger M1 rule)
+        assert_eq!(payout_ok(&[(50_000, plain.clone())], d, 90, "w1", 50_000, 49_000, "testnet4").unwrap(), 50_000);
+        // 1 sat short to the plain dest: rejected (the ledger would refuse the attest)
+        assert!(payout_ok(&[(49_999, plain.clone())], d, 90, "w1", 50_000, 49_000, "testnet4").is_err());
+        // legacy inscription script still accepted for in-flight PEG_OUTs
+        let legacy = expected_payout_spk(d, 90, "w1", "testnet4").unwrap();
+        assert!(payout_ok(&[(49_984, legacy)], d, 90, "w1", 50_000, 49_000, "testnet4").is_ok());
+        assert!(payout_ok(&[(50_000, "0014".to_string() + &"00".repeat(20))], d, 90, "w1", 50_000, 49_000, "testnet4").is_err());
     }
 }
