@@ -24,7 +24,13 @@ bh=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["blockhash"])' <<<"
 ht=$("${cli[@]}" getblockheader "$bh" | python3 -c 'import json,sys; print(json.load(sys.stdin)["height"])')
 "${cli[@]}" getblock "$bh" true | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["tx"]))' > "$W/txids.json"
 rawhex=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["hex"])' <<<"$raw")
-vk=(); [[ -n "${FPL_VK_HEX:-}" ]] && vk=(--vk-hex "$FPL_VK_HEX")
+# FPL_VK_HEX may be hex or a path (fpl-operatord passes FPL_OP_ATTEST_VK_HEX, usually attest/v1_vk.bin):
+# a file is read as hex text, or hex-encoded when binary (the attest tool wants hex).
+vkh=${FPL_VK_HEX:-}
+if [[ -n "$vkh" && -f "$vkh" ]]; then
+  if ! LC_ALL=C grep -aqvE '^[0-9a-fA-F[:space:]]*$' "$vkh"; then vkh=$(tr -d '[:space:]' < "$vkh"); else vkh=$(od -An -v -tx1 "$vkh" | tr -d ' \n'); fi
+fi
+vk=(); [[ -n "$vkh" ]] && vk=(--vk-hex "$vkh")
 $A body --input "$W/attest.json" --import "$W/import.json" --raw-tx "$rawhex" --btc-height "$ht" \
   --block-txids "$W/txids.json" --claim-txid "$FPL_ATTEST_CLAIM_TXID" "${vk[@]}" --out "$W/body.json"
 kd=(); [[ -n "${FPL_OP_FALCON_KEYS_DIR:-}" ]] && kd=(--keys-dir "$FPL_OP_FALCON_KEYS_DIR")
