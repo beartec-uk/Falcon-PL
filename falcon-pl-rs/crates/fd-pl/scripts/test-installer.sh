@@ -124,4 +124,123 @@ printf 'NODE_ID=old1\nVERSION=2.10.0\nAUTOUPGRADE=off\n' >"$OLDH/config/node.env
 OUT6="$(bash -c 'set -euo pipefail; source "$1"; FALCON_HOME="$2"; resolve_home; echo ok' _ "$FUNCS_FILE" "$OLDH" 2>&1 || true)"; [[ "$OUT6" == *ok ]] || { echo "FAIL: resolve_home aborts on a pre-2.10.1 node.env" >&2; exit 1; }
 printf 'ADOPTED=1\nUNIT=falcon-pl-v99\nSVC_USER=falcon\n' >>"$OLDH/config/node.env"; OUT6="$(bash -c 'set -euo pipefail; source "$1"; FALCON_HOME="$2"; resolve_home; echo "$ADOPTED $UNIT $AUTOU_UNIT $SVC_USER"' _ "$FUNCS_FILE" "$OLDH" 2>&1 || true)"; [[ "$OUT6" == *"1 falcon-pl-v99 falcon-pl-v99-autoupgrade falcon" ]] || { echo "FAIL: resolve_home adopted fields" >&2; exit 1; }
 
-echo "PASS: all installer tests (Items #1, #8, #13, 2.10.1 autoupgrade default + adopt) succeeded"
+# --- Test 7 (2.11.4): autoupgrade never rolls back / restarts a running node on a flat tip ---
+# 12 Nov 2026 h=869559: an hourly run with no new release waited 120s for the tip, saw it flat
+# (chain stall), "rolled back" to the same 2.11.3 and restarted v3/v12 mid-stall.
+# Service / RPC state live in files: cmd_upgrade runs in a subshell, like the real unit state.
+AU_SVC_F="$TMP/au_svc"; AU_RPC_F="$TMP/au_rpc"   # contents 1 = service active / RPC answers
+AU_TIPS=()          # successive tip_height values returned by local_status
+AU_PEERS=()         # successive best_peer_tip values
+AU_I=0
+RESTARTS="$TMP/restarts.log"; : >"$RESTARTS"
+svc_active() { [[ "$(cat "$AU_SVC_F")" == 1 ]]; }
+svc_restart() { echo restart >>"$RESTARTS"; echo 1 >"$AU_SVC_F"; }
+local_status() {
+  [[ "$(cat "$AU_RPC_F")" == 1 ]] || return 1
+  local i=$AU_I t p
+  (( i < ${#AU_TIPS[@]} )) || i=$(( ${#AU_TIPS[@]} - 1 ))
+  t="${AU_TIPS[$i]}"; p="${AU_PEERS[$i]:-$t}"
+  AU_I=$(( AU_I + 1 ))
+  printf '{"tip_height": %s, "best_peer_tip": %s}\n' "$t" "$p" >"$1"
+}
+au_reset() { # svc rpc "tips" "peers"
+  echo "$1" >"$AU_SVC_F"; echo "$2" >"$AU_RPC_F"; read -r -a AU_TIPS <<<"$3"; read -r -a AU_PEERS <<<"${4:-}"; AU_I=0; : >"$RESTARTS"
+  echo "node-2.11.3" >"$BIN/falcon-pl-node"; echo "ctl-2.11.3" >"$BIN/falcon-pl-ctl"
+  rm -f "$BIN/falcon-pl-node.prev" "$BIN/falcon-pl-ctl.prev"
+  kv_set "$NODE_ENV" VERSION "2.11.3"
+}
+UPGRADE_CALLS="$TMP/upgrade.log"
+upgrade_noop() { echo noop >>"$UPGRADE_CALLS"; }                                   # no new release
+upgrade_new() { echo new >>"$UPGRADE_CALLS"; echo "node-2.11.4" >"$BIN/falcon-pl-node"; echo "ctl-2.11.4" >"$BIN/falcon-pl-ctl"; kv_set "$NODE_ENV" VERSION "2.11.4"; }
+upgrade_fail() { echo fail >>"$UPGRADE_CALLS"; return 1; }                           # e.g. download failed
+export FALCON_AUTOUPGRADE_HEALTH_TIMEOUT=2 FALCON_AUTOUPGRADE_POLL_SECS=1 FALCON_AUTOUPGRADE_STALL_PROBE_SECS=0
+AUTOUPGRADE_JITTER_SECS=0
+au_run() { # upgrade-fn ; prints rc
+  : >"$UPGRADE_CALLS"
+  cmd_upgrade() { "$AU_UPGRADE"; }
+  local rc=0
+  AUTOUPGRADE_ACTION=run cmd_autoupgrade >/dev/null 2>&1 || rc=$?
+  echo "$rc"
+}
+nrestarts() { wc -l <"$RESTARTS" | tr -d ' '; }
+
+# 7a health check return codes
+au_reset 1 1 "869559 869559 869559 869559 869559"
+rc=0; autoupgrade_health_check 869559 >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 2 ]] || { echo "FAIL 7a: active + RPC + flat tip must be 2 (stall), got $rc" >&2; exit 1; }
+au_reset 0 1 "869559"
+rc=0; autoupgrade_health_check 869559 >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 1 ]] || { echo "FAIL 7a: service down must be 1, got $rc" >&2; exit 1; }
+au_reset 1 0 "869559"
+rc=0; autoupgrade_health_check 869559 >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 1 ]] || { echo "FAIL 7a: RPC dead must be 1, got $rc" >&2; exit 1; }
+au_reset 1 1 "869559 869560"
+rc=0; autoupgrade_health_check 869559 >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 0 ]] || { echo "FAIL 7a: tip advanced must be 0, got $rc" >&2; exit 1; }
+
+# 7b incident: no new release, service active, tip flat -> no health wait, no rollback, no restart
+au_reset 1 1 "869559"
+AU_UPGRADE=upgrade_noop; rc="$(au_run)"
+[[ "$rc" == 0 && "$(nrestarts)" == 0 ]] || { echo "FAIL 7b: no-op run on a flat tip restarted ($(nrestarts)) rc=$rc" >&2; exit 1; }
+[[ "$(cat "$BIN/falcon-pl-node")" == node-2.11.3 && "$(kv_get "$NODE_ENV" VERSION)" == 2.11.3 ]] || { echo "FAIL 7b: binaries/VERSION touched" >&2; exit 1; }
+
+# 7c new binary installed, service active, chain stalled -> keep it, no rollback, no restart
+au_reset 1 1 "869559"
+AU_UPGRADE=upgrade_new; rc="$(au_run)"
+[[ "$rc" == 0 && "$(nrestarts)" == 0 ]] || { echo "FAIL 7c: flat tip after a real upgrade rolled back/restarted ($(nrestarts)) rc=$rc" >&2; exit 1; }
+[[ "$(cat "$BIN/falcon-pl-node")" == node-2.11.4 && "$(kv_get "$NODE_ENV" VERSION)" == 2.11.4 ]] || { echo "FAIL 7c: new binary not kept" >&2; exit 1; }
+
+# 7d new binary, service dead after upgrade -> real failure: roll back to the old binary and restart
+au_reset 1 1 "869559"
+upgrade_new_dies() { upgrade_new; echo 0 >"$AU_SVC_F"; }
+AU_UPGRADE=upgrade_new_dies; rc="$(au_run)"
+[[ "$rc" == 1 && "$(nrestarts)" == 1 ]] || { echo "FAIL 7d: dead service after upgrade must roll back + restart once (restarts=$(nrestarts) rc=$rc)" >&2; exit 1; }
+[[ "$(cat "$BIN/falcon-pl-node")" == node-2.11.3 && "$(cat "$BIN/falcon-pl-ctl")" == ctl-2.11.3 && "$(kv_get "$NODE_ENV" VERSION)" == 2.11.3 ]] || { echo "FAIL 7d: not rolled back" >&2; exit 1; }
+
+# 7e new binary, RPC never answers -> real failure: roll back
+au_reset 1 1 "869559"
+upgrade_new_rpcdead() { upgrade_new; echo 0 >"$AU_RPC_F"; }
+AU_UPGRADE=upgrade_new_rpcdead; rc="$(au_run)"
+[[ "$rc" == 1 && "$(cat "$BIN/falcon-pl-node")" == node-2.11.3 ]] || { echo "FAIL 7e: dead RPC after upgrade must roll back (rc=$rc)" >&2; exit 1; }
+
+# 7f healthy upgrade (tip advances) -> success, keep new binary, no extra restart
+au_reset 1 1 "869559 869559 869560"
+AU_UPGRADE=upgrade_new; rc="$(au_run)"
+[[ "$rc" == 0 && "$(nrestarts)" == 0 && "$(cat "$BIN/falcon-pl-node")" == node-2.11.4 ]] || { echo "FAIL 7f: healthy upgrade (rc=$rc restarts=$(nrestarts))" >&2; exit 1; }
+
+# 7g upgrade step fails before replacing anything, service running -> nothing to roll back, no restart
+au_reset 1 1 "869559"
+AU_UPGRADE=upgrade_fail; rc="$(au_run)"
+[[ "$rc" == 1 && "$(nrestarts)" == 0 && "$(cat "$BIN/falcon-pl-node")" == node-2.11.3 ]] || { echo "FAIL 7g: failed download restarted a running node (restarts=$(nrestarts) rc=$rc)" >&2; exit 1; }
+
+# 7h upgrade step fails, service actually down -> still recovers (start it)
+au_reset 0 1 "869559"
+AU_UPGRADE=upgrade_fail; rc="$(au_run)"
+[[ "$rc" == 1 && "$(nrestarts)" == 1 ]] || { echo "FAIL 7h: dead service not recovered (restarts=$(nrestarts) rc=$rc)" >&2; exit 1; }
+
+# 7i no new release but service is down -> start it, no rollback
+au_reset 0 1 "869559"
+AU_UPGRADE=upgrade_noop; rc="$(au_run)"
+[[ "$rc" == 1 && "$(nrestarts)" == 1 && "$(cat "$BIN/falcon-pl-node")" == node-2.11.3 ]] || { echo "FAIL 7i: dead service with no release (restarts=$(nrestarts) rc=$rc)" >&2; exit 1; }
+
+# 7j stall probe: our tip AND best peer tip flat -> defer, do not even run the upgrade
+export FALCON_AUTOUPGRADE_STALL_PROBE_SECS=1
+au_reset 1 1 "869559 869559" "869559 869559"
+AU_UPGRADE=upgrade_new; rc="$(au_run)"
+[[ "$rc" == 0 && ! -s "$UPGRADE_CALLS" && "$(nrestarts)" == 0 && "$(cat "$BIN/falcon-pl-node")" == node-2.11.3 ]] || { echo "FAIL 7j: upgrade ran mid-stall (calls=$(cat "$UPGRADE_CALLS") rc=$rc)" >&2; exit 1; }
+# 7k stall probe: we are flat but peers advance (we are the laggard) -> proceed
+au_reset 1 1 "869556 869556 869556 869560" "869559 869559 869560 869560"
+AU_UPGRADE=upgrade_new; rc="$(au_run)"
+[[ "$(cat "$UPGRADE_CALLS")" == new && "$(cat "$BIN/falcon-pl-node")" == node-2.11.4 ]] || { echo "FAIL 7k: lagging seat must still upgrade (calls=$(cat "$UPGRADE_CALLS") rc=$rc)" >&2; exit 1; }
+# 7l stall probe: chain advancing -> proceed
+au_reset 1 1 "869559 869561 869562" "869559 869561 869562"
+AU_UPGRADE=upgrade_new; rc="$(au_run)"
+[[ "$(cat "$UPGRADE_CALLS")" == new && "$rc" == 0 ]] || { echo "FAIL 7l: moving chain must upgrade (rc=$rc)" >&2; exit 1; }
+# 7m stall probe: node down -> probe does not block recovery
+au_reset 0 1 "869559"
+AU_UPGRADE=upgrade_noop; rc="$(au_run)"
+[[ "$(cat "$UPGRADE_CALLS")" == noop && "$(nrestarts)" == 1 ]] || { echo "FAIL 7m: probe blocked a down node" >&2; exit 1; }
+export FALCON_AUTOUPGRADE_STALL_PROBE_SECS=0
+grep -q 'treating as a chain stall, not a bad binary' "$INSTALLER" || { echo "FAIL 7: stall log line missing" >&2; exit 1; }
+
+echo "PASS: all installer tests (Items #1, #8, #13, 2.10.1 autoupgrade default + adopt, 2.11.4 flat-tip stall) succeeded"

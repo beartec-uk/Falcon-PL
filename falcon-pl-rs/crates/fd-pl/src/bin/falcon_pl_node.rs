@@ -2641,6 +2641,14 @@ async fn main() -> Result<()> {
                 info!("vote journal: restored {merged} open-height round vote(s)");
             }
         }
+        // 2.11.4: a same-height restart re-enters the round this seat had
+        // already voted in (snapshot / journal), instead of round 0.
+        if let Some(r) = node.restore_open_round_from_own_votes() {
+            info!(
+                "restart realign: re-entered round {r} at open height {} from own signed vote",
+                node.tip_height.saturating_add(1)
+            );
+        }
         info!(
             "consensus: vote_rounds_from_height={} (source={}, network_default={}) pause=[{}, {}) (source={}) (active_now={}) liveness_alert_secs={}",
             vr,
@@ -5352,7 +5360,7 @@ fn process_msg(
             // without waiting for Pong fanout (which may never reach inbound dialers).
             // Do not mix NeedLedgers with a snapshot pull (fills the archive catchq).
             // snap_pull is peeked before this arm (lock order: snap_pull → node).
-            let need_from = if hello_pulling || n.wants_snapshot() {
+            let need_from = if hello_pulling || n.snapshot_blocks_residual() {
                 None
             } else if tip_height > 0 {
                 n.note_peer_tip(tip_height, &tip_hash)
@@ -5400,7 +5408,7 @@ fn process_msg(
             n.pong_with_role(&id, tip_height, mempool_len, is_hub, archive, snap_height);
             // Pull catch-up: if peer is ahead (or hard-resync), request missing heights.
             // P2: pass tip_hash for best_peer tracking; residual unless operator hard-reset.
-            let need_from = if pulling || n.wants_snapshot() {
+            let need_from = if pulling || n.snapshot_blocks_residual() {
                 None
             } else {
                 n.note_peer_tip(tip_height, &tip_hash)

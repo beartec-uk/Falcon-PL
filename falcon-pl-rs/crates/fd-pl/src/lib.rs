@@ -384,7 +384,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.3";
+pub const PRODUCT_VERSION: &str = "2.11.4";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -9437,7 +9437,8 @@ impl Node {
     pub fn take_catchup_pull(&mut self) -> Option<u64> {
         // Exclusive snap: residual on this lane is what starved NeedSnapshot
         // for minutes before the 2.9.24 offer (v11 still waiting).
-        if self.wants_snapshot() {
+        // 2.11.4: except a small-lag hole (see `snapshot_blocks_residual`).
+        if self.snapshot_blocks_residual() {
             return None;
         }
         self.rebase_future_stamps();
@@ -9741,6 +9742,36 @@ impl Node {
         if self.stale_snap_offer_ms > self.now_ms {
             self.stale_snap_offer_ms = 0;
         }
+    }
+
+    /// A few heights behind, on our own (non-poisoned) chain: NeedLedgers
+    /// stays available even when `wants_snapshot()` is set by the small-hole
+    /// rule (`residual_hole_needs_snapshot`, lag < `SNAPSHOT_SERVE_STALE_LAG`).
+    ///
+    /// 2.11.4 (12 Nov 2026, h=869559 stall, v13): a seat 3 behind collected
+    /// three empty residuals while it sat in a DualProposal stall, the hole
+    /// rule flipped `wants_snapshot()`, `take_catchup_pull` went silent and
+    /// every NeedSnapshot was dropped on a full hub catch lane. It sat at
+    /// tip-3 for 20 minutes; after a restart NeedLedgers pulled the 3 blocks
+    /// from the archive in seconds. Empty residuals at small lag are often
+    /// rejected/unanswered pulls, not missing data, so the ledger lane must
+    /// keep running alongside the (rate-limited) NeedSnapshot.
+    ///
+    /// Large lags keep the exclusive snapshot lane (`SNAPSHOT_JOIN_LAG`, the
+    /// no-archive hub fallback above `SNAPSHOT_SERVE_STALE_LAG`), and a
+    /// fork-poisoned chain or an operator hard-resync never takes this path.
+    pub fn small_lag_residual_allowed(&self) -> bool {
+        let lag = self.tip_lag();
+        self.tip_height > 0
+            && !self.need_hard_resync
+            && lag > 0
+            && lag < Self::SNAPSHOT_SERVE_STALE_LAG
+            && !self.catchup_conflict_is_fork_poison()
+    }
+
+    /// Residual NeedLedgers must stay off because a snapshot owns the lane.
+    pub fn snapshot_blocks_residual(&self) -> bool {
+        self.wants_snapshot() && !self.small_lag_residual_allowed()
     }
 
     /// Unanswered/empty residual pulls (~2.6 s each) after which a lagging
@@ -16687,8 +16718,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.3");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.3");
+        assert_eq!(PRODUCT_VERSION, "2.11.4");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.4");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
@@ -18728,6 +18759,106 @@ mod tests {
             !n.wants_snapshot(),
             "a ~100 height tail must stay on NeedLedgers, not another join snap"
         );
+    }
+
+    /// 2.11.4 (12 Nov 2026, h=869559, v13): three behind, three empty
+    /// residuals. The small-hole rule still asks for a snapshot, but
+    /// NeedLedgers must keep running next to it. Before the fix
+    /// `take_catchup_pull` returned None for 20 minutes while every
+    /// NeedSnapshot was dropped on a full hub catch lane.
+    fn small_lag_hole_node() -> Node {
+        let mut n = Node::new(
+            "v13",
+            ChainConfig::default(),
+            crate::crypto::KeyRing::new(crate::crypto::CryptoScheme::HmacDev),
+            &users(),
+        );
+        n.register_validator("v1", 1000);
+        n.register_validator("v13", 1000);
+        n.cfg.archive = false;
+        n.now_ms = 1_000_000;
+        n.tip_height = 869_556;
+        n.tip_hash = "35da3982".into();
+        n.best_peer_tip = 869_559;
+        if let Some(v) = n.validators.get_mut("v1") {
+            v.advertised_archive = true;
+            v.advertised_hub = true;
+            v.last_advertised_tip = Some(869_559);
+            v.last_pong_ms = n.now_ms;
+        }
+        n.empty_residual_streak = 3;
+        n.last_catchup_conflict = "round 0→1 at h=869557 proposer=Some(\"v10\") target=None".into();
+        n
+    }
+
+    #[test]
+    fn small_lag_hole_keeps_need_ledgers_alongside_snapshot() {
+        let mut n = small_lag_hole_node();
+        assert!(n.wants_snapshot(), "small-hole rule still asks for a snap");
+        assert!(n.small_lag_residual_allowed());
+        assert!(!n.snapshot_blocks_residual());
+        assert_eq!(n.take_catchup_pull(), Some(869_557), "NeedLedgers must still be issued at lag 3");
+        assert!(n.take_snapshot_pull(), "NeedSnapshot stays available as the hole fallback");
+        // Unanswered pulls keep rotating hubs and keep pulling (no lock-out).
+        for k in 0..20u32 {
+            n.now_ms += Node::CATCHUP_INFLIGHT_MS + 1;
+            assert_eq!(n.take_catchup_pull(), Some(869_557), "pull {k} after an empty residual");
+            assert!(n.empty_residual_streak >= 3);
+        }
+        // A served batch resets the streak, and the hole rule turns off.
+        n.note_catchup_batch(true);
+        assert_eq!(n.empty_residual_streak, 0);
+        assert!(!n.wants_snapshot());
+        // Every lag under SNAPSHOT_SERVE_STALE_LAG keeps the ledger lane.
+        for lag in 1..Node::SNAPSHOT_SERVE_STALE_LAG {
+            let mut n = small_lag_hole_node();
+            n.best_peer_tip = n.tip_height + lag;
+            n.empty_residual_streak = 9;
+            assert!(n.wants_snapshot(), "lag={lag}");
+            assert_eq!(n.take_catchup_pull(), Some(n.tip_height + 1), "lag={lag}");
+        }
+    }
+
+    #[test]
+    fn large_lag_and_fork_poison_keep_exclusive_snapshot_lane() {
+        // Join lag: snapshot only, no residual.
+        let mut n = small_lag_hole_node();
+        n.empty_residual_streak = 0;
+        n.best_peer_tip = n.tip_height + Node::SNAPSHOT_JOIN_LAG;
+        assert!(n.wants_snapshot());
+        assert!(!n.small_lag_residual_allowed());
+        assert!(n.snapshot_blocks_residual());
+        assert_eq!(n.take_catchup_pull(), None, "join lag stays snapshot-only");
+        assert!(n.take_snapshot_pull());
+        // No-archive hub fallback above SNAPSHOT_SERVE_STALE_LAG: unchanged.
+        let mut n = upgrade_stall_node();
+        n.best_peer_tip = n.tip_height + 200;
+        n.empty_residual_streak = Node::RESIDUAL_NO_SERVER_STREAK;
+        assert!(n.wants_snapshot());
+        assert_eq!(n.take_catchup_pull(), None, "lag 200 with no archive stays on the hub snapshot");
+        // Exactly SNAPSHOT_SERVE_STALE_LAG is not "small".
+        let mut n = small_lag_hole_node();
+        n.best_peer_tip = n.tip_height + Node::SNAPSHOT_SERVE_STALE_LAG;
+        assert!(!n.small_lag_residual_allowed());
+        // Fork poison at small lag: the chain diverged, ledgers cannot apply.
+        let mut n = small_lag_hole_node();
+        n.last_catchup_conflict =
+            "catch-up conflict (no auto hard-resync): state root mismatch at h=869557".into();
+        assert!(n.wants_snapshot());
+        assert!(!n.small_lag_residual_allowed());
+        assert_eq!(n.take_catchup_pull(), None, "fork poison must re-snap, not residual");
+        // In sync: nothing to pull, nothing to snap.
+        let mut n = small_lag_hole_node();
+        n.best_peer_tip = n.tip_height;
+        assert!(!n.wants_snapshot());
+        assert!(!n.small_lag_residual_allowed());
+        assert_eq!(n.take_catchup_pull(), None);
+        // Fresh joiner at tip 0 never takes the small-lag path.
+        let mut n = small_lag_hole_node();
+        n.tip_height = 0;
+        n.best_peer_tip = 5;
+        assert!(!n.small_lag_residual_allowed());
+        assert!(n.snapshot_blocks_residual());
     }
 
     #[test]
