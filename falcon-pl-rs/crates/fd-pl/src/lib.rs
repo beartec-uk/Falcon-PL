@@ -9769,6 +9769,17 @@ impl Node {
             && !self.catchup_conflict_is_fork_poison()
     }
 
+    /// A downloaded peer snapshot may be adopted while it is still ahead of
+    /// our tip. With NeedLedgers running beside a small-lag snapshot pull
+    /// (2.11.4), residual batches can overtake the pin mid-download; an
+    /// overtaken pin would rewind committed state. Fork heal (poisoned chain)
+    /// and an operator hard-resync keep adopting as before.
+    pub fn peer_snapshot_adoptable(&self, snap_tip: u64) -> bool {
+        snap_tip > self.tip_height
+            || self.need_hard_resync
+            || self.catchup_conflict_is_fork_poison()
+    }
+
     /// Residual NeedLedgers must stay off because a snapshot owns the lane.
     pub fn snapshot_blocks_residual(&self) -> bool {
         self.wants_snapshot() && !self.small_lag_residual_allowed()
@@ -18847,6 +18858,15 @@ mod tests {
         assert!(n.wants_snapshot());
         assert!(!n.small_lag_residual_allowed());
         assert_eq!(n.take_catchup_pull(), None, "fork poison must re-snap, not residual");
+        // A pin that residual catch-up overtook mid-download is not adopted.
+        let n = small_lag_hole_node();
+        assert!(n.peer_snapshot_adoptable(869_559));
+        assert!(!n.peer_snapshot_adoptable(869_556), "same tip: would rewind nothing new");
+        assert!(!n.peer_snapshot_adoptable(869_550), "older pin must never be adopted");
+        let mut n = small_lag_hole_node();
+        n.last_catchup_conflict =
+            "catch-up conflict (no auto hard-resync): state root mismatch at h=869557".into();
+        assert!(n.peer_snapshot_adoptable(869_556), "fork heal still adopts");
         // In sync: nothing to pull, nothing to snap.
         let mut n = small_lag_hole_node();
         n.best_peer_tip = n.tip_height;

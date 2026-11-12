@@ -1402,7 +1402,8 @@ autoupgrade_health_check() { # prev_tip
   t0="$(date +%s)"
   st="$(mktemp)"
   while :; do
-    rpc_ok=0
+    # rpc_ok: the RPC answered at least once in the window (one slow final
+    # poll under load must not turn a stall into a rollback).
     if svc_active && local_status "$st"; then
       rpc_ok=1
       cur_tip="$(json_num "$st" tip_height)"
@@ -1458,10 +1459,13 @@ autoupgrade_recover() { # prev_ver
 # 2.11.4: before an upgrade restarts the node, make sure the network is not in
 # a stall. Restarting a committee seat mid-stall resets its view round and can
 # deadlock the open height. Returns 1 (defer) only when both our tip and the
-# best peer tip stay flat for the probe window; a seat that is merely lagging
-# (peers advancing) or a stopped/unreachable node is not deferred.
+# best peer tip stay flat for the probe window AND the node reports pending
+# work (liveness.has_work=true). Blocks are load-driven, so an idle healthy
+# chain is flat too and must not defer upgrades forever. A seat that is merely
+# lagging (peers advancing), an unknown has_work, or a stopped/unreachable
+# node is not deferred.
 autoupgrade_stall_probe() {
-  local probe="${FALCON_AUTOUPGRADE_STALL_PROBE_SECS:-90}" st t1 p1 t2 p2
+  local probe="${FALCON_AUTOUPGRADE_STALL_PROBE_SECS:-90}" st t1 p1 t2 p2 work
   [[ "$probe" =~ ^[0-9]+$ ]] && (( probe > 0 )) || return 0
   svc_active || return 0
   st="$(mktemp)"
@@ -1470,9 +1474,10 @@ autoupgrade_stall_probe() {
   sleep "$probe"
   if ! svc_active || ! local_status "$st"; then rm -f "$st"; return 0; fi
   t2="$(json_num "$st" tip_height)"; p2="$(json_num "$st" best_peer_tip)"
+  work="$(grep -oE '"has_work": *(true|false)' "$st" 2>/dev/null | head -1 | grep -oE '(true|false)$' || true)"
   rm -f "$st"
   [[ -n "$t1" && -n "$t2" ]] || return 0
-  if [[ "$t2" == "$t1" && "${p2:-0}" -le "${p1:-0}" ]]; then
+  if [[ "$t2" == "$t1" && "${p2:-0}" -le "${p1:-0}" && "$work" == true ]]; then
     warn "autoupgrade deferred: tip flat at $t2 for ${probe}s (best peer tip ${p2:-none}); chain looks stalled, not restarting mid-stall (next timer run retries)"
     return 1
   fi

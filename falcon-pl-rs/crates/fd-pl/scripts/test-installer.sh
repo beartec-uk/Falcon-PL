@@ -131,20 +131,29 @@ printf 'ADOPTED=1\nUNIT=falcon-pl-v99\nSVC_USER=falcon\n' >>"$OLDH/config/node.e
 AU_SVC_F="$TMP/au_svc"; AU_RPC_F="$TMP/au_rpc"   # contents 1 = service active / RPC answers
 AU_TIPS=()          # successive tip_height values returned by local_status
 AU_PEERS=()         # successive best_peer_tip values
+AU_RPCSEQ=()        # optional per-call RPC answers (1/0); overrides the RPC file
+AU_WORK=true        # liveness.has_work reported by status
 AU_I=0
 RESTARTS="$TMP/restarts.log"; : >"$RESTARTS"
 svc_active() { [[ "$(cat "$AU_SVC_F")" == 1 ]]; }
 svc_restart() { echo restart >>"$RESTARTS"; echo 1 >"$AU_SVC_F"; }
 local_status() {
-  [[ "$(cat "$AU_RPC_F")" == 1 ]] || return 1
   local i=$AU_I t p
+  if (( ${#AU_RPCSEQ[@]} > 0 )); then
+    local j=$i; (( j < ${#AU_RPCSEQ[@]} )) || j=$(( ${#AU_RPCSEQ[@]} - 1 ))
+    AU_I=$(( AU_I + 1 ))
+    [[ "${AU_RPCSEQ[$j]}" == 1 ]] || return 1
+    i=$(( AU_I - 1 ))
+  else
+    [[ "$(cat "$AU_RPC_F")" == 1 ]] || return 1
+    AU_I=$(( AU_I + 1 ))
+  fi
   (( i < ${#AU_TIPS[@]} )) || i=$(( ${#AU_TIPS[@]} - 1 ))
   t="${AU_TIPS[$i]}"; p="${AU_PEERS[$i]:-$t}"
-  AU_I=$(( AU_I + 1 ))
-  printf '{"tip_height": %s, "best_peer_tip": %s}\n' "$t" "$p" >"$1"
+  printf '{"tip_height": %s, "best_peer_tip": %s, "liveness": {"tip_height": %s, "has_work": %s}}\n' "$t" "$p" "$t" "$AU_WORK" >"$1"
 }
 au_reset() { # svc rpc "tips" "peers"
-  echo "$1" >"$AU_SVC_F"; echo "$2" >"$AU_RPC_F"; read -r -a AU_TIPS <<<"$3"; read -r -a AU_PEERS <<<"${4:-}"; AU_I=0; : >"$RESTARTS"
+  echo "$1" >"$AU_SVC_F"; echo "$2" >"$AU_RPC_F"; read -r -a AU_TIPS <<<"$3"; read -r -a AU_PEERS <<<"${4:-}"; AU_I=0; AU_RPCSEQ=(); AU_WORK=true; : >"$RESTARTS"
   echo "node-2.11.3" >"$BIN/falcon-pl-node"; echo "ctl-2.11.3" >"$BIN/falcon-pl-ctl"
   rm -f "$BIN/falcon-pl-node.prev" "$BIN/falcon-pl-ctl.prev"
   kv_set "$NODE_ENV" VERSION "2.11.3"
@@ -177,6 +186,11 @@ rc=0; autoupgrade_health_check 869559 >/dev/null 2>&1 || rc=$?
 au_reset 1 1 "869559 869560"
 rc=0; autoupgrade_health_check 869559 >/dev/null 2>&1 || rc=$?
 [[ $rc -eq 0 ]] || { echo "FAIL 7a: tip advanced must be 0, got $rc" >&2; exit 1; }
+# RPC answered earlier with a flat tip, then one slow/failed poll: still a stall (2), not a failure
+au_reset 1 1 "869559"
+AU_RPCSEQ=(1 0 0 0 0 0 0 0 0 0 0 0)
+rc=0; autoupgrade_health_check 869559 >/dev/null 2>&1 || rc=$?
+[[ $rc -eq 2 ]] || { echo "FAIL 7a: earlier RPC answer + flat tip must be 2, got $rc" >&2; exit 1; }
 
 # 7b incident: no new release, service active, tip flat -> no health wait, no rollback, no restart
 au_reset 1 1 "869559"
@@ -228,6 +242,11 @@ export FALCON_AUTOUPGRADE_STALL_PROBE_SECS=1
 au_reset 1 1 "869559 869559" "869559 869559"
 AU_UPGRADE=upgrade_new; rc="$(au_run)"
 [[ "$rc" == 0 && ! -s "$UPGRADE_CALLS" && "$(nrestarts)" == 0 && "$(cat "$BIN/falcon-pl-node")" == node-2.11.3 ]] || { echo "FAIL 7j: upgrade ran mid-stall (calls=$(cat "$UPGRADE_CALLS") rc=$rc)" >&2; exit 1; }
+# 7j2 idle healthy chain (flat tips, has_work=false): load-driven blocks, must NOT defer
+au_reset 1 1 "869559 869559 869559" "869559 869559 869559"
+AU_WORK=false
+AU_UPGRADE=upgrade_new; rc="$(au_run)"
+[[ "$(cat "$UPGRADE_CALLS")" == new && "$(cat "$BIN/falcon-pl-node")" == node-2.11.4 && "$(nrestarts)" == 0 ]] || { echo "FAIL 7j2: idle chain deferred the upgrade (calls=$(cat "$UPGRADE_CALLS") rc=$rc)" >&2; exit 1; }
 # 7k stall probe: we are flat but peers advance (we are the laggard) -> proceed
 au_reset 1 1 "869556 869556 869556 869560" "869559 869559 869560 869560"
 AU_UPGRADE=upgrade_new; rc="$(au_run)"

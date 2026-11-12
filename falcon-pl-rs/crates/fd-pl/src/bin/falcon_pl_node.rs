@@ -5544,6 +5544,10 @@ fn process_msg(
             if n_batch == 0 {
                 return None;
             }
+            // 2.11.4: small lag may run NeedLedgers next to a snapshot offer;
+            // never chain another pull onto an active snapshot download
+            // (lock order: snap_pull → node).
+            let pulling = shared.snap_pull.lock().is_some();
             let mut n = shared.node.lock();
             let before = n.tip_height;
             match n.apply_catchup_batch(&ledgers) {
@@ -5565,7 +5569,7 @@ fn process_msg(
                     // Residual only. from=1 is operator-only (never auto-rewind).
                     // note_catchup_batch already cleared inflight; take_catchup_pull
                     // issues the next NeedLedgers (one hub, not a 3-way fan).
-                    if n.still_lagging() && advanced {
+                    if n.still_lagging() && advanced && !pulling {
                         if let Some(from) = n.take_catchup_pull() {
                             drop(n);
                             fan(WireMsg::NeedLedgers {
@@ -5822,6 +5826,15 @@ fn process_msg(
             let mut n = shared.node.lock();
             let keys = n.keys.clone();
             match Node::load_snapshot(&dest, keys) {
+                Ok(loaded) if !n.peer_snapshot_adoptable(loaded.tip_height) => {
+                    // 2.11.4: residual catch-up (or live commits) moved past
+                    // this pin while it downloaded. Adopting it would rewind
+                    // committed state.
+                    info!(
+                        "snapshot pull discarded: snap tip {} not ahead of local tip {}",
+                        loaded.tip_height, n.tip_height
+                    );
+                }
                 Ok(loaded) => {
                     let old = n.tip_height;
                     n.adopt_peer_snapshot(loaded);
