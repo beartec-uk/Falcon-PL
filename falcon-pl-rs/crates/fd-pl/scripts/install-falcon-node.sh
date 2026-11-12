@@ -33,7 +33,7 @@
 # (and an interactive confirmation unless --yes). Docs: docs/PUBLIC_NODE.md in the Falcon-PL repo.
 set -euo pipefail
 
-INSTALLER_VERSION="2.11.3"
+INSTALLER_VERSION="2.11.4"
 RELEASE_REPO="${FALCON_RELEASE_REPO:-beartec-jpg/falcon-pl-releases}"
 # Pinned minisign public key of the Falcon PL release key (key id 8ACFFC29EE09FAEC).
 # A valid SHA256SUMS.minisig is REQUIRED. FALCON_MINISIGN_PUBKEY="" disables the check, but only together
@@ -1387,15 +1387,25 @@ U
   sctl daemon-reload >/dev/null 2>&1 || true
 }
 
+# Post-upgrade health check. Return codes:
+#   0  service active and the tip advanced past prev_tip (healthy)
+#   2  service active and the local RPC answers, but the tip is flat: the CHAIN
+#      is stalled, not the binary (2.11.4; 12 Nov 2026 h=869559). Callers must
+#      not roll back or restart on 2: a restart mid-stall resets the seat's
+#      view round and turned a 3-block lag into a 22-minute deadlock.
+#   1  service down / crashed, or the local RPC never answered (real failure)
 autoupgrade_health_check() { # prev_tip
   local prev_tip="${1:-0}"
   local timeout_secs="${FALCON_AUTOUPGRADE_HEALTH_TIMEOUT:-120}"
   local poll_secs="${FALCON_AUTOUPGRADE_POLL_SECS:-2}"
-  local t0 now st cur_tip
+  local t0 now st cur_tip="" active rpc_ok=0
   t0="$(date +%s)"
   st="$(mktemp)"
   while :; do
+    # rpc_ok: the RPC answered at least once in the window (one slow final
+    # poll under load must not turn a stall into a rollback).
     if svc_active && local_status "$st"; then
+      rpc_ok=1
       cur_tip="$(json_num "$st" tip_height)"
       if [[ -n "$cur_tip" && "$cur_tip" -gt "$prev_tip" ]]; then
         ok "autoupgrade health check passed: service active and tip advanced ($prev_tip -> $cur_tip)"
@@ -1405,12 +1415,73 @@ autoupgrade_health_check() { # prev_tip
     fi
     now="$(date +%s)"
     if (( now - t0 >= timeout_secs )); then
-      warn "autoupgrade health check failed after ${timeout_secs}s (service active: $(svc_active && echo yes || echo no), prev tip: $prev_tip, current tip: ${cur_tip:-none})"
       rm -f "$st"
+      active=no; svc_active && active=yes
+      if [[ "$active" == yes && $rpc_ok -eq 1 && -n "$cur_tip" ]]; then
+        warn "autoupgrade health check: service active and RPC answering but tip flat after ${timeout_secs}s (prev tip: $prev_tip, current tip: $cur_tip); treating as a chain stall, not a bad binary: no rollback, no restart"
+        return 2
+      fi
+      warn "autoupgrade health check failed after ${timeout_secs}s (service active: $active, rpc: $( [[ $rpc_ok -eq 1 ]] && echo yes || echo no ), prev tip: $prev_tip, current tip: ${cur_tip:-none})"
       return 1
     fi
     sleep "$poll_secs"
   done
+}
+
+# 2.11.4: did this run actually replace a binary? (.prev is the pre-run copy.)
+autoupgrade_bins_changed() {
+  local b
+  for b in falcon-pl-node falcon-pl-ctl; do
+    if [[ -f "$BIN/$b.prev" && -f "$BIN/$b" ]] && ! cmp -s "$BIN/$b" "$BIN/$b.prev"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 2.11.4: recover from a failed autoupgrade run. Roll back only when a binary
+# was actually replaced. With the binaries unchanged, "rolling back" restored
+# the same version and restarted a running node (v3/v12 at h=869559); now the
+# node is only (re)started when the service is really down.
+autoupgrade_recover() { # prev_ver
+  if autoupgrade_bins_changed; then
+    rollback_autoupgrade "$1"
+    return
+  fi
+  if svc_active; then
+    warn "autoupgrade: binaries unchanged and service active; nothing to roll back, not restarting"
+  else
+    warn "autoupgrade: binaries unchanged but service is down; starting it"
+    svc_restart || true
+  fi
+}
+
+# 2.11.4: before an upgrade restarts the node, make sure the network is not in
+# a stall. Restarting a committee seat mid-stall resets its view round and can
+# deadlock the open height. Returns 1 (defer) only when both our tip and the
+# best peer tip stay flat for the probe window AND the node reports pending
+# work (liveness.has_work=true). Blocks are load-driven, so an idle healthy
+# chain is flat too and must not defer upgrades forever. A seat that is merely
+# lagging (peers advancing), an unknown has_work, or a stopped/unreachable
+# node is not deferred.
+autoupgrade_stall_probe() {
+  local probe="${FALCON_AUTOUPGRADE_STALL_PROBE_SECS:-90}" st t1 p1 t2 p2 work
+  [[ "$probe" =~ ^[0-9]+$ ]] && (( probe > 0 )) || return 0
+  svc_active || return 0
+  st="$(mktemp)"
+  if ! local_status "$st"; then rm -f "$st"; return 0; fi
+  t1="$(json_num "$st" tip_height)"; p1="$(json_num "$st" best_peer_tip)"
+  sleep "$probe"
+  if ! svc_active || ! local_status "$st"; then rm -f "$st"; return 0; fi
+  t2="$(json_num "$st" tip_height)"; p2="$(json_num "$st" best_peer_tip)"
+  work="$(grep -oE '"has_work": *(true|false)' "$st" 2>/dev/null | head -1 | grep -oE '(true|false)$' || true)"
+  rm -f "$st"
+  [[ -n "$t1" && -n "$t2" ]] || return 0
+  if [[ "$t2" == "$t1" && "${p2:-0}" -le "${p1:-0}" && "$work" == true ]]; then
+    warn "autoupgrade deferred: tip flat at $t2 for ${probe}s (best peer tip ${p2:-none}); chain looks stalled, not restarting mid-stall (next timer run retries)"
+    return 1
+  fi
+  return 0
 }
 
 rollback_autoupgrade() { # prev_ver
@@ -1509,16 +1580,37 @@ cmd_autoupgrade() {
         prev_tip="${prev_tip:-0}"
       fi
       rm -f "$st"
+      if ! autoupgrade_stall_probe; then
+        return 0
+      fi
       for b in falcon-pl-node falcon-pl-ctl; do
         [[ -f "$BIN/$b" ]] && cp -p "$BIN/$b" "$BIN/$b.prev"
       done
       if ! ( YES=1 cmd_upgrade ); then
         warn "falcon-node upgrade failed during autoupgrade"
-        rollback_autoupgrade "$prev_ver"
+        autoupgrade_recover "$prev_ver"
         return 1
       fi
-      if ! autoupgrade_health_check "$prev_tip"; then
-        rollback_autoupgrade "$prev_ver"
+      if ! autoupgrade_bins_changed; then
+        # No new release: nothing was replaced, so there is nothing to verify.
+        # (Before 2.11.4 the hourly run waited for the tip to move and, on a
+        # stalled chain, "rolled back" to the same version and restarted.)
+        if svc_active; then
+          ok "autoupgrade: already on the latest release; nothing to verify"
+          return 0
+        fi
+        warn "autoupgrade: no new release, but the service is down"
+        autoupgrade_recover "$prev_ver"
+        return 1
+      fi
+      local hc=0
+      autoupgrade_health_check "$prev_tip" || hc=$?
+      if (( hc == 2 )); then
+        warn "autoupgrade: new binary is running but the chain tip is flat; keeping it (no rollback, no restart)"
+        return 0
+      fi
+      if (( hc != 0 )); then
+        autoupgrade_recover "$prev_ver"
         return 1
       fi
       ok "autoupgrade completed and verified healthy"
@@ -1704,7 +1796,10 @@ cmd_adopt() {
   write_adopt_dropin
   if [[ $START -eq 1 ]]; then
     svc_restart
-    if ! FALCON_AUTOUPGRADE_HEALTH_TIMEOUT="${FALCON_AUTOUPGRADE_HEALTH_TIMEOUT:-300}" autoupgrade_health_check "${prev:-0}"; then
+    local hc=0
+    FALCON_AUTOUPGRADE_HEALTH_TIMEOUT="${FALCON_AUTOUPGRADE_HEALTH_TIMEOUT:-300}" autoupgrade_health_check "${prev:-0}" || hc=$?
+    (( hc != 2 )) || warn "adopted $UNIT is running but the chain tip is flat (chain stall); keeping the adoption"
+    if (( hc == 1 )); then
       warn "adopted $UNIT did not come back healthy; restoring its original ExecStart"
       rm -f "/etc/systemd/system/$UNIT.service.d/90-falcon-node-adopt.conf"; sctl daemon-reload; svc_restart || true
       die "adopt failed; $UNIT is back on $oldbin (managed files left in $FALCON_HOME for inspection)"
