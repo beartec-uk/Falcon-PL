@@ -484,7 +484,9 @@ def tx_seen(txid):
     if not txid:
         return False
     try:
-        esplora(f"tx/{txid}/status")
+        # NOT tx/<id>/status: mempool.space answers 200 {"confirmed": false} for txids it
+        # has never seen. tx/<id> returns 404 for unknown txids.
+        esplora(f"tx/{txid}")
         return True
     except urllib.error.HTTPError as e:
         return False if e.code == 404 else None
