@@ -423,6 +423,26 @@ class ReviewFixes(Base):
         self.assertEqual(acts, {a["id"]: "stall", b["id"]: "defer", c["id"]: "coordinator_dead"})
 
 
+class TxSeenEndpoint(unittest.TestCase):
+    def test_uses_tx_endpoint_not_status(self):
+        tmp = tempfile.mkdtemp()
+        I = load_intake(os.path.join(tmp, "h"), os.path.join(tmp, "p"))
+        calls = []
+
+        def fake(path, data=None):
+            calls.append(path)
+            if path.endswith("/status"):
+                return {"confirmed": False}       # mempool.space: 200 even for unknown txids
+            raise urllib.error.HTTPError("u", 404, "Transaction not found", {}, None)
+        with mock.patch.object(I, "esplora", fake):
+            self.assertIs(I.tx_seen("ab" * 32), False)
+        self.assertEqual(calls, ["tx/" + "ab" * 32])
+        with mock.patch.object(I, "esplora", lambda path, data=None: {"txid": "x"}):
+            self.assertIs(I.tx_seen("cd" * 32), True)
+        with mock.patch.object(I, "esplora", side_effect=OSError("down")):
+            self.assertIsNone(I.tx_seen("ef" * 32))
+
+
 class AlertSafety(unittest.TestCase):
     def test_webhook_url_never_logged(self):
         tmp = tempfile.mkdtemp()
