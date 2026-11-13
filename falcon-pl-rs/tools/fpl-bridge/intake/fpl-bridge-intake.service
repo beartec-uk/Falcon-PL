@@ -9,6 +9,15 @@ ExecStart=/usr/bin/python3 /opt/fpl-operator/bin/fpl_bridge_intake.py
 Restart=always
 RestartSec=5
 User=root
-MemoryMax=6G
+# Ceremony coordinators run in this unit's cgroup (~4.2 GB RSS each). The intake caps
+# concurrent ceremonies (FPL_MAX_CEREMONIES, default 2) and checks free memory first.
+# MemoryHigh throttles before the hard limit; OOMPolicy=continue keeps the intake up if
+# the kernel still kills one coordinator (the supervisor then restarts or fails it, with
+# an alert) instead of stopping the whole unit. KillMode=process: an intake restart does
+# not kill in-flight ceremonies (they are re-adopted by /proc scan).
+MemoryHigh=9G
+MemoryMax=10G
+OOMPolicy=continue
+KillMode=process
 [Install]
 WantedBy=multi-user.target

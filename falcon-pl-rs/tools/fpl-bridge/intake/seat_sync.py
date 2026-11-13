@@ -49,9 +49,28 @@ def sync(rid):
             put(f"/seat/{rid}/file/{sub}/{SEAT}.json", open(f, "rb").read()); open(f + ".up", "w").close()
 
 
+def reap(live):
+    """Stop our participant for requests the lead no longer lists (failed/expired/done).
+    Exited participants of still-listed requests are NOT respawned (their RAM-only key is
+    gone; a new key could not join the same ceremony) - the lead times the request out."""
+    for rid in list(procs):
+        if rid in live:
+            continue
+        p = procs.pop(rid)
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+            print(time.strftime("%H:%M:%S"), "stopped participant for", rid, "(no longer listed by lead)", flush=True)
+
+
 while True:
     try:
-        for rid in json.loads(get("/seat/requests")):
+        live = json.loads(get("/seat/requests"))
+        reap(set(live))
+        for rid in live:
             sync(rid)
     except Exception as e:
         print(time.strftime("%H:%M:%S"), "sync error:", e, flush=True)
