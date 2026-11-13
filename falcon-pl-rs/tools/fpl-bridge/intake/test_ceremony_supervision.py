@@ -379,6 +379,50 @@ class BroadcastSupervision(Base):
         self.assertEqual(f["state"], "broadcasting"); self.assertIn("manual action", f["stalled"])
 
 
+class ReviewFixes(Base):
+    def test_final_json_never_released_on_timeout(self):
+        """Copilot high: presigned graphs stay usable -> stall, keep kickoff."""
+        I = self.I
+        r = self.req("e100000000000001", "presigned", age=I.stage_timeout("presigned") + 60)
+        Path(I.gdir(r), "final.json").write_text("{}")
+        I.worker_pass()
+        f = self.load(r["id"])
+        self.assertEqual(f["state"], "presigned")
+        self.assertIn("final.json", f["stalled"])
+        self.assertIn(r["kickoff"], I.reserved_kickoffs())
+        self.assertEqual(I.plan(I.all_reqs())[0]["action"], "stall")
+
+    def test_awaiting_funding_timeout_configurable(self):
+        I = self.I
+        r = self.req("e100000000000002", "awaiting_funding", age=120, address="tb1qx")
+        with mock.patch.dict(os.environ, {"FPL_STAGE_TIMEOUT_AWAITING_FUNDING": "60"}):
+            self.assertTrue(I.step(I.load(r["id"])) is True)
+        with mock.patch.dict(os.environ, {"FPL_STAGE_TIMEOUT_AWAITING_FUNDING": "0"}), \
+                mock.patch.object(I, "esplora", lambda path: []):
+            rr = I.load(r["id"])
+            self.assertFalse(I.step(rr)); self.assertEqual(rr["state"], "awaiting_funding")
+
+    def test_participant_dead_with_live_coordinator_fails(self):
+        I = self.I
+        r = self.req("e100000000000003", "signed", coord_spawned=1)
+        self.coord(r)
+        I.worker_pass()
+        f = self.load(r["id"])
+        self.assertEqual(f["state"], "failed"); self.assertEqual(f["failed_reason"], "participant_died")
+        self.assertEqual(I.ceremony_procs(I.gdir(r)), [])
+
+    def test_plan_matches_supervision_safety(self):
+        I = self.I
+        a = self.req("e100000000000004", "signed", age=I.stage_timeout("signed") + 60)
+        b = self.req("e100000000000005", "signed", age=I.stage_timeout("signed") + 60)
+        c = self.req("e100000000000006", "signed", coord_spawned=1)
+        self.participant(c)
+        self.seen[a["deposit_txid"]] = True
+        self.seen[b["deposit_txid"]] = None
+        acts = {x["id"]: x["action"] for x in I.plan(I.all_reqs())}
+        self.assertEqual(acts, {a["id"]: "stall", b["id"]: "defer", c["id"]: "coordinator_dead"})
+
+
 class AlertSafety(unittest.TestCase):
     def test_webhook_url_never_logged(self):
         tmp = tempfile.mkdtemp()

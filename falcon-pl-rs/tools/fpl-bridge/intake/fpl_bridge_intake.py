@@ -503,7 +503,13 @@ def broadcast_seen(r):
 
 
 def fail_request(r, reason, kind, now):
-    """Mark failed (releases kickoff + funding reservation) only if nothing was broadcast."""
+    """Mark failed (releases kickoff + funding reservation) only if nothing was broadcast
+    AND the ceremony never produced fully signed graphs (final.json). Seats keep copies of
+    final.json, so a presigned peg-in stays broadcastable; releasing its kickoff could let
+    two usable graphs share one kickoff. Such requests are stalled with reservations kept."""
+    if os.path.exists(os.path.join(gdir(r), "final.json")):
+        return mark_stalled(r, f"{reason}; NOT failed: ceremony completed (final.json), presigned graphs "
+                               "remain usable, kickoff stays reserved; manual action needed", now)
     seen = broadcast_seen(r)
     if seen is None:
         r["last_error"] = f"{reason} (fail deferred: esplora unavailable)"
@@ -552,20 +558,20 @@ def supervise(r, now=None):
         return mark_stalled(r, why, now)
 
     if s in CEREMONY_STATES and not os.path.exists(os.path.join(d, "final.json")):
-        if live_ceremony_coordinators().get(os.path.normpath(d)):
-            if r.pop("coord_dead_since", None) is not None:
-                return True
-            return False
         if now - int(r.get("coord_spawned") or 0) < COORD_GRACE_SECS:
             return False
-        if os.path.exists(os.path.join(d, "graphs.json")):
-            return fail_request(r, "ceremony coordinator died after graphs.json was published; the signing "
-                                   "rounds cannot resume (participants hold RAM-only nonces)", "coordinator_died_mid_signing", now)
         seat = E("FPL_LOCAL_SEAT")
         if seat and not os.path.exists(os.path.join(d, "attest", seat + ".json")) \
                 and not ceremony_procs(d, (PART_BIN,)):
             return fail_request(r, f"local ceremony participant ({seat}) is gone; its RAM-only n-of-n key "
                                    "is lost so this ceremony cannot finish", "participant_died", now)
+        if live_ceremony_coordinators().get(os.path.normpath(d)):
+            if r.pop("coord_dead_since", None) is not None:
+                return True
+            return False
+        if os.path.exists(os.path.join(d, "graphs.json")):
+            return fail_request(r, "ceremony coordinator died after graphs.json was published; the signing "
+                                   "rounds cannot resume (participants hold RAM-only nonces)", "coordinator_died_mid_signing", now)
         attempts = int(r.get("coord_attempts") or 1)
         changed = False
         if not r.get("coord_dead_since"):
@@ -616,19 +622,43 @@ def supervise(r, now=None):
     return False
 
 
-def plan(reqs, now=None):
-    """Read-only report of what supervise() would do on the next pass."""
+def plan(reqs, now=None, check_chain=True):
+    """Read-only report of the action supervise() would take on the next pass. Uses the same
+    timeout, final.json, broadcast-safety and coordinator-liveness rules (reads only: files,
+    /proc, esplora GETs). Actions: none | fail | stall | defer (esplora unknown) |
+    coordinator_dead (restart within retries, else fail) | participant_dead (fail)."""
     now = int(now or time.time())
     rows = []
     for r in reqs:
         if r.get("state") in TERMINAL_STATES:
             continue
+        s, d = r["state"], gdir(r)
+        act, why = "none", ""
         ta = timeout_action(r, now)
-        rows.append({"id": r["id"], "account": r.get("account"), "state": r["state"],
+        if ta:
+            act, why = ta
+        elif s in CEREMONY_STATES and not os.path.exists(os.path.join(d, "final.json")) \
+                and now - int(r.get("coord_spawned") or 0) >= COORD_GRACE_SECS:
+            seat = E("FPL_LOCAL_SEAT")
+            if seat and not os.path.exists(os.path.join(d, "attest", seat + ".json")) \
+                    and not ceremony_procs(d, (PART_BIN,)):
+                act, why = "participant_dead", "local participant gone"
+            elif not live_ceremony_coordinators().get(os.path.normpath(d)):
+                act, why = "coordinator_dead", f"no live coordinator (attempts {int(r.get('coord_attempts') or 1)})"
+        if act in ("fail", "participant_dead"):
+            if os.path.exists(os.path.join(d, "final.json")):
+                act, why = "stall", why + "; final.json exists (kickoff kept)"
+            elif check_chain:
+                seen = broadcast_seen(r)
+                if seen is None:
+                    act, why = "defer", why + "; esplora unavailable"
+                elif seen:
+                    act, why = "stall", why + "; peg-in tx already broadcast"
+        rows.append({"id": r["id"], "account": r.get("account"), "state": s,
                      "age_h": round(state_age(r, now) / 3600, 1),
-                     "timeout_h": round(stage_timeout(r["state"]) / 3600, 1),
-                     "kickoff": r.get("kickoff"), "action": ta[0] if ta else "none",
-                     "reason": ta[1] if ta else ""})
+                     "timeout_h": round(stage_timeout(s) / 3600, 1),
+                     "kickoff": r.get("kickoff"), "kickoff_sats": r.get("kickoff_sats"),
+                     "action": act, "reason": why})
     return rows
 
 
@@ -636,7 +666,8 @@ def step(r):
     """Advance one request; returns True if changed."""
     s, d = r["state"], gdir(r)
     if s == "awaiting_funding":
-        if time.time() - r["created"] > 3 * 86400:
+        lim = stage_timeout("awaiting_funding")
+        if lim and time.time() - r["created"] > lim:
             r["state"] = "expired"; return True
         used = reserved_fundings(r["id"])
         for u in esplora(f"address/{r['address']}/utxo"):
