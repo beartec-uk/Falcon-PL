@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -365,14 +366,183 @@ def sign_depositor(home: Path, account_name: str, sign_mjs: Path, req_path: Path
         raise RuntimeError(f"sign failed: {(p.stderr or p.stdout)[-300:]}")
     log(f"signed depositor PSBTs for {account_name}")
 
+
+# ---------------------------------------------------------------------------
+# peg-in pacing gate
+#
+# Each peg-in runs a BitVM2 ceremony on the intake seat (~4 GB RSS per
+# coordinator). On 13 Nov 2026 four fundings confirmed in one block, four
+# ceremonies started in the same intake tick, the intake memcg (10 G) OOM-killed
+# one coordinator and that request hung at `signed` forever. The gate keeps at
+# most MAX_CONCURRENT_PEGIN_CEREMONIES of our peg-ins between "funding sent" and
+# "ceremony finished" (presigned or later), so their ceremonies never overlap.
+# A ceremony starts when the funding *confirms*, so the slot is taken before the
+# funding tx is broadcast, not when the ceremony starts.
+
+DEFAULT_GATE_STATES = (
+    "awaiting_funding", "funded", "waiting_operator_liquidity",
+    "ceremony_pubkeys", "awaiting_signature", "signed",
+)
+CEREMONY_STALL_STATES = ("funded", "ceremony_pubkeys", "awaiting_signature", "signed")
+TERMINAL_STATES = ("minted", "failed", "expired", "error", "rejected")
+
+
+class LegSkipped(Exception):
+    """A leg that was not started (pacing / caps). Not a bridge failure."""
+
+
+def gate_states() -> tuple[str, ...]:
+    raw = env("PEGIN_GATE_STATES", "")
+    if not raw:
+        return DEFAULT_GATE_STATES
+    return tuple(x.strip() for x in raw.split(",") if x.strip())
+
+
+def journal_open_pegins() -> set[str]:
+    """Peg-in deposit ids in legs.jsonl that have no terminal row yet."""
+    p = record_dir() / "logs" / "legs.jsonl"
+    if not p.exists():
+        return set()
+    opened: set[str] = set()
+    closed: set[str] = set()
+    for line in p.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if r.get("direction") != "peg-in":
+            continue
+        lid = str(r.get("leg_id") or "")
+        if not re.fullmatch(r"[0-9a-f]{16}", lid):
+            continue
+        if r.get("state") == "funding_broadcast":
+            opened.add(lid)
+        elif r.get("result") in ("pass", "fail", "error") or r.get("state") in TERMINAL_STATES:
+            closed.add(lid)
+    return opened - closed
+
+
+class PegInGate:
+    """At most `max_n` of our peg-ins in pre-ceremony / ceremony states at once."""
+
+    def __init__(self, max_n: int, accounts: list[str], poll_secs: int = 20,
+                 wait_max_secs: int = 3600, intake_fn=None, sleep_fn=time.sleep,
+                 clock=time.time):
+        self.max_n = max(1, int(max_n))
+        self.accounts = list(accounts)
+        self.poll = max(1, int(poll_secs))
+        self.wait_max = max(0, int(wait_max_secs))
+        self._intake = intake_fn or intake
+        self._sleep = sleep_fn
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._held = 0                 # slots held by threads in this process
+        self._mine: set[str] = set()   # deposit ids opened by slot holders
+
+    def _state_of(self, dep_id: str) -> str:
+        try:
+            return str(self._intake("GET", f"/v1/deposits/{dep_id}").get("state") or "")
+        except Exception:
+            return "unknown"  # unknown counts as busy (fail safe)
+
+    def external_busy(self) -> set[str]:
+        """Our-account peg-ins in gate states not held by a slot in this process
+        (e.g. legs left in flight by a previous loadgen process)."""
+        states = set(gate_states()) | {"unknown"}
+        ids = set(journal_open_pegins())
+        for a in self.accounts:
+            try:
+                for r in self._intake("GET", f"/v1/deposits?account={a}") or []:
+                    if isinstance(r, dict) and r.get("state") in states and r.get("id"):
+                        ids.add(str(r["id"]))
+            except Exception:
+                pass
+        with self._lock:
+            ids -= self._mine
+        busy = set()
+        for i in sorted(ids):
+            if self._state_of(i) in states:
+                busy.add(i)
+        return busy
+
+    def acquire(self, label: str) -> None:
+        deadline = self._clock() + self.wait_max
+        logged = False
+        while True:
+            ext = self.external_busy()
+            with self._lock:
+                if self._held + len(ext) < self.max_n:
+                    self._held += 1
+                    return
+                held = self._held
+            if self._clock() >= deadline:
+                raise LegSkipped(
+                    f"pacing: no peg-in ceremony slot for {label} after {self.wait_max}s "
+                    f"(max {self.max_n}; held {held}; other in-flight {sorted(ext)[:4]})"
+                )
+            if not logged:
+                log(f"pacing: {label} waiting for peg-in ceremony slot "
+                    f"(max {self.max_n}; held {held}; other in-flight {len(ext)})")
+                logged = True
+            self._sleep(self.poll)
+
+    def bind(self, dep_id: str) -> None:
+        with self._lock:
+            self._mine.add(dep_id)
+
+    def release(self, dep_id: str | None = None) -> None:
+        with self._lock:
+            if self._held > 0:
+                self._held -= 1
+            if dep_id:
+                self._mine.discard(dep_id)
+
+    @property
+    def held(self) -> int:
+        with self._lock:
+            return self._held
+
+
+def batch_offsets(size: int, window: int, jitter_frac: float = 0.25, rng=random) -> list[float]:
+    """Evenly spaced launch offsets across the window (one slot per leg) with a
+    small jitter inside each slot. Replaces uniform-random offsets, which could
+    put several legs within seconds of each other."""
+    if size <= 0:
+        return []
+    usable = max(1.0, float(window) - 30.0)
+    slot = usable / size
+    j = min(max(jitter_frac, 0.0), 0.9)
+    return [i * slot + rng.uniform(0, slot * j) for i in range(size)]
+
 # ---------------------------------------------------------------------------
 # peg-in / peg-out
 
-def peg_in(account_name: str, send_sats: int, home: Path, sign_mjs: Path, timeout_sec: int) -> dict:
+def peg_in(account_name: str, send_sats: int, home: Path, sign_mjs: Path, timeout_sec: int,
+           gate: "PegInGate | None" = None) -> dict:
+    """Open, fund, sign and wait for one peg-in. With `gate`, a ceremony slot is
+    taken before the deposit is opened/funded and released once the request
+    leaves the gate states (ceremony finished) or the leg ends for any reason."""
+    slot = {"held": False, "dep": None}
+    if gate is not None:
+        gate.acquire(account_name)
+        slot["held"] = True
+    try:
+        return _peg_in_body(account_name, send_sats, home, sign_mjs, timeout_sec, gate, slot)
+    finally:
+        if gate is not None and slot["held"]:
+            gate.release(slot["dep"])
+            slot["held"] = False
+
+
+def _peg_in_body(account_name: str, send_sats: int, home: Path, sign_mjs: Path, timeout_sec: int,
+                 gate: "PegInGate | None", slot: dict) -> dict:
     started = gmt()
     t0 = time.time()
     pub = ensure_depositor_key(home, account_name, sign_mjs)
     dep = intake("POST", "/v1/deposits", {"account": account_name, "depositor_pubkey": pub})
+    if gate is not None:
+        gate.bind(dep["id"])
+        slot["dep"] = dep["id"]
     dep_id = dep["id"]
     addr = dep["address"]
     need = int(dep.get("send_sats_min") or send_sats)
@@ -398,6 +568,10 @@ def peg_in(account_name: str, send_sats: int, home: Path, sign_mjs: Path, timeou
     signed = False
     deadline = time.time() + timeout_sec
     last = ""
+    state_since = time.time()
+    stall_alerted: set[str] = set()
+    stall_secs = env_int("PEGIN_STALL_ALERT_SECS", 1800)
+    gstates = set(gate_states())
     while time.time() < deadline:
         if paused(Path(env("PAUSE_FILE", str(home / "PAUSE")))) and env("PAUSE_STOPS_WAIT", "0") == "1":
             raise RuntimeError("paused during peg-in wait")
@@ -406,6 +580,21 @@ def peg_in(account_name: str, send_sats: int, home: Path, sign_mjs: Path, timeou
         if state != last:
             log(f"peg-in {dep_id} state={state} confs={st.get('confirmations')} err={(st.get('last_error') or '')[:80]}")
             last = state
+            state_since = time.time()
+        # ceremony finished (presigned or later): free the pacing slot early
+        if gate is not None and slot["held"] and state not in gstates:
+            gate.release(dep_id)
+            slot["held"] = False
+            log(f"pacing: {dep_id} left ceremony stages at state={state}; slot released")
+        # stall alert: a ceremony stage that should take minutes has taken too long
+        if (state in CEREMONY_STALL_STATES and state not in stall_alerted
+                and time.time() - state_since >= stall_secs):
+            stall_alerted.add(state)
+            discord_alert(
+                f"BTC4 loadtest peg-in {dep_id} ({account_name}) stuck in state={state} for "
+                f"{int((time.time() - state_since) // 60)} min (alert after {stall_secs}s). "
+                f"Ceremony coordinator may have died; check intake graphs/req-{dep_id}."
+            )
         if state == "awaiting_signature" and not signed:
             work = home / "work" / dep_id
             work.mkdir(parents=True, exist_ok=True)
@@ -448,10 +637,14 @@ def peg_in(account_name: str, send_sats: int, home: Path, sign_mjs: Path, timeou
             rec["deposit_txid"] = st.get("deposit_txid") or txid
             rec["peg_in_confirm_txid"] = st.get("peg_in_confirm_txid")
             return rec
-        if state in ("failed", "error", "rejected"):
+        if state in ("failed", "error", "rejected", "expired"):
             raise RuntimeError(f"peg-in {dep_id} {state}: {st.get('last_error')}")
-        time.sleep(20)
-    raise RuntimeError(f"peg-in {dep_id} timeout after {timeout_sec}s last={last}")
+        time.sleep(env_int("PEGIN_POLL_SECS", 20))
+    msg = f"peg-in {dep_id} TIMEOUT after {timeout_sec}s stuck at state={last}"
+    if last == "signed":
+        msg += " (signed but no presign: ceremony coordinator likely dead)"
+    discord_alert(f"BTC4 loadtest {msg} ({account_name})")
+    raise RuntimeError(msg)
 
 def peg_out(account_name: str, amount: int, dest: str, keys_dir: Path, timeout_sec: int) -> dict:
     started = gmt()
@@ -699,6 +892,13 @@ def cmd_run(home: Path) -> int:
     batch_window = env_int("BATCH_WINDOW_SECS", 3600)
     sizes = [env_int("BATCH_SIZE_A", 10), env_int("BATCH_SIZE_B", 20)]
     watch = RailWatch()
+    gate = PegInGate(
+        env_int("MAX_CONCURRENT_PEGIN_CEREMONIES", 1), accounts,
+        poll_secs=env_int("PEGIN_GATE_POLL_SECS", 20),
+        wait_max_secs=env_int("PEGIN_GATE_WAIT_SECS", batch_window),
+    )
+    jitter = float(env("BATCH_JITTER_FRAC", "0.25") or 0.25)
+    log(f"pacing: max {gate.max_n} peg-in ceremony at a time; legs evenly spaced over {batch_window}s")
 
     for a in accounts:
         ensure_fpl_wallet(a, keys)
@@ -732,7 +932,7 @@ def cmd_run(home: Path) -> int:
         size = sizes[bi % 2]
         log(f"starting batch {bi+1} size={size} window={batch_window}s lag={lag}")
         # randomize start offsets in the hour; half in, half out if the wallet has BTC4
-        offsets = sorted(random.uniform(0, max(1, batch_window - 30)) for _ in range(size))
+        offsets = batch_offsets(size, batch_window, jitter)
         batch_t0 = time.time()
         launched = 0
         for i, off in enumerate(offsets):
@@ -772,7 +972,16 @@ def cmd_run(home: Path) -> int:
                         fpl = int(account(acct).get("balance") or 0)
                         if fpl < fpl_floor:
                             fund_fpl(acct, fpl_fund, keys)
-                        peg_in(acct, send, home, sign_mjs, timeout)
+                        peg_in(acct, send, home, sign_mjs, timeout, gate=gate)
+                except LegSkipped as e:
+                    log(f"leg skipped ({acct}): {e}")
+                    append_leg({
+                        "case": f"batch-{bi+1}", "leg_id": f"{bi+1}-{i+1}",
+                        "direction": "peg-in", "account": acct, "amount_sats": send,
+                        "result": "skipped", "error": str(e)[:300],
+                        "started_gmt": gmt(), "ended_gmt": gmt(),
+                    })
+                    discord_alert(f"BTC4 loadtest leg skipped ({acct}): {e}")
                 except Exception as e:
                     log(f"leg failed ({acct}): {e}")
                     append_leg({
@@ -782,7 +991,6 @@ def cmd_run(home: Path) -> int:
                         "error": str(e)[:300], "started_gmt": gmt(), "ended_gmt": gmt(),
                     })
                     discord_alert(f"BTC4 loadtest leg failed ({acct}): {e}")
-            import threading
             threading.Thread(target=_run_leg, name=f"leg-{bi+1}-{i+1}", daemon=True).start()
             launched += 1
         remain = batch_t0 + batch_window - time.time()
