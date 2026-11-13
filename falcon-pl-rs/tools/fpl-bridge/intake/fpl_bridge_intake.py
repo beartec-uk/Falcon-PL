@@ -22,8 +22,13 @@ announce one). FPL_LOCAL_SEAT: this seat's own participant is spawned locally.
 Env: FPL_OP_HOME FPL_EX FPL_NETWORK(testnet4) FPL_ESPLORA FPL_SEATS FPL_OPERATOR_SECRET
      (or FPL_OPERATOR_SECRET_FILE) FPL_PROOF_DIR FPL_LOCAL_SEAT FPL_FALCON_CTL FPL_FALCON_RPC FPL_INTAKE_LISTEN(127.0.0.1:8790) FPL_SEAT_LISTEN(tailnet ip:8791)
      FPL_MIN_SATS(50000) FPL_MAX_SATS(2000000)
+Ceremony supervision (see "ceremony supervision" below): FPL_MAX_CEREMONIES(2) FPL_CEREMONY_MEM_MB(4608)
+     FPL_MEM_HEADROOM_MB(1024) FPL_COORD_MAX_RETRIES(3) FPL_COORD_BACKOFF_SECS(60) FPL_COORD_BACKOFF_MAX_SECS(900)
+     FPL_COORD_GRACE_SECS(45) FPL_STAGE_TIMEOUT_<STATE>(secs) FPL_STALL_REALERT_SECS(21600)
+     FPL_DISCORD_WEBHOOK_URL / DISCORD_HEALTH_WEBHOOK_URL or FPL_DISCORD_ENV_FILE (0600; URL never logged)
+CLI: fpl_bridge_intake.py --plan   print what the supervisor would do to each live request (no changes)
 """
-import hashlib, json, os, re, secrets, subprocess, threading, time, urllib.request
+import hashlib, json, os, re, secrets, signal, subprocess, sys, threading, time, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 E = os.environ.get
@@ -111,7 +116,17 @@ def load(i):
 
 
 def save(r):
-    r["updated"] = int(time.time())
+    now = int(time.time())
+    try:
+        prev = load(r["id"]).get("state")
+    except Exception:
+        prev = None
+    if prev != r.get("state"):
+        r["state_since"] = now
+    elif not r.get("state_since"):
+        # legacy record (before state_since existed): its last save is the best age we have
+        r["state_since"] = int(r.get("updated") or r.get("created") or now)
+    r["updated"] = now
     tmp = path(r["id"]) + ".tmp"
     with open(tmp, "w") as f:
         json.dump(r, f, indent=1)
@@ -214,11 +229,445 @@ def ledger_bound(dep_txid):
     return bool(active) and all(f"{dep_txid.lower()}:{x}" in g for x in active)
 
 
+
+# ---------------------------------------------------------------------------
+# ceremony supervision
+#
+# Incident 2026-11-13: four fundings confirmed in one block, four BitVM2 ceremonies
+# started in one pass (~4.2 GB RSS per coordinator), the unit's 10G memcg OOM-killed
+# one coordinator and request 65bb17492517646e sat in `signed` forever: nothing
+# restarted the coordinator and no state had a timeout. This section adds
+#   (a) a global ceremony limit sized to memory (funded -> ceremony_pubkeys deferred),
+#   (b) coordinator supervision with bounded retries + backoff, then failed,
+#   (c) stage timeouts for every non-terminal state,
+#   (d) alerts (log + Discord health webhook) on death, retry, failure, stall.
+# Safety rule: a request is only auto-failed while its peg-in deposit is NOT on chain
+# or in the mempool (funds still at the depositor-only address). After broadcast the
+# kickoff stays reserved (the graph needs it) and the request is flagged `stalled`
+# with repeating alerts for a human instead.
+
+def _env_int(k, d):
+    try:
+        return int(E(k, str(d)))
+    except ValueError:
+        return d
+
+
+MAX_CEREMONIES = max(1, _env_int("FPL_MAX_CEREMONIES", 2))
+CEREMONY_MEM_MB = _env_int("FPL_CEREMONY_MEM_MB", 4608)     # observed peak ~4.2 GB anon
+MEM_HEADROOM_MB = _env_int("FPL_MEM_HEADROOM_MB", 1024)
+COORD_MAX_RETRIES = _env_int("FPL_COORD_MAX_RETRIES", 3)
+COORD_BACKOFF_SECS = _env_int("FPL_COORD_BACKOFF_SECS", 60)
+COORD_BACKOFF_MAX_SECS = _env_int("FPL_COORD_BACKOFF_MAX_SECS", 900)
+COORD_GRACE_SECS = _env_int("FPL_COORD_GRACE_SECS", 45)
+STALL_REALERT_SECS = _env_int("FPL_STALL_REALERT_SECS", 6 * 3600)
+PROC = E("FPL_PROC", "/proc")
+COORD_BIN, PART_BIN = "fpl_ceremony_coordinator", "fpl_ceremony_participant"
+
+TERMINAL_STATES = ("expired", "failed", "minted")
+CEREMONY_STATES = ("ceremony_pubkeys", "awaiting_signature", "signed")
+PRE_BROADCAST_STATES = ("waiting_operator_liquidity", "funded", "ceremony_pubkeys",
+                        "awaiting_signature", "signed", "presigned")
+POST_BROADCAST_STATES = ("broadcasting", "peg_in_confirmed", "awaiting_mint")
+_H = 3600
+DEFAULT_STAGE_TIMEOUTS = {
+    "awaiting_funding": 3 * 86400,     # existing rule -> expired
+    "waiting_operator_liquidity": 24 * _H,
+    "funded": 12 * _H,                 # queued for a ceremony slot
+    "ceremony_pubkeys": 2 * _H,        # seats announce in seconds
+    "awaiting_signature": 24 * _H,     # depositor's wallet must sign
+    "signed": 3 * _H,                  # ceremony normally 3-5 min
+    "presigned": 24 * _H,              # ledger binding by all active operators
+    "broadcasting": 24 * _H,           # stall alert only (post-broadcast)
+    "peg_in_confirmed": 24 * _H,       # stall alert only
+    "awaiting_mint": 24 * _H,          # stall alert only
+}
+
+
+def stage_timeout(state):
+    return _env_int("FPL_STAGE_TIMEOUT_" + state.upper(), DEFAULT_STAGE_TIMEOUTS.get(state, 0))
+
+
+def state_age(r, now):
+    return now - int(r.get("state_since") or r.get("updated") or r.get("created") or now)
+
+
+# ---- alerts (URL never logged) ----
+_ALERTED = {}
+
+
+def _webhook_url():
+    u = E("FPL_DISCORD_WEBHOOK_URL") or E("DISCORD_HEALTH_WEBHOOK_URL")
+    f = E("FPL_DISCORD_ENV_FILE")
+    if not u and f and os.path.isfile(f):
+        with open(f) as fh:
+            lines = fh.read().splitlines()
+        for line in lines:
+            k, _, v = line.strip().partition("=")
+            if k.strip().removeprefix("export ") in ("FPL_DISCORD_WEBHOOK_URL", "DISCORD_HEALTH_WEBHOOK_URL") and v:
+                u = v.strip().strip('"').strip("'")
+                break
+    return u
+
+
+def _post_discord(text):
+    u = _webhook_url()
+    if not u:
+        return
+    try:
+        q = urllib.request.Request(u, data=json.dumps({"content": text[:1800]}).encode(), method="POST",
+                                   headers={"Content-Type": "application/json", "User-Agent": "fpl-bridge-intake"})
+        urllib.request.urlopen(q, timeout=10).read()
+    except Exception as e:
+        log("alert post failed:", type(e).__name__)  # never the URL
+
+
+def alert(kind, r, msg, min_interval=900):
+    """Log always; post to Discord at most once per (request, kind) per min_interval."""
+    rid = r.get("id", "?") if isinstance(r, dict) else str(r)
+    key = (rid, kind)
+    now = time.time()
+    log("ALERT", kind, rid, msg)
+    if now - _ALERTED.get(key, 0) < min_interval:
+        return
+    _ALERTED[key] = now
+    text = f"[{NET} bridge intake] {kind} req {rid}: {msg}"
+    threading.Thread(target=_post_discord, args=(text,), daemon=True).start()
+
+
+# ---- processes / memory ----
+def _cmdline(pid):
+    try:
+        with open(f"{PROC}/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return []
+    return [c.decode(errors="replace") for c in raw.split(b"\0") if c]
+
+
+def _is_zombie(pid):
+    try:
+        with open(f"{PROC}/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    except (OSError, IndexError):
+        return True
+
+
+def _rss_mb(pid):
+    try:
+        with open(f"{PROC}/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def ceremony_procs(d=None, names=(COORD_BIN, PART_BIN)):
+    """Live (non-zombie) ceremony processes, optionally only those for graph dir d.
+    Returns [(pid, binary, args)]. Found by /proc scan, so processes that outlived an
+    intake restart (KillMode=process) are adopted."""
+    out = []
+    try:
+        pids = [x for x in os.listdir(PROC) if x.isdigit()]
+    except OSError:
+        return out
+    for pid in pids:
+        args = _cmdline(pid)
+        if not args or os.path.basename(args[0]) not in names or "--dir" not in args:
+            continue
+        i = args.index("--dir")
+        pd = args[i + 1] if i + 1 < len(args) else ""
+        if d is not None and os.path.normpath(pd) != os.path.normpath(d):
+            continue
+        if _is_zombie(pid):
+            continue
+        out.append((int(pid), os.path.basename(args[0]), args))
+    return out
+
+
+def live_ceremony_coordinators():
+    """{graph dir: pid} for ceremony coordinators (not --resume broadcast/scenario runs)."""
+    res = {}
+    for pid, name, args in ceremony_procs(None, (COORD_BIN,)):
+        if "--resume" in args:
+            continue
+        res[os.path.normpath(args[args.index("--dir") + 1])] = pid
+    return res
+
+
+def mem_available_mb():
+    """min(host MemAvailable, this unit's cgroup v2 memory.max - memory.current)."""
+    avail = None
+    try:
+        for line in open(E("FPL_MEMINFO", "/proc/meminfo")):
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    try:
+        rel = [l.split("::", 1)[1].strip() for l in open("/proc/self/cgroup") if l.startswith("0::")][0]
+        base = os.path.join(E("FPL_CGROUP_ROOT", "/sys/fs/cgroup"), rel.lstrip("/"))
+        mx = open(os.path.join(base, "memory.max")).read().strip()
+        if mx != "max":
+            cur = int(open(os.path.join(base, "memory.current")).read().strip())
+            cg = (int(mx) - cur) // (1 << 20)
+            avail = cg if avail is None else min(avail, cg)
+    except (OSError, IndexError, ValueError):
+        pass
+    return avail
+
+
+def ceremony_slot_free(exclude_dir=None):
+    """(ok, reason). At most MAX_CEREMONIES live ceremony coordinators, and enough
+    memory for one more: available - (still-ramping coordinators' remaining growth)
+    must cover CEREMONY_MEM_MB + MEM_HEADROOM_MB."""
+    live = {k: v for k, v in live_ceremony_coordinators().items()
+            if exclude_dir is None or k != os.path.normpath(exclude_dir)}
+    if len(live) >= MAX_CEREMONIES:
+        return False, f"{len(live)} ceremonies running (max {MAX_CEREMONIES})"
+    avail = mem_available_mb()
+    if avail is not None:
+        ramp = sum(max(0, CEREMONY_MEM_MB - _rss_mb(pid)) for pid in live.values())
+        need = CEREMONY_MEM_MB + MEM_HEADROOM_MB
+        if avail - ramp < need:
+            return False, f"memory {avail} MB free, {ramp} MB still ramping, need {need} MB"
+    return True, ""
+
+
+def spawn_ceremony_coordinator(r, d, restart=False):
+    lg = open(os.path.join(d, "coordinator.log"), "a")
+    if restart:
+        lg.write(f"\n=== intake: coordinator restart attempt {int(r.get('coord_attempts') or 1)} "
+                 f"at {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC ===\n"); lg.flush()
+        # a killed coordinator may leave a half-written lock-script cache; regenerate it
+        cache = os.path.join(d, "bridge_data", "cache")
+        if os.path.isdir(cache) and os.listdir(cache):
+            os.replace(cache, cache + f".aside-{int(time.time())}")
+    p = subprocess.Popen(coord_base(d) + ["--deposit-outpoint", r["funding"], "--deposit-amount", str(r["funding_sats"]),
+                         "--evm-address", "fpl:" + r["account"], "--kickoff-outpoint", r["kickoff"],
+                         "--kickoff-amount", str(r["kickoff_sats"]), "--timeout-secs", "86400"],
+                         stdout=lg, stderr=lg, start_new_session=True, cwd=d)
+    lg.close()  # the child holds its own descriptor
+    r["coord_pid"] = p.pid
+    r["coord_spawned"] = int(time.time())
+    if not restart:
+        r["coord_attempts"] = 1
+    return p.pid
+
+
+def spawn_broadcast(r, d):
+    lg = open(os.path.join(d, "broadcast.log"), "a")
+    args = coord_base(d) + ["--resume", "--broadcast-peg-in"]
+    if E("FPL_FALCON_CTL"):
+        args += ["--falcon-ctl", E("FPL_FALCON_CTL")] + (["--falcon-rpc", E("FPL_FALCON_RPC")] if E("FPL_FALCON_RPC") else [])
+    p = subprocess.Popen(args, stdout=lg, stderr=lg, start_new_session=True, cwd=d)
+    lg.close()
+    r["bcast_pid"] = p.pid
+    r["bcast_spawned"] = int(time.time())
+    return p.pid
+
+
+def kill_ceremony_procs(d):
+    killed = []
+    for pid, name, _ in ceremony_procs(d):
+        try:
+            os.kill(pid, signal.SIGTERM); killed.append(pid)
+        except OSError:
+            pass
+    return killed
+
+
+def tx_seen(txid):
+    """True if esplora knows txid (mempool or chain), False on 404, None if unknown."""
+    if not txid:
+        return False
+    try:
+        esplora(f"tx/{txid}/status")
+        return True
+    except urllib.error.HTTPError as e:
+        return False if e.code == 404 else None
+    except Exception:
+        return None
+
+
+def broadcast_seen(r):
+    """True/False/None (unknown) for 'is any peg-in tx of this request out there'."""
+    seen = [tx_seen(r.get("deposit_txid")), tx_seen(r.get("peg_in_confirm_txid"))]
+    if any(x is True for x in seen):
+        return True
+    if any(x is None for x in seen):
+        return None
+    return False
+
+
+def fail_request(r, reason, kind, now):
+    """Mark failed (releases kickoff + funding reservation) only if nothing was broadcast
+    AND the ceremony never produced fully signed graphs (final.json). Seats keep copies of
+    final.json, so a presigned peg-in stays broadcastable; releasing its kickoff could let
+    two usable graphs share one kickoff. Such requests are stalled with reservations kept."""
+    if os.path.exists(os.path.join(gdir(r), "final.json")):
+        return mark_stalled(r, f"{reason}; NOT failed: ceremony completed (final.json), presigned graphs "
+                               "remain usable, kickoff stays reserved; manual action needed", now)
+    seen = broadcast_seen(r)
+    if seen is None:
+        r["last_error"] = f"{reason} (fail deferred: esplora unavailable)"
+        return True
+    if seen:
+        return mark_stalled(r, f"{reason}; NOT failed: peg-in tx already broadcast, manual action needed", now)
+    killed = kill_ceremony_procs(gdir(r))
+    r.update(state="failed", last_error=reason, failed_reason=kind, failed_at=int(now))
+    r.pop("stalled", None)
+    alert("failed", r, f"{reason}. Funds stay at the depositor address; kickoff "
+                       f"{(r.get('kickoff') or '-')[:16]} released; killed pids {killed}", min_interval=0)
+    return True
+
+
+def mark_stalled(r, reason, now):
+    last = int(r.get("stall_alerted_at") or 0)
+    r["stalled"] = reason
+    if now - last >= STALL_REALERT_SECS:
+        r["stall_alerted_at"] = int(now)
+        alert("stalled", r, reason, min_interval=0)
+    return True
+
+
+def timeout_action(r, now):
+    """None or (action, reason): action in fail|stall. Pure (no I/O): used by --plan too."""
+    s = r["state"]
+    if s in TERMINAL_STATES or s == "awaiting_funding":   # awaiting_funding: existing 3d -> expired
+        return None
+    lim = stage_timeout(s)
+    age = state_age(r, now)
+    if not lim or age <= lim:
+        return None
+    why = f"stage timeout: {s} for {age // 60} min (limit {lim // 60} min)"
+    return ("fail" if s in PRE_BROADCAST_STATES else "stall", why)
+
+
+def supervise(r, now=None):
+    """Liveness + timeouts for one request (caller holds LOCK and saves on True)."""
+    now = int(now or time.time())
+    s, d = r["state"], gdir(r)
+    ta = timeout_action(r, now)
+    if ta:
+        act, why = ta
+        if act == "fail":
+            return fail_request(r, why, "stage_timeout_" + s, now)
+        return mark_stalled(r, why, now)
+
+    if s in CEREMONY_STATES and not os.path.exists(os.path.join(d, "final.json")):
+        if now - int(r.get("coord_spawned") or 0) < COORD_GRACE_SECS:
+            return False
+        seat = E("FPL_LOCAL_SEAT")
+        if seat and not os.path.exists(os.path.join(d, "attest", seat + ".json")) \
+                and not ceremony_procs(d, (PART_BIN,)):
+            return fail_request(r, f"local ceremony participant ({seat}) is gone; its RAM-only n-of-n key "
+                                   "is lost so this ceremony cannot finish", "participant_died", now)
+        if live_ceremony_coordinators().get(os.path.normpath(d)):
+            if r.pop("coord_dead_since", None) is not None:
+                return True
+            return False
+        if os.path.exists(os.path.join(d, "graphs.json")):
+            return fail_request(r, "ceremony coordinator died after graphs.json was published; the signing "
+                                   "rounds cannot resume (participants hold RAM-only nonces)", "coordinator_died_mid_signing", now)
+        attempts = int(r.get("coord_attempts") or 1)
+        changed = False
+        if not r.get("coord_dead_since"):
+            r["coord_dead_since"] = now
+            alert("coordinator_died", r, f"ceremony coordinator not running in state {s} (no final.json); "
+                                         f"attempt {attempts} of {1 + COORD_MAX_RETRIES}")
+            changed = True
+        if attempts > COORD_MAX_RETRIES:
+            return fail_request(r, f"ceremony coordinator died {attempts} times (max retries {COORD_MAX_RETRIES})",
+                                "coordinator_retries_exhausted", now)
+        backoff = min(COORD_BACKOFF_SECS * (2 ** (attempts - 1)), COORD_BACKOFF_MAX_SECS)
+        if now - int(r["coord_dead_since"]) < backoff:
+            return changed
+        ok, why = ceremony_slot_free(exclude_dir=d)
+        if not ok:
+            note = "coordinator restart waiting for slot: " + why
+            if r.get("last_error") != note:
+                r["last_error"] = note
+                changed = True
+            return changed
+        r["coord_attempts"] = attempts + 1
+        spawn_ceremony_coordinator(r, d, restart=True)
+        r.pop("coord_dead_since", None)
+        r["last_error"] = f"coordinator restarted (attempt {attempts + 1})"
+        alert("coordinator_restarted", r, f"restarted ceremony coordinator, attempt {attempts + 1} "
+                                          f"of {1 + COORD_MAX_RETRIES} (pid {r['coord_pid']})", min_interval=0)
+        return True
+
+    if s == "broadcasting":
+        if [p for p in ceremony_procs(d, (COORD_BIN,)) if "--resume" in p[2]]:
+            return False
+        if now - int(r.get("bcast_spawned") or 0) < COORD_GRACE_SECS:
+            return False
+        if tx_seen(r.get("peg_in_confirm_txid")) is not False:
+            return False   # confirm is out there (or unknown): step() tracks confirmations
+        attempts = int(r.get("bcast_attempts") or 1)
+        if attempts > COORD_MAX_RETRIES:
+            return mark_stalled(r, f"peg-in broadcast process died {attempts} times and the confirm tx is "
+                                   "not on chain; manual action needed", now)
+        backoff = min(COORD_BACKOFF_SECS * (2 ** (attempts - 1)), COORD_BACKOFF_MAX_SECS)
+        if now - int(r.get("bcast_spawned") or 0) < backoff:
+            return False
+        r["bcast_attempts"] = attempts + 1
+        spawn_broadcast(r, d)
+        alert("broadcast_restarted", r, f"peg-in broadcast process gone, confirm tx unseen; respawned "
+                                        f"(attempt {attempts + 1})", min_interval=0)
+        return True
+    return False
+
+
+def plan(reqs, now=None, check_chain=True):
+    """Read-only report of the action supervise() would take on the next pass. Uses the same
+    timeout, final.json, broadcast-safety and coordinator-liveness rules (reads only: files,
+    /proc, esplora GETs). Actions: none | fail | stall | defer (esplora unknown) |
+    coordinator_dead (restart within retries, else fail) | participant_dead (fail)."""
+    now = int(now or time.time())
+    rows = []
+    for r in reqs:
+        if r.get("state") in TERMINAL_STATES:
+            continue
+        s, d = r["state"], gdir(r)
+        act, why = "none", ""
+        ta = timeout_action(r, now)
+        if ta:
+            act, why = ta
+        elif s in CEREMONY_STATES and not os.path.exists(os.path.join(d, "final.json")) \
+                and now - int(r.get("coord_spawned") or 0) >= COORD_GRACE_SECS:
+            seat = E("FPL_LOCAL_SEAT")
+            if seat and not os.path.exists(os.path.join(d, "attest", seat + ".json")) \
+                    and not ceremony_procs(d, (PART_BIN,)):
+                act, why = "participant_dead", "local participant gone"
+            elif not live_ceremony_coordinators().get(os.path.normpath(d)):
+                act, why = "coordinator_dead", f"no live coordinator (attempts {int(r.get('coord_attempts') or 1)})"
+        if act in ("fail", "participant_dead"):
+            if os.path.exists(os.path.join(d, "final.json")):
+                act, why = "stall", why + "; final.json exists (kickoff kept)"
+            elif check_chain:
+                seen = broadcast_seen(r)
+                if seen is None:
+                    act, why = "defer", why + "; esplora unavailable"
+                elif seen:
+                    act, why = "stall", why + "; peg-in tx already broadcast"
+        rows.append({"id": r["id"], "account": r.get("account"), "state": s,
+                     "age_h": round(state_age(r, now) / 3600, 1),
+                     "timeout_h": round(stage_timeout(s) / 3600, 1),
+                     "kickoff": r.get("kickoff"), "kickoff_sats": r.get("kickoff_sats"),
+                     "action": act, "reason": why})
+    return rows
+
+
 def step(r):
     """Advance one request; returns True if changed."""
     s, d = r["state"], gdir(r)
     if s == "awaiting_funding":
-        if time.time() - r["created"] > 3 * 86400:
+        lim = stage_timeout("awaiting_funding")
+        if lim and time.time() - r["created"] > lim:
             r["state"] = "expired"; return True
         used = reserved_fundings(r["id"])
         for u in esplora(f"address/{r['address']}/utxo"):
@@ -230,6 +679,13 @@ def step(r):
                 r.update(state="funded", funding=f"{u['txid']}:{u['vout']}", funding_sats=u["value"]); return True
         return False
     if s in ("funded", "waiting_operator_liquidity"):
+        ok, why = ceremony_slot_free()
+        if not ok:
+            reason = "waiting_ceremony_slot: " + why
+            if r.get("last_error") != reason:
+                r["last_error"] = reason
+                return True
+            return False
         amt = r["funding_sats"] - PEG_IN_FEE
         ko, kv = pick_kickoff(amt + PEG_OUT_FEE)
         if not ko:
@@ -249,10 +705,8 @@ def step(r):
             json.dump({"id": r["id"], "depositor_account": r["account"], "depositor_pubkey": r["depositor_pubkey"],
                        "funding": r["funding"], "amount": r["funding_sats"]}, f)
         evm = "fpl:" + r["account"]
-        lg = open(os.path.join(d, "coordinator.log"), "a")
-        subprocess.Popen(coord_base(d) + ["--deposit-outpoint", r["funding"], "--deposit-amount", str(r["funding_sats"]),
-                          "--evm-address", evm, "--kickoff-outpoint", ko, "--kickoff-amount", str(kv), "--timeout-secs", "86400"],
-                         stdout=lg, stderr=lg, start_new_session=True, cwd=d)
+        r.update(kickoff=ko, kickoff_sats=kv)
+        spawn_ceremony_coordinator(r, d)
         lg2 = open(os.path.join(d, "prepare.log"), "a")
         subprocess.Popen([EX + "/fpl_depositor_ext", "prepare", "--network", NET, "--dir", d, "--depositor-pubkey", r["depositor_pubkey"],
                           "--funding", r["funding"], "--amount", str(r["funding_sats"]), "--evm-address", evm, "--seats", SEATS,
@@ -274,7 +728,8 @@ def step(r):
         args = coord_base(d) + ["--resume", "--broadcast-peg-in"]
         if E("FPL_FALCON_CTL"):
             args += ["--falcon-ctl", E("FPL_FALCON_CTL")] + (["--falcon-rpc", E("FPL_FALCON_RPC")] if E("FPL_FALCON_RPC") else [])
-        subprocess.Popen(args, stdout=lg, stderr=lg, start_new_session=True, cwd=d)
+        p = subprocess.Popen(args, stdout=lg, stderr=lg, start_new_session=True, cwd=d)
+        r.update(bcast_pid=p.pid, bcast_spawned=int(time.time()), bcast_attempts=1)
         r["state"] = "broadcasting"; return True
     if s in ("broadcasting", "peg_in_confirmed"):
         try:
@@ -297,17 +752,36 @@ def step(r):
     return False
 
 
-def worker():
-    while True:
-        for r in all_reqs():
-            if r["state"] in ("expired", "failed", "minted"):
-                continue
+def worker_pass(now=None):
+    """One pass over live requests: supervision (liveness, timeouts) then the normal step.
+    Each request is re-read under LOCK so an HTTP handler's concurrent change is never
+    overwritten by a stale copy."""
+    for rid in [r["id"] for r in all_reqs() if r["state"] not in TERMINAL_STATES]:
+        try:
+            with LOCK:
+                r = load(rid)
+                if r["state"] in TERMINAL_STATES:
+                    continue
+                before = r["state"]
+                changed = supervise(r, now)
+                if r["state"] not in TERMINAL_STATES and step(r):
+                    changed = True
+                if changed:
+                    save(r)
+                    if r["state"] != before:
+                        log("req", r["id"], "->", r["state"])
+        except Exception as e:  # keep serving; record last error
             try:
                 with LOCK:
-                    if step(r):
-                        save(r); log("req", r["id"], "->", r["state"])
-            except Exception as e:  # keep serving; record last error
-                r["last_error"] = str(e)[:300]; save(r)
+                    r = load(rid)
+                    r["last_error"] = str(e)[:300]; save(r)
+            except Exception:
+                pass
+
+
+def worker():
+    while True:
+        worker_pass()
         time.sleep(15)
 
 
@@ -500,6 +974,10 @@ def serve(addr, cls):
 
 
 if __name__ == "__main__":
+    if "--plan" in sys.argv[1:]:
+        for row in plan(all_reqs()):
+            print(json.dumps(row))
+        sys.exit(0)
     OP_ADDR, PEG_IN_FEE, PEG_OUT_FEE = funding_info()
     log("intake", NET, "operator funding", OP_ADDR, "seats", SEATS)
     threading.Thread(target=worker, daemon=True).start()
