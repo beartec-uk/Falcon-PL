@@ -647,6 +647,16 @@ def _peg_in_body(account_name: str, send_sats: int, home: Path, sign_mjs: Path, 
     raise RuntimeError(msg)
 
 def peg_out(account_name: str, amount: int, dest: str, keys_dir: Path, timeout_sec: int) -> dict:
+    # hold a cap slot from before the burn until its claim shows in status
+    pending_key = f"{account_name}:{dest}:{amount}:{time.time_ns()}"
+    _pending_add(pending_key)
+    try:
+        return _peg_out_body(account_name, amount, dest, keys_dir, timeout_sec, pending_key)
+    finally:
+        _pending_discard(pending_key)
+
+def _peg_out_body(account_name: str, amount: int, dest: str, keys_dir: Path, timeout_sec: int,
+                  pending_key: str) -> dict:
     started = gmt()
     t0 = time.time()
     fpl_before, rail_before, _, _ = fpl_status_rail()
@@ -696,6 +706,7 @@ def peg_out(account_name: str, amount: int, dest: str, keys_dir: Path, timeout_s
                 # prefer newest
                 hit = c
         if hit:
+            _pending_discard(pending_key)  # claim visible: counted from status now
             st = hit.get("status")
             if st != last:
                 log(f"peg-out {burn_tx[:16]} claim status={st} payout={(hit.get('pegout_txid_hex') or '')[:16]} attest={hit.get('attest_height')}")
@@ -729,21 +740,62 @@ def new_recycle_addr() -> str:
         raise RuntimeError("expected tb1 payout address")
     return addr
 
-def unfinalized_claims(accounts: set[str]) -> int:
-    raw = ctl("status", timeout=60)
-    b = json.loads(raw[raw.find("{"):]).get("body", {})
+# Claim states (snake_case of fd-pl Bitvm2Status). Rule (Scott, 13 Nov 2026):
+# a claim paid to the user counts as settled, even if the operator's
+# reimbursement is still pending. So only pre-payout states hold a cap slot.
+PRE_PAYOUT_CLAIM_STATES = ("awaiting_pegout", "pegout_posted")
+SETTLED_CLAIM_STATES = (
+    "claim_posted", "paid_optimistic", "paid", "challenged",
+    "disproved", "refunded", "failed",
+)
+
+def claim_in_flight(status) -> bool:
+    """True if a BTC4 claim has not yet been paid to the user.
+
+    Settled (paid to user, or terminal) -> False. Known pre-payout states and
+    any unknown/new state -> True (fail safe: count it against the cap).
+    """
+    st = str(status or "").strip().lower()
+    if st in SETTLED_CLAIM_STATES:
+        return False
+    return True
+
+# peg-out burns submitted by this process whose claim is not yet visible in
+# status (closes the burn->claim window so a fast leg can't overshoot the cap)
+_pending_burns: set[str] = set()
+_pending_lock = threading.Lock()
+
+def _pending_add(key: str) -> None:
+    with _pending_lock:
+        _pending_burns.add(key)
+
+def _pending_discard(key: str) -> None:
+    with _pending_lock:
+        _pending_burns.discard(key)
+
+def pending_burns() -> int:
+    with _pending_lock:
+        return len(_pending_burns)
+
+def count_in_flight_claims(body: dict, accounts: set[str]) -> int:
     n = 0
-    for r in b.get("rails") or []:
-        if r.get("asset") != "BTC4":
+    for r in body.get("rails") or []:
+        if not isinstance(r, dict) or r.get("asset") != "BTC4":
             continue
         for c in r.get("bitvm2_claims") or []:
             if not isinstance(c, dict):
                 continue
             if c.get("from") not in accounts:
                 continue
-            if c.get("status") in ("awaiting_pegout", "claim_posted"):
+            if claim_in_flight(c.get("status")):
                 n += 1
     return n
+
+def unfinalized_claims(accounts: set[str]) -> int:
+    """Peg-outs not yet paid to the user (in-flight), for MAX_UNFINALIZED_CLAIMS."""
+    raw = ctl("status", timeout=60)
+    b = json.loads(raw[raw.find("{"):]).get("body", {})
+    return count_in_flight_claims(b, accounts) + pending_burns()
 
 # ---------------------------------------------------------------------------
 # watchdogs used by run()
@@ -950,7 +1002,7 @@ def cmd_run(home: Path) -> int:
                 log(f"unfinalized query failed: {e}")
                 unfin = max_unfin
             if unfin >= max_unfin:
-                log(f"cap: {unfin} unfinalised claims (max {max_unfin}); skip leg")
+                log(f"cap: {unfin} in-flight peg-out claims (pre-payout; max {max_unfin}); skip leg")
                 continue
             if spend_today(home) + send > max_day:
                 log("cap: daily tBTC spend reached; skip remaining legs")
