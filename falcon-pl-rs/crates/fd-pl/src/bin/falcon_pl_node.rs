@@ -218,8 +218,11 @@ fn line_must_send(bytes: &[u8]) -> bool {
         || head.starts_with(b"{\"type\":\"piece\"")
 }
 
+/// Session writer: plain lines until the peer negotiated `zstd-stream-v1`.
+type ZWire = fd_pl::wire_zstd::ZWriter<tokio::net::tcp::OwnedWriteHalf>;
+
 async fn write_or_shed(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut ZWire,
     probe: std::os::unix::io::RawFd,
     bytes: &[u8],
 ) -> Result<(), WriteEnd> {
@@ -259,11 +262,26 @@ async fn write_or_shed(
     if bytes.len() > LARGE_LINE && unsent > PIPE_PAUSE_BYTES && !must_send {
         return Err(WriteEnd::Dropped { unsent });
     }
+    // zstd-stream-v1: encode only once the line will be written. Encoding
+    // advances the stream, so from here a compressed line is sent or the
+    // session ends (never silently dropped).
+    let framed = match writer.encode(bytes) {
+        Ok(f) => f,
+        Err(_) => {
+            return Err(WriteEnd::Shed {
+                unsent,
+                unread: tcp_unread(probe).unwrap_or(0),
+                which: "zstd",
+            })
+        }
+    };
+    let compressed = writer.compressed();
+    let out: &[u8] = &framed;
     let mut deadline = tokio::time::Instant::now() + PIPE_SHED_HOLD;
     let mut off = 0usize;
     let mut progressed = 0usize;
     loop {
-        if off == bytes.len() {
+        if off == out.len() {
             return Ok(());
         }
         if off > progressed {
@@ -284,7 +302,7 @@ async fn write_or_shed(
             // The kernel took none of this line, so the next pong is still framed.
             // A block body must not be discarded: redial and send it on the new socket.
             if off == 0 && !catchup_body {
-                if must_send {
+                if must_send || compressed {
                     return Err(WriteEnd::Shed {
                         unsent,
                         unread,
@@ -300,7 +318,7 @@ async fn write_or_shed(
                 which: "torn",
             });
         }
-        match tokio::time::timeout(left, writer.write(&bytes[off..])).await {
+        match tokio::time::timeout(left, writer.inner.write(&out[off..])).await {
             Ok(Ok(0)) => {
                 return Err(WriteEnd::Shed {
                     unsent: tcp_unsent(probe).unwrap_or(0),
@@ -322,7 +340,7 @@ async fn write_or_shed(
 }
 
 async fn emit_or_shed(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut ZWire,
     probe: std::os::unix::io::RawFd,
     bytes: &[u8],
     who: &str,
@@ -4106,7 +4124,11 @@ async fn peer_session(
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let probe = unsafe { libc::dup(stream.as_raw_fd()) };
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let zstd_on = fd_pl::wire_zstd::enabled();
+    let peer_zstd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peer_zstd_r = peer_zstd.clone();
+    let mut writer = ZWire::new(writer, peer_zstd.clone(), fd_pl::wire_zstd::level());
 
     // hello (includes tip so peer can start pull catch-up immediately).
     // **Validators only** in publics — never dump load-wallet keyring (was ~1.9MB
@@ -4146,7 +4168,10 @@ async fn peer_session(
                 .map(|m| m.tip)
                 .unwrap_or(0),
             release_version: PRODUCT_VERSION.to_string(),
-            capabilities: fd_pl::utc_header::local_hello_capabilities(),
+            capabilities: fd_pl::wire_zstd::with_capability(
+                fd_pl::utc_header::local_hello_capabilities(),
+                zstd_on,
+            ),
         };
         serde_json::to_string(&hello)? + "\n"
     };
@@ -4170,7 +4195,7 @@ async fn peer_session(
         Arc::new(parking_lot::Mutex::new(None));
     let hello_rejected_r = hello_rejected.clone();
     let mut read_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
+        let mut lines = fd_pl::wire_zstd::LineReader::new(reader, zstd_on);
         let mut gate = HelloSession::default();
         let mut asm = fd_pl::pieces::PieceAssembler::default();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -4201,6 +4226,11 @@ async fn peer_session(
                             *hello_rejected_r.lock() = Some(reason);
                             return;
                         }
+                    }
+                }
+                if let WireMsg::Hello { capabilities, .. } = &msg {
+                    if zstd_on && fd_pl::wire_zstd::peer_has(capabilities) {
+                        peer_zstd_r.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 *shared_r.wire_from.lock() = peer_id.lock().clone();
@@ -4562,8 +4592,11 @@ async fn handle_inbound(
         key: remote.clone(),
     };
     let probe = unsafe { libc::dup(stream.as_raw_fd()) };
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let (reader, writer) = stream.into_split();
+    let zstd_on = fd_pl::wire_zstd::enabled();
+    let peer_zstd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writer = ZWire::new(writer, peer_zstd.clone(), fd_pl::wire_zstd::level());
+    let mut lines = fd_pl::wire_zstd::LineReader::new(reader, zstd_on);
 
     // Register sink so mesh fanout (Pong/ProposeLedger/Skip) reaches joiners
     // that dialed us but are not on our --peers list.
@@ -4616,7 +4649,10 @@ async fn handle_inbound(
                 .map(|m| m.tip)
                 .unwrap_or(0),
             release_version: PRODUCT_VERSION.to_string(),
-            capabilities: fd_pl::utc_header::local_hello_capabilities(),
+            capabilities: fd_pl::wire_zstd::with_capability(
+                fd_pl::utc_header::local_hello_capabilities(),
+                zstd_on,
+            ),
         };
         serde_json::to_string(&hello)? + "\n"
     };
@@ -4795,6 +4831,11 @@ async fn handle_inbound(
                     writer_task.abort();
                     return Err(HelloRejected(reason).into());
                 }
+            }
+        }
+        if let WireMsg::Hello { capabilities, .. } = &msg {
+            if zstd_on && fd_pl::wire_zstd::peer_has(capabilities) {
+                peer_zstd.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if !inbound_registered {
@@ -7409,6 +7450,78 @@ mod inbound_ack_tests {
         assert_eq!(should_log_reply_dropped(11_000, &last, &sup), Some(4));
         assert_eq!(should_log_reply_dropped(11_001, &last, &sup), None);
         assert_eq!(should_log_reply_dropped(21_000, &last, &sup), Some(1));
+    }
+
+    #[tokio::test]
+    async fn inbound_session_zstd_stream_new_and_old_peers() {
+        // Only this node's env flag; old-style clients in other tests are
+        // unaffected either way (no capability in their Hello).
+        std::env::set_var("FPL_WIRE_ZSTD", "1");
+        let shared = test_shared("v99");
+        let fanout = Arc::new(Vec::new());
+        let hello = |caps: Vec<String>| WireMsg::Hello {
+            id: "v9".into(),
+            public_key: String::new(),
+            validators: BTreeMap::new(),
+            publics: BTreeMap::new(),
+            tip_height: 0,
+            tip_hash: String::new(),
+            is_hub: false,
+            mempool_len: 0,
+            product_version: PRODUCT_VERSION.into(),
+            hello_network_id: 1,
+            archive: false,
+            snap_height: 0,
+            release_version: String::new(),
+            capabilities: caps,
+        };
+        let status_req = serde_json::to_string(&WireMsg::StatusReq { include_accounts: false, brief: true }).unwrap() + "\n";
+
+        // (a) New peer: both sides advertise, both directions switch to frames.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut rd = fd_pl::wire_zstd::LineReader::new(cr, true);
+        let peer_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut wr = fd_pl::wire_zstd::ZWriter::new(cw, peer_ok.clone(), 3);
+        let srv_hello: WireMsg = serde_json::from_str(&rd.next_line().await.unwrap().unwrap()).unwrap();
+        let WireMsg::Hello { capabilities, .. } = srv_hello else { panic!("hello") };
+        assert!(fd_pl::wire_zstd::peer_has(&capabilities), "server advertises when enabled");
+        let my_hello = serde_json::to_string(&hello(vec![fd_pl::wire_zstd::CAP_ZSTD_STREAM_V1.into()])).unwrap() + "\n";
+        wr.write_all(my_hello.as_bytes()).await.unwrap();
+        peer_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+        wr.write_all(status_req.as_bytes()).await.unwrap();
+        assert!(wr.compressed());
+        let reply: WireMsg = serde_json::from_str(&rd.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(reply, WireMsg::Status { .. }), "got {reply:?}");
+        assert!(rd.compressed(), "server reply came as zstd frames");
+        drop(wr);
+        let _ = srv.await;
+
+        // (b) Old peer: no capability. Server output stays plain JSON lines.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, mut cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut lines = BufReader::new(cr).lines();
+        let _srv_hello = lines.next_line().await.unwrap().unwrap();
+        cw.write_all((serde_json::to_string(&hello(Vec::new())).unwrap() + "\n").as_bytes()).await.unwrap();
+        cw.write_all(status_req.as_bytes()).await.unwrap();
+        let line = lines.next_line().await.unwrap().unwrap();
+        assert!(!line.starts_with('#'), "old peer must never see the marker");
+        let reply: WireMsg = serde_json::from_str(&line).unwrap();
+        assert!(matches!(reply, WireMsg::Status { .. }), "got {reply:?}");
+        drop(cw);
+        let _ = srv.await;
     }
 
     #[tokio::test]

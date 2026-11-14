@@ -323,6 +323,9 @@
 
 pub mod accounts;
 pub mod pieces;
+pub mod wire_zstd;
+#[cfg(test)]
+mod wire_zstd_tests;
 pub mod bitvm;
 pub mod bitvm2_exit;
 pub mod bitvm2_instance;
