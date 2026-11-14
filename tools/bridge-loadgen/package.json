@@ -1,0 +1,11 @@
+{
+  "name": "fpl-browser-depositor-sim",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@scure/btc-signer": "^1",
+    "@scure/base": "^1",
+    "@noble/curves": "^1"
+  },
+  "license": "UNLICENSED"
+}
