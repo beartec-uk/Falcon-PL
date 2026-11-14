@@ -119,14 +119,18 @@ def discord_alert(text: str) -> None:
     body = json.dumps({"content": text[:1800]}).encode()
     req = urllib.request.Request(
         url, data=body, method="POST",
-        headers={"Content-Type": "application/json"},
+        # Discord's edge rejects the default Python-urllib User-Agent with
+        # HTTP 403 (error 1010), so every alert was silently dropped.
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "falcon-pl-bridge-loadgen/1.0"},
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             r.read()
         log("alert posted to Discord (webhook present, URL not logged)")
     except Exception as e:
-        log(f"alert post failed: {type(e).__name__}")
+        code = getattr(e, "code", "")
+        log(f"alert post failed: {type(e).__name__} {code}".rstrip())
 
 # ---------------------------------------------------------------------------
 # host tools
