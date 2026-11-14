@@ -1,0 +1,11 @@
+[package]
+name = "falcon-agg-methods"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-All-Rights-Reserved"
+
+[build-dependencies]
+risc0-build = "3.0"
+
+[package.metadata.risc0]
+methods = ["guest"]

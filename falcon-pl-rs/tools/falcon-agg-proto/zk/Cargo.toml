@@ -1,0 +1,10 @@
+# Prototype: prove N Falcon-512 verifies inside the RISC Zero zkVM (hash-based STARK).
+# Needs the RISC Zero toolchain (rzup). Own workspace; not part of any node build.
+[workspace]
+resolver = "2"
+members = ["host", "methods"]
+
+[profile.release]
+opt-level = 3
+debug = 0
+lto = "thin"
