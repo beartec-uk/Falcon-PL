@@ -51,6 +51,99 @@ pub enum CryptoErr {
     Sign(String),
 }
 
+/// v2.11.4 lean body: prefix of a signature carried as canonical, padded,
+/// standard-alphabet base64 instead of hex (~33% fewer bytes per Falcon sig).
+/// Hex never contains ':', so the two forms cannot be confused.
+pub const LEAN_SIG_PREFIX: &str = "b64:";
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with `=` padding.
+pub fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Strict decoder: padded, standard alphabet, and **canonical** (re-encoding
+/// gives the same text, so one signature has exactly one lean spelling).
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() % 4 != 0 {
+        return None;
+    }
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    let last = b.len() / 4 - 1;
+    for (i, q) in b.chunks(4).enumerate() {
+        let pad = q.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && i != last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for &c in &q[..4 - pad] {
+            n = (n << 6) | val(c)?;
+        }
+        n <<= 6 * pad as u32;
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    if b64_encode(&out) != s {
+        return None;
+    }
+    Some(out)
+}
+
+/// True if `sig` uses the lean (`b64:`) spelling.
+pub fn is_lean_sig(sig: &str) -> bool {
+    sig.starts_with(LEAN_SIG_PREFIX)
+}
+
+/// Signature bytes from either spelling: legacy hex or lean `b64:`.
+pub fn sig_bytes(sig: &str) -> Option<Vec<u8>> {
+    match sig.strip_prefix(LEAN_SIG_PREFIX) {
+        Some(b) => b64_decode(b),
+        None => hex::decode(sig).ok(),
+    }
+}
+
+/// Canonical lowercase hex of a signature in either spelling. Hashes and
+/// roots are always taken over this form, so the wire spelling never
+/// changes consensus values.
+pub fn sig_to_hex(sig: &str) -> Option<String> {
+    if !is_lean_sig(sig) {
+        return Some(sig.to_ascii_lowercase()).filter(|_| hex::decode(sig).is_ok());
+    }
+    sig_bytes(sig).map(hex::encode)
+}
+
+/// Lean (`b64:`) spelling of a signature in either spelling.
+pub fn sig_to_lean(sig: &str) -> Option<String> {
+    sig_bytes(sig).map(|b| format!("{LEAN_SIG_PREFIX}{}", b64_encode(&b)))
+}
+
 /// SHA-256 hex. v2.9.59: computed with `ring` (runtime-detected SHA-NI /
 /// AVX2 / SSSE3 code; same digest as `sha2`, ~1.8x faster on CPUs without
 /// SHA-NI such as the Skylake seats).

@@ -1549,6 +1549,21 @@ impl TxBody {
 }
 
 impl Tx {
+    /// Signature as hex for verification. v2.11.4 lean bodies carry tx sigs
+    /// as `b64:`; the block-level rule ([`Ledger::check_lean_encoding`])
+    /// decides whether that spelling is allowed at the ledger's height.
+    /// Verifiers only ever see hex, so votes/certs/PoP stay hex-only.
+    pub fn sig_hex(&self) -> std::borrow::Cow<'_, str> {
+        if crate::crypto::is_lean_sig(&self.signature) {
+            match crate::crypto::sig_to_hex(&self.signature) {
+                Some(h) => std::borrow::Cow::Owned(h),
+                None => std::borrow::Cow::Borrowed(""),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(&self.signature)
+        }
+    }
+
     pub fn payload(
         account: &str,
         sequence: u64,
@@ -1661,7 +1676,7 @@ impl Tx {
             &self.account,
             &self.public_key,
             &payload,
-            &self.signature,
+            &self.sig_hex(),
         )
     }
 
@@ -2478,6 +2493,20 @@ impl Ledger {
         keys: &KeyRing,
         known: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), String> {
+        let lean = crate::params_v2::lean_body_active(self.network_id, self.height);
+        self.attach_merkle_batch_known_ex(keys, known, lean)
+    }
+
+    /// As [`Self::attach_merkle_batch_known`] with the lean-body rule given
+    /// explicitly. `lean` writes tx sigs as `b64:` and omits `batch_paths`;
+    /// otherwise every tx sig is written as hex (a `b64:` sig from the pool
+    /// is converted back) and paths are attached as before.
+    pub fn attach_merkle_batch_known_ex(
+        &mut self,
+        keys: &KeyRing,
+        known: &dyn Fn(&str) -> Option<String>,
+        lean: bool,
+    ) -> Result<(), String> {
         if self.txs.is_empty() {
             return Ok(());
         }
@@ -2499,12 +2528,26 @@ impl Ledger {
         for tx in &self.txs {
             tx.verify(keys)?;
         }
-        let sig_leaves: Vec<String> = self.txs.iter().map(|t| t.signature.clone()).collect();
+        // Sig root is always over canonical hex, so the wire spelling never
+        // changes `batch_root` (and so never changes the signed batch msg).
+        let sig_leaves: Vec<String> = self.txs.iter().map(|t| t.sig_hex().into_owned()).collect();
         let (root, paths) = merkle_paths(&payloads);
         let (sig_root, _) = merkle_paths(&sig_leaves);
         // payload root, then the root of the sender signatures the packer checked.
         self.batch_root = format!("{}|{}", hex::encode(root), hex::encode(sig_root));
-        self.batch_paths = paths;
+        if lean {
+            self.batch_paths = Vec::new();
+            for tx in &mut self.txs {
+                if let Some(l) = crate::crypto::sig_to_lean(&tx.signature) {
+                    tx.signature = l;
+                }
+            }
+        } else {
+            self.batch_paths = paths;
+            for (tx, hex_sig) in self.txs.iter_mut().zip(sig_leaves) {
+                tx.signature = hex_sig;
+            }
+        }
         for tx in &mut self.txs {
             if !tx.body.reads_signer_key()
                 && known(&tx.account).as_deref() == Some(tx.public_key.as_str())
@@ -2542,6 +2585,30 @@ impl Ledger {
         self.verify_merkle_batch_reg(keys, known, onchain_first, None)
     }
 
+    /// v2.11.4 lean-body encoding rule. Below the activation height a body
+    /// must be legacy: no `b64:` tx signature. From it, tx sigs may be `b64:`
+    /// (canonical base64 only) or hex, and `batch_paths` may be omitted.
+    /// Applies to every body, batch or not, live or catch-up.
+    pub fn check_lean_encoding(&self, lean: bool) -> Result<(), String> {
+        for tx in &self.txs {
+            if crate::crypto::is_lean_sig(&tx.signature) {
+                if !lean {
+                    return Err(format!(
+                        "lean tx signature before activation at h={}",
+                        self.height
+                    ));
+                }
+                if crate::crypto::sig_bytes(&tx.signature).is_none() {
+                    return Err("non-canonical lean tx signature".into());
+                }
+            }
+        }
+        if !lean && !self.batch_sig.is_empty() && self.batch_paths.len() != self.txs.len() {
+            return Err("batch path count".into());
+        }
+        Ok(())
+    }
+
     /// As `verify_merkle_batch_onchain`; `packer_key = Some(k)` (from `H_act`)
     /// verifies the packer batch_sig ONLY against the on-chain registered key
     /// `k` (must equal `packer_public_key`), never the node-local ring.
@@ -2552,10 +2619,26 @@ impl Ledger {
         onchain_first: bool,
         packer_key: Option<&str>,
     ) -> Result<(), String> {
+        let lean = crate::params_v2::lean_body_active(self.network_id, self.height);
+        self.verify_merkle_batch_reg_ex(keys, known, onchain_first, packer_key, lean)
+    }
+
+    /// As [`Self::verify_merkle_batch_reg`] with the lean-body rule given.
+    pub fn verify_merkle_batch_reg_ex(
+        &self,
+        keys: &KeyRing,
+        known: &dyn Fn(&str) -> Option<String>,
+        onchain_first: bool,
+        packer_key: Option<&str>,
+        lean: bool,
+    ) -> Result<(), String> {
         if self.batch_sig.is_empty() {
             return Ok(());
         }
-        if self.batch_paths.len() != self.txs.len() {
+        self.check_lean_encoding(lean)?;
+        // Lean bodies omit the paths: rebuild the root from the txs instead.
+        let rebuild_root = lean && self.batch_paths.is_empty();
+        if !rebuild_root && self.batch_paths.len() != self.txs.len() {
             return Err("batch path count".into());
         }
         let payloads: Vec<String> = self
@@ -2573,14 +2656,23 @@ impl Ledger {
                 )
             })
             .collect();
+        let payload_root = self.batch_root.split('|').next().unwrap_or("");
         for (i, payload) in payloads.iter().enumerate() {
             if sha256_hex(payload.as_bytes()) != self.txs[i].tx_id {
                 return Err("batch tx_id mismatch".into());
             }
+            if rebuild_root {
+                continue;
+            }
             let got = merkle_fold(payload.as_bytes(), &self.batch_paths[i], i);
-            let payload_root = self.batch_root.split('|').next().unwrap_or("");
             if hex::encode(got) != payload_root {
                 return Err("batch path mismatch".into());
+            }
+        }
+        if rebuild_root {
+            let (root, _) = merkle_paths(&payloads);
+            if hex::encode(root) != payload_root {
+                return Err("batch root mismatch".into());
             }
         }
         // Pool entry is not enough. From the sender-sig height every seat
@@ -2605,11 +2697,11 @@ impl Ledger {
             };
             if onchain_first {
                 if let Some(pk) = known(&tx.account) {
-                    keys.verify_account_sig(&tx.account, &tx.public_key, Some(&pk), &payloads[i], &tx.signature)?;
+                    keys.verify_account_sig(&tx.account, &tx.public_key, Some(&pk), &payloads[i], &tx.sig_hex())?;
                     continue;
                 }
             }
-            keys.verify_carried_key(&tx.account, &public_key, &payloads[i], &tx.signature)?;
+            keys.verify_carried_key(&tx.account, &public_key, &payloads[i], &tx.sig_hex())?;
         }
         let msg = format!("pl-batch:v1|{}", self.batch_root);
         if let Some(rk) = packer_key {
@@ -2856,7 +2948,14 @@ pub struct Mempool {
 impl Mempool {
     /// Insert tx. Returns `Ok(true)` if new, `Ok(false)` if already present (same tx_id).
     /// When `max_txs > 0` and the pool is full, rejects **new** txs (dupes still ok).
-    pub fn insert(&mut self, tx: Tx, max_txs: usize) -> Result<bool, String> {
+    pub fn insert(&mut self, mut tx: Tx, max_txs: usize) -> Result<bool, String> {
+        // v2.11.4: the pool (and tx gossip) always holds hex sigs; only a
+        // sealed lean body carries `b64:`. Same bytes, so tx_id is unchanged.
+        if crate::crypto::is_lean_sig(&tx.signature) {
+            if let Some(h) = crate::crypto::sig_to_hex(&tx.signature) {
+                tx.signature = h;
+            }
+        }
         if self.by_id.contains_key(&tx.tx_id) {
             return Ok(false);
         }
@@ -6897,7 +6996,7 @@ impl Node {
                     tx.network_id,
                     &tx.body,
                 );
-                if !KeyRing::verify_with_public(&pk, &payload, &tx.signature) {
+                if !KeyRing::verify_with_public(&pk, &payload, &tx.sig_hex()) {
                     return Err("bad tx crypto: bad signature".into());
                 }
                 self.keys
@@ -11845,7 +11944,7 @@ impl Node {
             return Err("bad tx crypto: tx_id mismatch".into());
         }
         self.keys
-            .verify_account_sig(&tx.account, &tx.public_key, Some(&pk), &payload, &tx.signature)
+            .verify_account_sig(&tx.account, &tx.public_key, Some(&pk), &payload, &tx.sig_hex())
     }
 
     /// On-chain keys for pack pre-verify (empty before the Fix B height).
@@ -12564,7 +12663,7 @@ impl Node {
             );
             return sha256_hex(payload.as_bytes()) == tx.tx_id
                 && keys
-                    .verify_account_sig(&tx.account, &tx.public_key, Some(pk), &payload, &tx.signature)
+                    .verify_account_sig(&tx.account, &tx.public_key, Some(pk), &payload, &tx.sig_hex())
                     .is_ok();
         }
         if keys.has_public(&tx.account) {
@@ -12582,7 +12681,7 @@ impl Node {
             tx.network_id,
             &tx.body,
         );
-        keys.verify_carried_key(&tx.account, &tx.public_key, &payload, &tx.signature)
+        keys.verify_carried_key(&tx.account, &tx.public_key, &payload, &tx.sig_hex())
             .is_ok()
     }
 
@@ -14081,6 +14180,15 @@ impl Node {
         self.now_ms = ledger.sealed_at_ms;
         let mut fee_total = 0u64;
         let mut err = None;
+        // v2.11.4: body spelling rule (legacy below the lean height).
+        if let Err(e) = ledger.check_lean_encoding(crate::params_v2::lean_body_active(
+            self.cfg.network_id,
+            ledger.height,
+        )) {
+            ckpt.restore(self);
+            self.now_ms = saved;
+            return Err(e);
+        }
         if !ledger.batch_sig.is_empty() {
             let packer_rk = self.packer_registry_key(ledger);
             let known_keys: Vec<(String, String)> = ledger
@@ -14408,6 +14516,11 @@ impl Node {
         self.orderbook_ledger_hook(&mut draft_state, &mut draft_defi, ledger.height);
         let mut fee_total = 0u64;
         let mut apply_err = None;
+        // v2.11.4: body spelling rule (legacy below the lean height).
+        ledger.check_lean_encoding(crate::params_v2::lean_body_active(
+            self.cfg.network_id,
+            ledger.height,
+        ))?;
         // Merkle-batch bodies: packer batch_sig + (from H=520000) per-sender
         // Falcon sigs are checked here. Non-batch bodies verify in try_protocol_tx.
         if !ledger.batch_sig.is_empty() {
@@ -16235,6 +16348,8 @@ fn default_need_txs_batch() -> u64 {
 #[cfg(test)]
 mod pack_catchup_tests;
 mod merkle_batch_tests;
+#[cfg(test)]
+mod lean_body_tests;
 
 #[cfg(test)]
 mod leak_2963_tests;
