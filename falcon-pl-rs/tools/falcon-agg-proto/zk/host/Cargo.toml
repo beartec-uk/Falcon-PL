@@ -1,0 +1,13 @@
+[package]
+name = "falcon-agg-zk"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-All-Rights-Reserved"
+
+[dependencies]
+falcon-agg-methods = { path = "../methods" }
+risc0-zkvm = { version = "3.0", features = ["client"] }
+pqcrypto-falcon = "0.3"
+pqcrypto-traits = "0.3"
+serde_json = "1"
+bincode = "1"

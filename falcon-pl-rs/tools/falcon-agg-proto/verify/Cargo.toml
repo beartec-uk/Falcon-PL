@@ -1,0 +1,13 @@
+[package]
+name = "falcon512-verify"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-All-Rights-Reserved"
+description = "Prototype: pure-Rust, no_std Falcon-512 (PQClean round-3 detached format) verifier, usable inside a zkVM guest."
+
+[dependencies]
+sha3 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+pqcrypto-falcon = "0.3"
+pqcrypto-traits = "0.3"

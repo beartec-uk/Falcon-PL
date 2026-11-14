@@ -1,0 +1,9 @@
+# Prototype only: Falcon-512 signature aggregation / batch experiments.
+# Own workspace so it never touches the node build. Not used by falcon-pl-node.
+[workspace]
+resolver = "2"
+members = ["verify", "bench"]
+exclude = ["zk"]
+
+[profile.release]
+opt-level = 3

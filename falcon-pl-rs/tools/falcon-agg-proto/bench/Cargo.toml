@@ -1,0 +1,12 @@
+[package]
+name = "falcon-agg-bench"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-All-Rights-Reserved"
+description = "Prototype benches: Falcon-512 verify cost, node verify-path overhead, batch/parallel scaling."
+
+[dependencies]
+falcon512-verify = { path = "../verify" }
+pqcrypto-falcon = "0.3"
+pqcrypto-traits = "0.3"
+hex = "0.4"

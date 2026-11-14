@@ -1,0 +1,15 @@
+[package]
+name = "falcon_agg_guest"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-All-Rights-Reserved"
+
+[workspace]
+
+[dependencies]
+risc0-zkvm = { version = "3.0", default-features = false, features = ["std"] }
+falcon512-verify = { path = "../../../verify" }
+
+[profile.release]
+opt-level = 3
+lto = true
