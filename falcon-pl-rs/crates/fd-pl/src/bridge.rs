@@ -182,6 +182,12 @@ pub fn genesis_lock_id(rail: &str) -> String {
 /// Error prefix: the fixed-depth BitVM2 claim tree has no free leaf.
 pub const BITVM2_CLAIM_TREE_FULL: &str = "bitvm2 claim tree full";
 
+/// Claim-tree-full apply error: ours, or the pre-fix leaf builder message
+/// (txs queued by older seats).
+pub fn is_bitvm2_claim_tree_full(err: &str) -> bool {
+    err.contains(BITVM2_CLAIM_TREE_FULL) || err.contains("too many leaves for MERKLE_DEPTH")
+}
+
 pub fn btc_withdraw_note_id(from: &str, amount: u64, external_to: &str) -> String {
     sha256_hex(format!("wd:BTC:{from}:{amount}:{external_to}").as_bytes())
 }
@@ -1495,6 +1501,52 @@ impl RailState {
     }
 
     /// Open a BitVM2 withdraw (no Kickoff). Operator fronts BTC + posts Claim.
+    /// Fix B: drop claim-tree leaves whose claim is settled, keep every leaf a
+    /// live claim may still need. Live = `AwaitingPegout`/`PegoutPosted` (the
+    /// operator still has to prove inclusion) and `ClaimPosted`/`Challenged`
+    /// (inside the challenge window). Settled = `PaidOptimistic` (window over),
+    /// `Refunded`, `Disproved`, and leaves with no claim. Order of the kept
+    /// leaves is unchanged. Returns how many were removed; the root is rebuilt
+    /// only when something changed. Conservative: if any live claim's leaf
+    /// cannot be derived, nothing is pruned.
+    pub fn prune_settled_bitvm2_leaves(&mut self) -> Result<usize, String> {
+        use crate::bitvm2_exit::Bitvm2Status as S;
+        let mut live: BTreeMap<String, usize> = BTreeMap::new();
+        for c in self.bitvm2_claims.values() {
+            if !matches!(c.status, S::AwaitingPegout | S::PegoutPosted | S::ClaimPosted | S::Challenged) {
+                continue;
+            }
+            let leaf = if !c.mimc_leaf_hex.is_empty() {
+                c.mimc_leaf_hex.to_ascii_lowercase()
+            } else {
+                match bitvm::dest_h160_from_address(&c.dest) {
+                    Ok(h) => crate::bitvm2_exit::mimc_leaf_hex(&c.note_id, &h, c.amount),
+                    Err(_) => return Ok(0),
+                }
+            };
+            *live.entry(leaf).or_insert(0) += 1;
+        }
+        let before = self.bitvm2_claim_leaves.len();
+        let kept: Vec<String> = self
+            .bitvm2_claim_leaves
+            .iter()
+            .filter(|l| match live.get_mut(&l.to_ascii_lowercase()) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    true
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        let removed = before - kept.len();
+        if removed > 0 {
+            self.bitvm2_claim_root = crate::bitvm2_exit::mimc_root_from_leaves(&kept)?;
+            self.bitvm2_claim_leaves = kept;
+        }
+        Ok(removed)
+    }
+
     /// `Err(BITVM2_CLAIM_TREE_FULL ..)` when no new BitVM2 claim leaf fits.
     pub fn bitvm2_claim_tree_check(&self) -> Result<(), String> {
         let cap = fd_pl_bitvm2::leaf::claim_tree_capacity();
@@ -1776,6 +1828,19 @@ impl RailState {
     /// bytes are ignored, so a garbage submission can no longer disprove an
     /// honest claim.
     pub fn disprove_bitvm2_v2(&mut self, note_id: &str, vk_bytes: &[u8]) -> Result<bool, String> {
+        self.disprove_bitvm2_v2_ex(note_id, vk_bytes, false)
+    }
+
+    /// [`Self::disprove_bitvm2_v2`]. `stored_root` (fix B, from the leaf-prune
+    /// height) checks the stored proof against the claim root it was attested
+    /// under instead of the live tree, so pruning settled leaves (or appending
+    /// new ones) cannot make an honest in-window claim look disproved.
+    pub fn disprove_bitvm2_v2_ex(
+        &mut self,
+        note_id: &str,
+        vk_bytes: &[u8],
+        stored_root: bool,
+    ) -> Result<bool, String> {
         if vk_bytes.is_empty() {
             return Err("bitvm2 v2: no ceremony verifying key in this release".into());
         }
@@ -1800,19 +1865,35 @@ impl RailState {
         let dest_h160 = bitvm::dest_h160_from_address(&c.dest)?;
         let pegout = crate::bitvm2_exit::pegout_txid_bytes(&c.pegout_txid_hex)?;
         let header = crate::bitvm2_exit::checkpoint_header_hash(c.checkpoint_height, &ckpt_hash);
-        match crate::bitvm2_exit::verify_withdraw_attest_vk_bytes(
-            vk_bytes,
-            note_id,
-            &dest_h160,
-            c.amount,
-            c.checkpoint_height,
-            &header,
-            &pegout,
-            &self.bitvm2_claim_leaves,
-            &c.proof_hex,
-            &c.public_hex,
-            &c.statement_digest_hex,
-        ) {
+        let verdict = if stored_root {
+            crate::bitvm2_exit::verify_stored_withdraw_attest_vk_bytes(
+                vk_bytes,
+                note_id,
+                &dest_h160,
+                c.amount,
+                c.checkpoint_height,
+                &header,
+                &pegout,
+                &c.proof_hex,
+                &c.public_hex,
+                &c.statement_digest_hex,
+            )
+        } else {
+            crate::bitvm2_exit::verify_withdraw_attest_vk_bytes(
+                vk_bytes,
+                note_id,
+                &dest_h160,
+                c.amount,
+                c.checkpoint_height,
+                &header,
+                &pegout,
+                &self.bitvm2_claim_leaves,
+                &c.proof_hex,
+                &c.public_hex,
+                &c.statement_digest_hex,
+            )
+        };
+        match verdict {
             Ok(()) => Ok(false),
             Err(_) => {
                 if let Some(cl) = self.bitvm2_claims.get_mut(note_id) {
@@ -3506,6 +3587,86 @@ mod tests {
             f.rail.bitvm2_claims.get(&f.note).unwrap().status,
             crate::bitvm2_exit::Bitvm2Status::Disproved
         );
+    }
+
+    /// Fix B: an honest in-window (`ClaimPosted`) claim stays undisprovable
+    /// after the live tree changes (later burns append, settled leaves are
+    /// pruned), while a tampered stored attestation is still disproved.
+    #[test]
+    fn fixb_disprove_in_window_claim_after_append_and_prune() {
+        use crate::bitvm2_exit::Bitvm2Status as S;
+        let (pk, vk, vkb) = m1_keys();
+        let mut f = m1_fixture(&pk, &vk);
+        // A settled claim opened before ours, so its leaf sits in the tree.
+        let mut r0 = RailState::new(RAIL_BTC);
+        r0.open_bitvm2_withdraw("settled-1", "bob", &f.dest, 7_000, 90).unwrap();
+        let settled_leaf = r0.bitvm2_claim_leaves[0].clone();
+        f.rail.attest_bitvm2_claim_v2(&f.attest, "op", &vkb, 200).unwrap();
+        assert_eq!(f.rail.bitvm2_claims[&f.note].status, S::ClaimPosted);
+        // Later burns append leaves: the live root moves on.
+        f.rail.open_bitvm2_withdraw("later-1", "carol", &f.dest, 5_000, 210).unwrap();
+        f.rail.open_bitvm2_withdraw("later-2", "carol", &f.dest, 6_000, 211).unwrap();
+        // Legacy Disprove (live tree) now wrongly calls the honest claim invalid.
+        let mut legacy = f.rail.clone();
+        assert!(legacy.disprove_bitvm2_v2_ex(&f.note, &vkb, false).unwrap());
+        // Fix B Disprove (attest-time root) holds.
+        let mut fixed = f.rail.clone();
+        assert!(!fixed.disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+        assert_eq!(fixed.bitvm2_claims[&f.note].status, S::ClaimPosted);
+        // Prune: add a refunded claim's leaf in front, then prune it.
+        let mut p = f.rail.clone();
+        p.bitvm2_claim_leaves.insert(0, settled_leaf.clone());
+        let mut sc = r0.bitvm2_claims["settled-1"].clone();
+        sc.status = S::Refunded;
+        p.bitvm2_claims.insert("settled-1".into(), sc);
+        assert_eq!(p.prune_settled_bitvm2_leaves().unwrap(), 1);
+        assert!(!p.bitvm2_claim_leaves.contains(&settled_leaf));
+        assert!(p.bitvm2_claim_leaves.contains(&p.bitvm2_claims[&f.note].mimc_leaf_hex));
+        assert!(!p.clone().disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+        // Tampering is still caught in stored-root mode.
+        let mut t = p.clone();
+        t.bitvm2_claims.get_mut(&f.note).unwrap().statement_digest_hex = "00".repeat(32);
+        assert!(t.disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+        assert_eq!(t.bitvm2_claims[&f.note].status, S::Disproved);
+        let mut t2 = p.clone();
+        t2.bitvm2_claims.get_mut(&f.note).unwrap().amount = 19_999;
+        assert!(t2.disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+        let mut t3 = p.clone();
+        t3.bitvm2_claims.get_mut(&f.note).unwrap().public_hex[4] = format!("{:064x}", 1);
+        assert!(t3.disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+    }
+
+    #[test]
+    fn fixb_prune_keeps_live_statuses_and_is_a_noop_when_nothing_settles() {
+        use crate::bitvm2_exit::Bitvm2Status as S;
+        let mut r = RailState::new(RAIL_BTC4);
+        let pk = crate::btc_tx::compressed_pubkey_from_secret(&[9u8; 32]).unwrap();
+        let dest = crate::vault::p2wpkh_testnet_address(&pk).unwrap();
+        let st = [S::AwaitingPegout, S::PegoutPosted, S::ClaimPosted, S::Challenged, S::PaidOptimistic, S::Refunded, S::Disproved];
+        for (i, s_) in st.iter().enumerate() {
+            let note = format!("n{i}");
+            r.open_bitvm2_withdraw(&note, "a", &dest, 1_000 + i as u64, 1).unwrap();
+            r.bitvm2_claims.get_mut(&note).unwrap().status = s_.clone();
+        }
+        // An orphan leaf with no claim is settled too.
+        r.bitvm2_claim_leaves.push("11".repeat(32));
+        let root0 = r.bitvm2_claim_root.clone();
+        assert_eq!(r.prune_settled_bitvm2_leaves().unwrap(), 4);
+        assert_eq!(r.bitvm2_claim_leaves.len(), 4);
+        assert_ne!(r.bitvm2_claim_root, root0);
+        for i in 0..4 {
+            assert_eq!(r.bitvm2_claim_leaves[i], r.bitvm2_claims[&format!("n{i}")].mimc_leaf_hex, "order kept");
+        }
+        let root1 = r.bitvm2_claim_root.clone();
+        assert_eq!(r.prune_settled_bitvm2_leaves().unwrap(), 0);
+        assert_eq!(r.bitvm2_claim_root, root1);
+        // Everything settled: empty tree, empty root (same as a fresh rail).
+        for c in r.bitvm2_claims.values_mut() {
+            c.status = S::PaidOptimistic;
+        }
+        assert_eq!(r.prune_settled_bitvm2_leaves().unwrap(), 4);
+        assert!(r.bitvm2_claim_leaves.is_empty());
+        assert_eq!(r.bitvm2_claim_root, "");
     }
 
     #[test]
