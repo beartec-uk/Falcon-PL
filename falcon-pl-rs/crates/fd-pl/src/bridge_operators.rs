@@ -347,7 +347,7 @@ impl Node {
         if amount == 0 {
             return Err("btc4 withdraw: zero amount".into());
         }
-        self.bridge.rail(crate::bridge::RAIL_BTC4)?;
+        self.bridge.rail(crate::bridge::RAIL_BTC4)?.bitvm2_claim_tree_check()?;
         self.defi.debit_asset(from, crate::bridge::RAIL_BTC4, amount)?;
         let tip = self.tip_height;
         let r = self.bridge.rail_mut(crate::bridge::RAIL_BTC4)?;

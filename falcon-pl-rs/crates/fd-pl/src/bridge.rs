@@ -179,6 +179,9 @@ pub fn genesis_lock_id(rail: &str) -> String {
 }
 
 /// BTC dest-lock note id — dest, not FPL height, so Kickoff can be pre-signed.
+/// Error prefix: the fixed-depth BitVM2 claim tree has no free leaf.
+pub const BITVM2_CLAIM_TREE_FULL: &str = "bitvm2 claim tree full";
+
 pub fn btc_withdraw_note_id(from: &str, amount: u64, external_to: &str) -> String {
     sha256_hex(format!("wd:BTC:{from}:{amount}:{external_to}").as_bytes())
 }
@@ -1492,6 +1495,19 @@ impl RailState {
     }
 
     /// Open a BitVM2 withdraw (no Kickoff). Operator fronts BTC + posts Claim.
+    /// `Err(BITVM2_CLAIM_TREE_FULL ..)` when no new BitVM2 claim leaf fits.
+    pub fn bitvm2_claim_tree_check(&self) -> Result<(), String> {
+        let cap = fd_pl_bitvm2::leaf::claim_tree_capacity();
+        if self.bitvm2_claim_leaves.len() >= cap {
+            return Err(format!(
+                "{BITVM2_CLAIM_TREE_FULL} ({}/{cap}) on {}: peg-outs need a capacity release",
+                self.bitvm2_claim_leaves.len(),
+                self.asset
+            ));
+        }
+        Ok(())
+    }
+
     pub fn open_bitvm2_withdraw(
         &mut self,
         note_id: &str,
@@ -1503,6 +1519,11 @@ impl RailState {
         if self.bitvm2_claims.contains_key(note_id) {
             return Err("bitvm2 claim exists".into());
         }
+        // Refuse before touching the tree. The leaf list is append-only and the
+        // circuit depth is fixed, so once it is full every later withdraw failed
+        // with the transient-looking "too many leaves" and sat unpacked at the
+        // account head forever (BTC4, 14 Nov 2026: 16/16 leaves).
+        self.bitvm2_claim_tree_check()?;
         let dest_h160 = bitvm::dest_h160_from_address(dest)?;
         crate::bitvm2_exit::append_mimc_leaf(
             &mut self.bitvm2_claim_leaves,

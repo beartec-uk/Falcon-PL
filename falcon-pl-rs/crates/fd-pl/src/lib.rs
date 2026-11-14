@@ -7843,6 +7843,15 @@ impl Node {
         if let Err(e) = self.verify_account_tx(&tx) {
             return Err(e);
         }
+        // Tell the submitter now (ctl exits non-zero) instead of accepting a
+        // BTC4 burn that can never pack. Admission policy only, not validity.
+        if let TxBody::RailWithdraw { asset, .. } = &tx.body {
+            if asset == crate::bridge::RAIL_BTC4 {
+                if let Ok(r) = self.bridge.rail(asset) {
+                    r.bitvm2_claim_tree_check()?;
+                }
+            }
+        }
         if matches!(tx.body, TxBody::WatcherCredit { .. }) {
             return Err("watcher-credit disabled; use WatcherHeartbeat or rail work".into());
         }
@@ -12674,6 +12683,10 @@ impl Node {
             // 2.10.4 draft: a disallowed AssetPay (e.g. BTC4 before activation) can never
             // apply; without this it sits at the account head forever and stale gossip
             // evicts valid same-seq resubmits (scott.reynolds.123 seq 51, 3 Nov 2026).
+            // Full BitVM2 claim tree: cannot apply until a capacity release, so
+            // drop it instead of leaving it unpacked at the head (14 Nov 2026).
+            || err.contains(crate::bridge::BITVM2_CLAIM_TREE_FULL)
+            || err.contains("too many leaves for MERKLE_DEPTH")
             || err.contains("asset pay: only")
             || err.contains("asset pay: bad destination")
             || err.contains("asset pay: zero amount")
@@ -24348,3 +24361,6 @@ mod btc4_fork_fix_tests;
 mod btc4_lend_scale_tests;
 #[cfg(test)]
 mod orderbook_tests;
+
+#[cfg(test)]
+mod bitvm2_tree_full_tests;
