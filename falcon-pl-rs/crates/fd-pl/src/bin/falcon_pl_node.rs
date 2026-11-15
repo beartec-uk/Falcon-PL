@@ -2641,6 +2641,14 @@ async fn main() -> Result<()> {
                 info!("vote journal: restored {merged} open-height round vote(s)");
             }
         }
+        // 2.11.4: a same-height restart re-enters the round this seat had
+        // already voted in (snapshot / journal), instead of round 0.
+        if let Some(r) = node.restore_open_round_from_own_votes() {
+            info!(
+                "restart realign: re-entered round {r} at open height {} from own signed vote",
+                node.tip_height.saturating_add(1)
+            );
+        }
         info!(
             "consensus: vote_rounds_from_height={} (source={}, network_default={}) pause=[{}, {}) (source={}) (active_now={}) liveness_alert_secs={}",
             vr,
@@ -5352,7 +5360,7 @@ fn process_msg(
             // without waiting for Pong fanout (which may never reach inbound dialers).
             // Do not mix NeedLedgers with a snapshot pull (fills the archive catchq).
             // snap_pull is peeked before this arm (lock order: snap_pull → node).
-            let need_from = if hello_pulling || n.wants_snapshot() {
+            let need_from = if hello_pulling || n.snapshot_blocks_residual() {
                 None
             } else if tip_height > 0 {
                 n.note_peer_tip(tip_height, &tip_hash)
@@ -5400,7 +5408,7 @@ fn process_msg(
             n.pong_with_role(&id, tip_height, mempool_len, is_hub, archive, snap_height);
             // Pull catch-up: if peer is ahead (or hard-resync), request missing heights.
             // P2: pass tip_hash for best_peer tracking; residual unless operator hard-reset.
-            let need_from = if pulling || n.wants_snapshot() {
+            let need_from = if pulling || n.snapshot_blocks_residual() {
                 None
             } else {
                 n.note_peer_tip(tip_height, &tip_hash)
@@ -5536,6 +5544,10 @@ fn process_msg(
             if n_batch == 0 {
                 return None;
             }
+            // 2.11.4: small lag may run NeedLedgers next to a snapshot offer;
+            // never chain another pull onto an active snapshot download
+            // (lock order: snap_pull → node).
+            let pulling = shared.snap_pull.lock().is_some();
             let mut n = shared.node.lock();
             let before = n.tip_height;
             match n.apply_catchup_batch(&ledgers) {
@@ -5557,7 +5569,7 @@ fn process_msg(
                     // Residual only. from=1 is operator-only (never auto-rewind).
                     // note_catchup_batch already cleared inflight; take_catchup_pull
                     // issues the next NeedLedgers (one hub, not a 3-way fan).
-                    if n.still_lagging() && advanced {
+                    if n.still_lagging() && advanced && !pulling {
                         if let Some(from) = n.take_catchup_pull() {
                             drop(n);
                             fan(WireMsg::NeedLedgers {
@@ -5814,6 +5826,15 @@ fn process_msg(
             let mut n = shared.node.lock();
             let keys = n.keys.clone();
             match Node::load_snapshot(&dest, keys) {
+                Ok(loaded) if !n.peer_snapshot_adoptable(loaded.tip_height) => {
+                    // 2.11.4: residual catch-up (or live commits) moved past
+                    // this pin while it downloaded. Adopting it would rewind
+                    // committed state.
+                    info!(
+                        "snapshot pull discarded: snap tip {} not ahead of local tip {}",
+                        loaded.tip_height, n.tip_height
+                    );
+                }
                 Ok(loaded) => {
                     let old = n.tip_height;
                     n.adopt_peer_snapshot(loaded);
