@@ -85,7 +85,7 @@ class Base(unittest.TestCase):
         I._ALERTED.clear()
         P = mock.patch.object
         self.patches = [
-            P(I, "alert", lambda kind, r, msg, min_interval=900: self.alerts.append((kind, r.get("id"), msg))),
+            P(I, "alert", lambda kind, r, msg, min_interval=900, short=None: self.alerts.append((kind, r.get("id"), msg))),
             P(I, "tx_seen", lambda txid: self.seen.get(txid, False) if txid else False),
             P(I, "mem_available_mb", lambda: self.mem),
             P(I, "spawn_ceremony_coordinator", self.fake_spawn_coord),
