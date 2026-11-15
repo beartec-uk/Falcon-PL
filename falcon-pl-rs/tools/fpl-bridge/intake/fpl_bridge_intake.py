@@ -807,7 +807,14 @@ def plan(reqs, now=None, check_chain=True):
                     and not ceremony_procs(d, (PART_BIN,)):
                 act, why = "participant_dead", "local participant gone"
             elif not live_ceremony_coordinators().get(os.path.normpath(d)):
-                act, why = "coordinator_dead", f"no live coordinator (attempts {int(r.get('coord_attempts') or 1)})"
+                attempts = int(r.get("coord_attempts") or 1)
+                # same order as supervise(): graphs.json published or retries used up -> fail
+                if os.path.exists(os.path.join(d, "graphs.json")):
+                    act, why = "fail", "coordinator died after graphs.json (cannot resume)"
+                elif attempts > COORD_MAX_RETRIES:
+                    act, why = "fail", f"coordinator died {attempts} times (max retries {COORD_MAX_RETRIES})"
+                else:
+                    act, why = "coordinator_dead", f"no live coordinator (attempts {attempts})"
         if act in ("fail", "participant_dead"):
             if os.path.exists(os.path.join(d, "final.json")):
                 act, why = "stall", why + "; final.json exists (kickoff kept)"

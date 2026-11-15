@@ -423,6 +423,22 @@ class ReviewFixes(Base):
         self.assertEqual(acts, {a["id"]: "stall", b["id"]: "defer", c["id"]: "coordinator_dead"})
 
 
+    def test_plan_reports_fail_like_supervise_for_dead_coordinator(self):
+        # review of 172fc65: --plan said coordinator_dead (restart) where supervise() fails
+        I = self.I
+        g = self.req("e100000000000007", "signed", coord_spawned=1)
+        self.participant(g)
+        open(os.path.join(I.gdir(g), "graphs.json"), "w").close()
+        x = self.req("e100000000000008", "signed", coord_spawned=1, coord_attempts=I.COORD_MAX_RETRIES + 1)
+        self.participant(x)
+        self.seen[g["deposit_txid"]] = False
+        self.seen[x["deposit_txid"]] = False
+        acts = {row["id"]: row["action"] for row in I.plan(I.all_reqs())}
+        self.assertEqual(acts, {g["id"]: "fail", x["id"]: "fail"})
+        I.worker_pass()
+        self.assertEqual(self.load(g["id"])["failed_reason"], "coordinator_died_mid_signing")
+        self.assertEqual(self.load(x["id"])["failed_reason"], "coordinator_retries_exhausted")
+
 class TxSeenEndpoint(unittest.TestCase):
     def test_uses_tx_endpoint_not_status(self):
         tmp = tempfile.mkdtemp()
