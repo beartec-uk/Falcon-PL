@@ -1,7 +1,16 @@
-# Falcon PL 2.11.4 — stall prevention (12 Nov 2026, h=869559)
+# Falcon PL 2.11.4: stall prevention + BTC4 claim-tree capacity
 
-No consensus-rule, wire, state-root or activation change. Seats on 2.11.3 and
-2.11.4 interoperate; this is a node + installer fix release.
+Combined release (PR #39 + PR #46, 15 Nov 2026).
+
+* **Stall prevention (PR #39, 12 Nov 2026, h=869559):** no consensus-rule,
+  wire, state-root or activation change.
+* **BTC4 claim tree full (PR #46, 14 Nov 2026):** Fix A (refuse a burn into a
+  full tree, before debit and at submit) is not a consensus change. Fix B
+  (prune settled leaves; Disprove against the attest-time root) is a
+  consensus change **gated by `TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT`**,
+  which ships as `u64::MAX` (never) until Scott picks a height. Until then
+  state is byte-identical to 2.11.3, so 2.11.3 and 2.11.4 seats interoperate.
+  Setting the height later needs every seat on a release that has it.
 
 ## Incident (15:13–15:36 GMT, ~22 min at h=869559)
 
@@ -32,6 +41,21 @@ C (DualProposal follow-through) is covered by B in the incident shape: the
 stalled seat's certified canonical body arrives by residual catch-up and
 commits (`dual_proposal_stalled_seat_commits_canonical_via_catchup`). No
 live-path change was made.
+
+## BTC4 BitVM2 claim tree capacity (PR #46)
+
+The BTC4 claim tree is fixed at 16 leaves (MERKLE_DEPTH=4). When it filled
+(14 Nov 2026, 13:56 GMT, h 886583), later burns were "accepted" but never
+packed. Details, tests and the snapshot replay are in PR #46.
+
+| | Where | Change |
+|---|---|---|
+| A | `bridge.rs` `bitvm2_claim_tree_check`, `bridge_operators.rs` `btc4_withdraw`, `lib.rs` submit | A burn into a full tree fails with `bitvm2 claim tree full (n/16) on BTC4`, before any debit and at submit. Tree-full is a permanent packer failure only while no prune height is scheduled; once it is scheduled, queued burns wait for a free leaf. |
+| B | `bridge.rs` `prune_settled_bitvm2_leaves`, `disprove_bitvm2_v2_ex`; `bridge_operators.rs` `bridge_finalize_rail`; `fd-pl-bitvm2` `verify_stored_withdraw_attest_vk_bytes` | From the prune height (also needs M1): settled claims' leaves (PaidOptimistic/Refunded/Disproved) are pruned every ledger; in-window claims keep their leaf until the 21,600-ledger window closes. Disprove checks the stored proof against its attest-time root, so honest claims stay valid after appends/prunes. |
+
+Activation: `TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT = u64::MAX`
+(placeholder). It must be ≥ the M1 height (692,000) and far enough out for all
+seats to upgrade first.
 
 ## Not in this release (recommended design)
 
