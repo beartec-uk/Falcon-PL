@@ -446,6 +446,20 @@ pub fn btc4_lend_scale_from_height(network_id: u32) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Testnet 2300 height from which settled BitVM2 claim-tree leaves are pruned
+/// (fix B, 14 Nov 2026 claim tree full). **Placeholder: never (u64::MAX)** until
+/// Scott picks the height; must be >= the M1 height and agreed by all seats.
+pub const TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT: u64 = u64::MAX;
+
+/// BitVM2 claim-tree leaf pruning activation (consensus). 2300: the constant
+/// above. Other networks: `FPL_BITVM2_LEAF_PRUNE_FROM_HEIGHT`, else never.
+pub fn bitvm2_leaf_prune_from_height(network_id: u32) -> u64 {
+    if network_id == NETWORK_ID_PUBLIC_TESTNET_2300 {
+        return TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT;
+    }
+    env_u64("FPL_BITVM2_LEAF_PRUNE_FROM_HEIGHT").unwrap_or(u64::MAX)
+}
+
 /// Order book activation = the 2.10.4 height (non-2300: env, else never).
 pub fn orderbook_from_height(network_id: u32) -> u64 {
     v2_10_4_from_height(network_id)

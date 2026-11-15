@@ -3694,6 +3694,8 @@ pub struct Node {
     pub btc4_fork_slot_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::btc4_lend_scale_from_height`]; runtime only.
     pub btc4_lend_scale_from_height: u64,
+    /// Fix B (TBD): [`crate::params_v2::bitvm2_leaf_prune_from_height`]; runtime only.
+    pub bitvm2_leaf_prune_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::orderbook_from_height`] (= the single
     /// 2.10.4 height); runtime only.
     pub orderbook_from_height: u64,
@@ -3831,6 +3833,7 @@ impl Node {
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
         let btc4_lend_scale_from_height = crate::params_v2::btc4_lend_scale_from_height(cfg.network_id);
+        let bitvm2_leaf_prune_from_height = crate::params_v2::bitvm2_leaf_prune_from_height(cfg.network_id);
         let orderbook_from_height = crate::params_v2::orderbook_from_height(cfg.network_id);
         let hello_min_release_from_height = crate::params_v2::hello_min_release_from_height(cfg.network_id);
         let network_id_for_utc_hello = cfg.network_id;
@@ -3971,6 +3974,7 @@ impl Node {
             btc4_fork_fix_from_height,
             btc4_fork_slot_from_height,
             btc4_lend_scale_from_height,
+            bitvm2_leaf_prune_from_height,
             orderbook_from_height,
             hello_min_release_from_height,
             utc_hello_enforce_from_height: utc_header::network_utc_hello_enforce_from_height(network_id_for_utc_hello),
@@ -4097,6 +4101,29 @@ impl Node {
     /// M1 BitVM2 rules for a ledger at `height`.
     pub fn bitvm2_m1_at(&self, height: u64) -> bool {
         height >= self.bitvm2_m1_from_height
+    }
+
+    /// Fix B: settled claim-tree leaves are pruned, and Disprove checks the
+    /// stored attestation against its attest-time root, for the ledger applied
+    /// at `height`. Needs M1 (Disprove v2) too. Consensus: activation height.
+    pub fn bitvm2_leaf_prune_at(&self, height: u64) -> bool {
+        height >= self.bitvm2_leaf_prune_from_height && self.bitvm2_m1_at(height)
+    }
+
+    /// A pruning height is configured (not the `never` placeholder), so a full
+    /// claim tree is temporary: queued burns are kept and apply once a leaf frees.
+    pub fn bitvm2_leaf_prune_scheduled(&self) -> bool {
+        self.bitvm2_leaf_prune_from_height != u64::MAX
+    }
+
+    /// [`Self::is_permanent_tx_failure`] plus the claim-tree-full case, which is
+    /// permanent only while no pruning height is scheduled (local policy, not
+    /// block validity).
+    fn is_permanent_tx_failure_here(&self, err: &str) -> bool {
+        if crate::bridge::is_bitvm2_claim_tree_full(err) {
+            return !self.bitvm2_leaf_prune_scheduled();
+        }
+        Self::is_permanent_tx_failure(err)
     }
 
     /// v2.9.62: consensus-safety rules for txs/ledgers applied at `height`.
@@ -7436,10 +7463,11 @@ impl Node {
         if self.bitvm2_m1_at(self.tip_height.saturating_add(1)) {
             let vk = self.bitvm2_vk.clone();
             let rail = self.bitvm2_rail_for_note(note_id);
+            let stored_root = self.bitvm2_leaf_prune_at(self.tip_height.saturating_add(1));
             return self
                 .bridge
                 .rail_mut(rail)?
-                .disprove_bitvm2_v2(note_id, &vk);
+                .disprove_bitvm2_v2_ex(note_id, &vk, stored_root);
         }
         self.bridge.rail_mut(crate::bridge::RAIL_BTC)?.disprove_bitvm2(
             note_id,
@@ -7843,6 +7871,15 @@ impl Node {
         if let Err(e) = self.verify_account_tx(&tx) {
             return Err(e);
         }
+        // Tell the submitter now (ctl exits non-zero) instead of accepting a
+        // BTC4 burn that can never pack. Admission policy only, not validity.
+        if let TxBody::RailWithdraw { asset, .. } = &tx.body {
+            if asset == crate::bridge::RAIL_BTC4 {
+                if let Ok(r) = self.bridge.rail(asset) {
+                    r.bitvm2_claim_tree_check()?;
+                }
+            }
+        }
         if matches!(tx.body, TxBody::WatcherCredit { .. }) {
             return Err("watcher-credit disabled; use WatcherHeartbeat or rail work".into());
         }
@@ -7897,7 +7934,7 @@ impl Node {
                         merkle_root: merkle_root.clone(),
                         raw: raw.clone(),
                     }, strict, fork_fix, slot_fix) {
-                        if Self::is_permanent_tx_failure(&e) {
+                        if self.is_permanent_tx_failure_here(&e) {
                             return Err(e);
                         }
                     }
@@ -7942,7 +7979,7 @@ impl Node {
         // cannot be dry-run against committed state.
         if replacing && tx.sequence == need {
             if let Err(e) = self.dry_run_head(&tx) {
-                if Self::is_permanent_tx_failure(&e) {
+                if self.is_permanent_tx_failure_here(&e) {
                     let tip = self.tip_hash.clone();
                     self.perm_dropped.insert(&tx.tx_id, self.now_ms, &tip);
                     return Err(format!("refused same-seq replacement: {e}"));
@@ -10642,7 +10679,7 @@ impl Node {
                 &tx,
             );
             match r {
-                Err(e) if Self::is_permanent_tx_failure(&e) => {
+                Err(e) if self.is_permanent_tx_failure_here(&e) => {
                     eprintln!(
                         "falcon-pl sanitize drop {} seq {} {}: {e}",
                         tx.tx_id, tx.sequence, tx.account
@@ -13021,7 +13058,7 @@ impl Node {
                         list.remove(0);
                         progressed = true;
                     }
-                    Err(e) if Self::is_permanent_tx_failure(&e) => {
+                    Err(e) if self.is_permanent_tx_failure_here(&e) => {
                         // Drop poison txs so they cannot stall every packer forever.
                         eprintln!(
                             "falcon-pl pack drop {} seq {} {}: {e}",
@@ -24499,3 +24536,6 @@ mod btc4_fork_fix_tests;
 mod btc4_lend_scale_tests;
 #[cfg(test)]
 mod orderbook_tests;
+
+#[cfg(test)]
+mod bitvm2_tree_capacity_tests;

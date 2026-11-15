@@ -208,6 +208,72 @@ pub fn verify_withdraw_attest_vk_bytes(
     )
 }
 
+/// Public-input positions of the claim-tree root (hi, lo) in
+/// [`FplWithdrawValid::public_values`].
+pub const PUBLIC_CLAIM_ROOT_IDX: [usize; 2] = [4, 5];
+
+/// Re-verify a **stored** attestation (fix B Disprove): the Groth16 proof, the
+/// statement digest and every public input except the claim-tree root, which
+/// is taken from the stored public inputs. That root was checked against the
+/// consensus claim tree when the attestation was accepted, so this is the same
+/// statement the attest verified, and it stays valid after later appends or
+/// prunes change the live tree.
+pub fn verify_stored_withdraw_attest_vk_bytes(
+    vk_bytes: &[u8],
+    note_id: &str,
+    dest_h160: &[u8; 20],
+    amount: u64,
+    height: u64,
+    header_hash: &[u8; 32],
+    pegout_txid: &[u8; 32],
+    proof_hex: &str,
+    public_hex: &[String],
+    statement_digest_hex: &str,
+) -> Result<(), String> {
+    let vk = vk_from_bytes(vk_bytes)?;
+    let proof_bytes = hex::decode(proof_hex.trim()).map_err(|e| e.to_string())?;
+    let proof = crate::groth16::proof_from_bytes(&proof_bytes)?;
+    let public = crate::groth16::public_from_be_hex(public_hex)?;
+    if !verify(&vk, &public, &proof)? {
+        return Err("groth16 verify failed".into());
+    }
+    let public_be: Vec<Vec<u8>> = public
+        .iter()
+        .map(|f| crate::groth16::fr_to_be32(*f).to_vec())
+        .collect();
+    let digest = statement_digest(&proof_bytes, &public_be);
+    if hex::encode(digest) != statement_digest_hex.to_ascii_lowercase() {
+        return Err("statement digest mismatch".into());
+    }
+    let depth = crate::abi::MERKLE_DEPTH;
+    let circuit = FplWithdrawValid::from_withdraw(
+        2300,
+        amount,
+        dest_h160,
+        Fr::from(0u64),
+        height,
+        header_hash,
+        note_id,
+        pegout_txid,
+        &vec![Fr::from(0u64); depth],
+        &vec![false; depth],
+        test_vk_hash(),
+    )?;
+    let want = circuit.public_values();
+    if public.len() != want.len() {
+        return Err("public inputs do not match withdraw".into());
+    }
+    for (i, (a, b)) in public.iter().zip(want.iter()).enumerate() {
+        if PUBLIC_CLAIM_ROOT_IDX.contains(&i) {
+            continue;
+        }
+        if a != b {
+            return Err("public inputs do not match withdraw".into());
+        }
+    }
+    Ok(())
+}
+
 pub fn verify_withdraw_attest_with_vk(
     vk: &VerifyingKey<Bn254>,
     note_id: &str,
