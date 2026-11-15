@@ -85,6 +85,8 @@ class PegOutPendingSlot(unittest.TestCase):
             if args[0] == "submit-rail-withdraw":
                 seen.append(("submit", L.pending_burns()))
                 return "tx=" + "cd" * 32
+            if args[0] == "account":  # burn landing check (item 6)
+                return json.dumps({"body": {"sequence": 1, "assets": {"BTC4": 100}}})
             body = next(polls)
             seen.append(("poll", L.pending_burns()))
             return json.dumps({"body": body})
@@ -104,6 +106,20 @@ class PegOutPendingSlot(unittest.TestCase):
              mock.patch.object(L, "fpl_status_rail", return_value=(1, 2, "", None)):
             with self.assertRaises(RuntimeError):
                 L.peg_out("loadtest01", 100, "tb1qx", Path("/nonexistent"), 600)
+        self.assertEqual(L.pending_burns(), 0)
+
+    def test_tree_full_refusal_releases_slot_and_is_clean(self):
+        def fake_ctl(*args, timeout=60):
+            if args[0] == "submit-rail-withdraw":
+                raise RuntimeError("ctl failed: Error: bitvm2 claim tree full (16/16) on BTC4")
+            return json.dumps({"body": {"sequence": 4, "assets": {"BTC4": 100}}})
+        with mock.patch.object(L, "ctl", side_effect=fake_ctl), \
+             mock.patch.object(L, "fpl_status_rail", return_value=(1, 2, "", None)), \
+             mock.patch.object(L, "append_leg") as rec:
+            with self.assertRaises(L.BurnRefused) as cm:
+                L.peg_out("loadtest01", 100, "tb1qx", Path("/nonexistent"), 600)
+        self.assertEqual(cm.exception.reason, "tree_full")
+        rec.assert_not_called()  # no burn_submitted row: nothing entered the mempool
         self.assertEqual(L.pending_burns(), 0)
 
 

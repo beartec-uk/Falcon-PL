@@ -650,6 +650,133 @@ def _peg_in_body(account_name: str, send_sats: int, home: Path, sign_mjs: Path, 
     discord_alert(f"BTC4 loadtest {msg} ({account_name})")
     raise RuntimeError(msg)
 
+REFUSAL_TEXT = {
+    "tree_full": "BTC4 claim tree full",
+    "deferred": "node behind (deferred-until-catchup) after retries",
+}
+
+
+class BurnRefused(Exception):
+    """The node refused a peg-out burn at submit: no tx entered the mempool and
+    no funds moved (e.g. BTC4 claim tree full, or still deferred after retries)."""
+
+    def __init__(self, reason: str, msg: str):
+        super().__init__(msg)
+        self.reason = reason
+
+
+# Node refusals that mean "nothing happened": the burn never entered the
+# mempool. `claim tree full` is fd-pl 2.11.4 (PR #46) BITVM2_CLAIM_TREE_FULL;
+# older nodes report the raw `too many leaves for MERKLE_DEPTH`.
+CLAIM_TREE_FULL_MARKERS = ("bitvm2 claim tree full", "too many leaves for merkle_depth")
+DEFERRED_MARKER = "deferred-until-catchup"
+
+
+def classify_submit(text: str) -> str:
+    """'tree_full' | 'deferred' | '' for a submit response / error text."""
+    t = (text or "").lower()
+    if any(m in t for m in CLAIM_TREE_FULL_MARKERS):
+        return "tree_full"
+    if DEFERRED_MARKER in t:
+        return "deferred"
+    return ""
+
+
+def one_line(text: str, limit: int = 600) -> str:
+    """Single-line, bounded copy of a node response for logs/records. Submit
+    responses carry public tx data only (no keys); still bounded."""
+    t = " ".join((text or "").split())
+    return t if len(t) <= limit else t[:limit] + "…"
+
+
+def submit_burn(account_name: str, amount: int, dest: str, keys_dir: Path,
+                *, sleep=time.sleep) -> tuple[str, str]:
+    """Submit one BTC4 burn. Logs the node's response for every attempt.
+    Retries `deferred-until-catchup` (node a block behind) up to
+    BURN_SUBMIT_RETRIES times, BURN_SUBMIT_RETRY_SECS apart. Raises
+    BurnRefused for clean refusals (nothing submitted). Returns (tx_id, response)."""
+    tries = max(1, env_int("BURN_SUBMIT_RETRIES", 6))
+    gap = env_int("BURN_SUBMIT_RETRY_SECS", 10)
+    last = ""
+    for attempt in range(1, tries + 1):
+        try:
+            out = ctl(
+                "submit-rail-withdraw",
+                "--account", account_name,
+                "--asset", "BTC4",
+                "--amount", str(amount),
+                "--external-to", dest,
+                "--fee", "2",
+                "--scheme", "falcon-512",
+                "--network-id", "2300",
+                "--keys-dir", str(keys_dir),
+            )
+            ok = True
+        except RuntimeError as e:
+            out, ok = str(e), False
+        last = out
+        kind = classify_submit(out)
+        log(f"peg-out submit {account_name} {amount} attempt {attempt}/{tries} "
+            f"{'ok' if ok and not kind else 'refused'}: {one_line(out)}")
+        if kind == "tree_full":
+            raise BurnRefused("tree_full", f"BTC4 claim tree full; burn refused, no funds moved: {one_line(out, 200)}")
+        if kind == "deferred":
+            if attempt < tries:
+                sleep(gap)
+                continue
+            raise BurnRefused("deferred", f"node still deferred-until-catchup after {tries} tries; "
+                                          f"burn not submitted, no funds moved: {one_line(out, 200)}")
+        if not ok:
+            raise RuntimeError(out)
+        m = re.search(r"tx(?:_id)?[= :\"]+([0-9a-f]{16,})", out)
+        return (m.group(1) if m else "unknown"), out
+    raise BurnRefused("deferred", one_line(last, 200))
+
+
+def burn_landed(pre: dict, now: dict, amount: int) -> bool:
+    """A burn has landed once the sender's sequence moved past the pre-submit
+    value and its BTC4 balance dropped by at least `amount`."""
+    def _seq(d):
+        return int((d or {}).get("sequence") or 0)
+
+    def _btc4(d):
+        return int(((d or {}).get("assets") or {}).get("BTC4") or 0)
+    return _seq(now) > _seq(pre) and _btc4(pre) - _btc4(now) >= amount
+
+
+class BurnLandWatch:
+    """Item 6: after a burn, poll account seq + BTC4; alert once if it has not
+    landed within BURN_LAND_ALERT_SECS (default 900 = 15 min)."""
+
+    def __init__(self, account_name: str, amount: int, burn_tx: str, pre: dict,
+                 alert_secs: int | None = None, clock=time.time):
+        self.account, self.amount, self.burn_tx, self.pre = account_name, amount, burn_tx, pre
+        self.alert_secs = env_int("BURN_LAND_ALERT_SECS", 900) if alert_secs is None else alert_secs
+        self.clock = clock
+        self.t0 = clock()
+        self.landed = False
+        self.alerted = False
+
+    def check(self, now_acct: dict | None) -> bool:
+        if self.landed:
+            return True
+        if now_acct is not None and burn_landed(self.pre, now_acct, self.amount):
+            self.landed = True
+            log(f"peg-out burn {self.burn_tx[:16]} landed: seq {self.pre.get('sequence')}->"
+                f"{now_acct.get('sequence')} after {int(self.clock() - self.t0)}s")
+            if self.alerted:
+                discord_alert(f"✅ Peg-out burn {self.burn_tx[:8]} ({self.account}) landed late.")
+            return True
+        if not self.alerted and self.clock() - self.t0 >= self.alert_secs:
+            self.alerted = True
+            seq = (now_acct or {}).get("sequence", "?")
+            discord_alert(
+                f"⚠️ Peg-out burn {self.burn_tx[:8]} ({self.account}) not landed after "
+                f"{int((self.clock() - self.t0) // 60)} min: seq still {seq}. BTC4 not debited."
+            )
+        return False
+
+
 def peg_out(account_name: str, amount: int, dest: str, keys_dir: Path, timeout_sec: int) -> dict:
     # hold a cap slot from before the burn until its claim shows in status
     pending_key = f"{account_name}:{dest}:{amount}:{time.time_ns()}"
@@ -664,19 +791,11 @@ def _peg_out_body(account_name: str, amount: int, dest: str, keys_dir: Path, tim
     started = gmt()
     t0 = time.time()
     fpl_before, rail_before, _, _ = fpl_status_rail()
-    out = ctl(
-        "submit-rail-withdraw",
-        "--account", account_name,
-        "--asset", "BTC4",
-        "--amount", str(amount),
-        "--external-to", dest,
-        "--fee", "2",
-        "--scheme", "falcon-512",
-        "--network-id", "2300",
-        "--keys-dir", str(keys_dir),
-    )
-    m = re.search(r"tx[= ]([0-9a-f]{16,})", out)
-    burn_tx = m.group(1) if m else "unknown"
+    try:
+        pre_acct = account(account_name)
+    except Exception:
+        pre_acct = {}
+    burn_tx, submit_resp = submit_burn(account_name, amount, dest, keys_dir)
     log(f"peg-out burn submitted {burn_tx[:16]}… amount {amount} dest (operator wallet)")
     append_leg({
         "test_id": env("TEST_ID", "FPL-BTC4-BRIDGE-LOAD-2026-11-13"),
@@ -690,10 +809,19 @@ def _peg_out_body(account_name: str, amount: int, dest: str, keys_dir: Path, tim
         "fpl_height": fpl_before,
         "started_gmt": started,
         "result": "pending",
+        "submit_response": one_line(submit_resp),
+        "pre_sequence": pre_acct.get("sequence"),
     })
+    land = BurnLandWatch(account_name, amount, burn_tx, pre_acct)
     deadline = time.time() + timeout_sec
     last = ""
     while time.time() < deadline:
+        if not land.landed:
+            try:
+                land.check(account(account_name))
+            except Exception as e:
+                log(f"peg-out {burn_tx[:16]} land check failed: {e}")
+                land.check(None)
         # find claim by scanning BTC4 claims for this dest+amount+from
         _, _, _, rail = fpl_status_rail() if False else (0, 0, "", None)
         raw = ctl("status", timeout=60)
@@ -710,6 +838,7 @@ def _peg_out_body(account_name: str, amount: int, dest: str, keys_dir: Path, tim
                 # prefer newest
                 hit = c
         if hit:
+            land.landed = True
             _pending_discard(pending_key)  # claim visible: counted from status now
             st = hit.get("status")
             if st != last:
@@ -735,7 +864,8 @@ def _peg_out_body(account_name: str, amount: int, dest: str, keys_dir: Path, tim
                 rec["claim"] = {k: hit[k] for k in hit if not isinstance(hit[k], (list, dict))}
                 return rec
         time.sleep(20)
-    raise RuntimeError(f"peg-out {burn_tx[:16]} timeout after {timeout_sec}s last={last}")
+    landed = "landed" if land.landed else "NOT landed (BTC4 not debited)"
+    raise RuntimeError(f"peg-out {burn_tx[:16]} timeout after {timeout_sec}s last={last}; burn {landed}")
 
 def new_recycle_addr() -> str:
     # bech32 from operator wallet — funds return to us
@@ -876,7 +1006,7 @@ def cmd_once(home: Path) -> int:
             "account": account_name, "amount_sats": minted, "result": "fail",
             "error": str(e)[:300], "started_gmt": gmt(), "ended_gmt": gmt(),
         })
-        discord_alert(f"BTC4 TC-1 peg-out failed: {e}")
+        discord_alert(f"BTC4 TC-1 peg-out {'refused (no funds moved)' if isinstance(e, BurnRefused) else 'failed'}: {e}")
         return 1
     log(f"TC-1 PASS peg-in {pin.get('tx_or_deposit_id')} peg-out {pout.get('tx_or_deposit_id')} "
         f"in {pin.get('latency_sec')}+{pout.get('latency_sec')}s")
@@ -908,7 +1038,7 @@ def cmd_pegout(home: Path) -> int:
             "account": account_name, "amount_sats": amount, "result": "fail",
             "error": str(e)[:300], "started_gmt": gmt(), "ended_gmt": gmt(),
         })
-        discord_alert(f"BTC4 TC-1 peg-out failed: {e}")
+        discord_alert(f"BTC4 TC-1 peg-out {'refused (no funds moved)' if isinstance(e, BurnRefused) else 'failed'}: {e}")
         return 1
     log(f"TC-1 peg-out PASS {pout.get('tx_or_deposit_id')} in {pout.get('latency_sec')}s")
     return 0
@@ -929,6 +1059,66 @@ def spend_today(home: Path) -> int:
         if r.get("direction") == "peg-in" and r.get("state") in ("funding_broadcast", "minted"):
             tot += int(r.get("amount_sats") or 0)
     return tot
+
+# ---------------------------------------------------------------------------
+# batch schedule persistence (item 10: a restart must not reset the 6 h gap or
+# relaunch legs of a batch already in progress)
+
+def schedule_path(home: Path) -> Path:
+    return Path(env("BATCH_SCHEDULE_FILE", str(home / "schedule.json")))
+
+
+def save_schedule(home: Path, state: dict) -> None:
+    p = schedule_path(home)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, sort_keys=True))
+    os.replace(tmp, p)
+
+
+def load_schedule(home: Path) -> dict | None:
+    p = schedule_path(home)
+    try:
+        d = json.loads(p.read_text())
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def resume_plan(state: dict | None, now: float, window: int, gap: int) -> dict:
+    """Where to pick up after a (re)start.
+
+    Returns {"bi", "phase": "batch"|"gap", "batch_t0", "offsets", "next_leg",
+    "gap_end"}. A batch still inside its window resumes at the next unlaunched
+    leg with the same offsets; a batch whose window passed goes to its gap; a
+    gap resumes with its original end; no/garbled state starts batch 0 now."""
+    fresh = {"bi": 0, "phase": "batch", "batch_t0": now, "offsets": None, "next_leg": 0, "gap_end": None}
+    if not state:
+        return fresh
+    try:
+        bi = int(state["bi"])
+        phase = state.get("phase")
+        t0 = float(state.get("batch_t0") or 0)
+        gap_end = state.get("gap_end")
+        gap_end = float(gap_end) if gap_end is not None else None
+        offsets = state.get("offsets")
+        next_leg = int(state.get("next_leg") or 0)
+    except (KeyError, TypeError, ValueError):
+        return fresh
+    if phase == "batch":
+        if offsets and now < t0 + window and next_leg < len(offsets):
+            return {"bi": bi, "phase": "batch", "batch_t0": t0, "offsets": offsets,
+                    "next_leg": next_leg, "gap_end": None}
+        phase, gap_end = "gap", t0 + window + gap
+    if phase == "gap":
+        if gap_end is None:
+            gap_end = now + gap
+        if now < gap_end:
+            return {"bi": bi, "phase": "gap", "batch_t0": t0, "offsets": None,
+                    "next_leg": 0, "gap_end": gap_end}
+        return {"bi": bi + 1, "phase": "batch", "batch_t0": now, "offsets": None,
+                "next_leg": 0, "gap_end": None}
+    return fresh
+
 
 def cmd_run(home: Path) -> int:
     keys = Path(env("LOADGEN_KEYS", str(home / "keys")))
@@ -972,8 +1162,25 @@ def cmd_run(home: Path) -> int:
         except Exception as e:
             log(f"key bind {a} failed: {e}")
 
-    bi = 0
+    raw_state = None if env("BATCH_SCHEDULE_RESET", "0") == "1" else load_schedule(home)
+    plan = resume_plan(raw_state, time.time(), batch_window, wait_gap)
+    if raw_state:
+        log(f"schedule: resuming batch {plan['bi']+1} phase={plan['phase']} next_leg={plan['next_leg']} "
+            f"gap_end={datetime.fromtimestamp(plan['gap_end'], timezone.utc).strftime('%H:%M:%S GMT') if plan['gap_end'] else '-'}")
+    bi = plan["bi"]
     while True:
+        if plan and plan["phase"] == "gap":
+            gap_end = plan["gap_end"]
+            save_schedule(home, {"bi": bi, "phase": "gap", "batch_t0": plan["batch_t0"], "gap_end": gap_end})
+            while time.time() < gap_end:
+                if paused(pause_file):
+                    time.sleep(30)
+                    continue
+                watch.tick()
+                time.sleep(min(60, max(1, gap_end - time.time())))
+            bi += 1
+            plan = None
+            continue
         if paused(pause_file):
             log("paused (PAUSE file or LOADGEN_PAUSE=1); sleeping 30s")
             time.sleep(30)
@@ -986,18 +1193,32 @@ def cmd_run(home: Path) -> int:
         if hbal and hbal < header_floor:
             discord_alert(f"btc-headers FPL balance low: {hbal}")
         size = sizes[bi % 2]
-        log(f"starting batch {bi+1} size={size} window={batch_window}s lag={lag}")
-        # randomize start offsets in the hour; half in, half out if the wallet has BTC4
-        offsets = batch_offsets(size, batch_window, jitter)
-        batch_t0 = time.time()
+        if plan and plan["offsets"]:
+            offsets = [float(x) for x in plan["offsets"]]
+            batch_t0 = float(plan["batch_t0"])
+            start_leg = int(plan["next_leg"])
+            log(f"resuming batch {bi+1} size={len(offsets)} at leg {start_leg+1} (schedule file)")
+        else:
+            offsets = batch_offsets(size, batch_window, jitter)
+            batch_t0 = time.time()
+            start_leg = 0
+            log(f"starting batch {bi+1} size={size} window={batch_window}s lag={lag}")
+        plan = None
+        sched = {"bi": bi, "phase": "batch", "batch_t0": batch_t0, "offsets": offsets, "next_leg": start_leg}
+        save_schedule(home, sched)
         launched = 0
         for i, off in enumerate(offsets):
+            if i < start_leg:
+                continue
             if paused(pause_file):
                 log("paused mid-batch; no new legs")
                 break
             wait = batch_t0 + off - time.time()
             if wait > 0:
                 time.sleep(wait)
+            # leg i is now consumed (launched or skipped): a restart never relaunches it
+            sched["next_leg"] = i + 1
+            save_schedule(home, sched)
             watch.tick()
             acct = accounts[i % len(accounts)]
             try:
@@ -1038,6 +1259,17 @@ def cmd_run(home: Path) -> int:
                         "started_gmt": gmt(), "ended_gmt": gmt(),
                     })
                     discord_alert(f"BTC4 loadtest leg skipped ({acct}): {e}")
+                except BurnRefused as e:
+                    # clean refusal: nothing entered the mempool, no funds moved
+                    log(f"leg refused ({acct}): {e}")
+                    append_leg({
+                        "case": f"batch-{bi+1}", "leg_id": f"{bi+1}-{i+1}",
+                        "direction": "peg-out", "account": acct, "amount_sats": minted_expect,
+                        "result": "refused", "state": f"refused_{e.reason}",
+                        "error": str(e)[:300], "funds_moved": False,
+                        "started_gmt": gmt(), "ended_gmt": gmt(),
+                    })
+                    discord_alert(f"⛔ Peg-out refused ({acct}): {REFUSAL_TEXT.get(e.reason, e.reason)}. No funds moved.")
                 except Exception as e:
                     log(f"leg failed ({acct}): {e}")
                     append_leg({
@@ -1052,15 +1284,9 @@ def cmd_run(home: Path) -> int:
         remain = batch_t0 + batch_window - time.time()
         if remain > 0 and not paused(pause_file):
             time.sleep(remain)
-        log(f"batch {bi+1} launched {launched}/{size}; gap {wait_gap}s")
-        gap_end = time.time() + wait_gap
-        while time.time() < gap_end:
-            if paused(pause_file):
-                time.sleep(30)
-                continue
-            watch.tick()
-            time.sleep(60)
-        bi += 1
+        log(f"batch {bi+1} launched {launched}/{len(offsets) - start_leg}; gap {wait_gap}s")
+        plan = {"bi": bi, "phase": "gap", "batch_t0": batch_t0, "offsets": None,
+                "next_leg": 0, "gap_end": time.time() + wait_gap}
 
 def main() -> int:
     argv = sys.argv[1:]
