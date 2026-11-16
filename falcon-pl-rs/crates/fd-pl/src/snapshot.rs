@@ -484,6 +484,7 @@ impl Node {
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
         let btc4_lend_scale_from_height = crate::params_v2::btc4_lend_scale_from_height(cfg.network_id);
+        let bitvm2_leaf_prune_from_height = crate::params_v2::bitvm2_leaf_prune_from_height(cfg.network_id);
         let orderbook_from_height = crate::params_v2::orderbook_from_height(cfg.network_id);
         let hello_min_release_from_height = crate::params_v2::hello_min_release_from_height(cfg.network_id);
         let network_id_for_utc_hello = cfg.network_id;
@@ -611,6 +612,9 @@ impl Node {
             height_view_round: 0,
             view_change_votes: HashMap::new(),
             last_view_change_vote_ms: 0,
+            vc_vote_sigs: HashMap::new(),
+            applied_round_qc: None,
+            last_round_regossip_ms: 0,
             height_sealers: HashMap::new(),
             certs: snap.certs,
             ok_by_height_voter: snap.ok_by_height_voter,
@@ -633,6 +637,7 @@ impl Node {
             btc4_fork_fix_from_height,
             btc4_fork_slot_from_height,
             btc4_lend_scale_from_height,
+            bitvm2_leaf_prune_from_height,
             orderbook_from_height,
             hello_min_release_from_height,
             utc_hello_enforce_from_height: crate::utc_header::network_utc_hello_enforce_from_height(network_id_for_utc_hello),

@@ -263,6 +263,13 @@ impl Node {
             // Unregistered attesters still finalize; they just earn nothing.
             let _ = self.bridge.operators.credit_payout_account(epoch, &id, &op, amt);
         }
+        // Fix B: free settled leaves so the fixed-depth (16) tree keeps room.
+        // Runs after the status moves above, same ledger, on every seat.
+        if self.bitvm2_leaf_prune_at(h) {
+            if let Ok(rail) = self.bridge.rail_mut(asset) {
+                let _ = rail.prune_settled_bitvm2_leaves();
+            }
+        }
     }
 
     /// Which rail holds the BitVM2 claim `note_id` (BTC4 first).
@@ -347,7 +354,7 @@ impl Node {
         if amount == 0 {
             return Err("btc4 withdraw: zero amount".into());
         }
-        self.bridge.rail(crate::bridge::RAIL_BTC4)?;
+        self.bridge.rail(crate::bridge::RAIL_BTC4)?.bitvm2_claim_tree_check()?;
         self.defi.debit_asset(from, crate::bridge::RAIL_BTC4, amount)?;
         let tip = self.tip_height;
         let r = self.bridge.rail_mut(crate::bridge::RAIL_BTC4)?;

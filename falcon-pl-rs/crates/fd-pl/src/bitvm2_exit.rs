@@ -7,7 +7,7 @@ pub use fd_pl_bitvm2::protocol::claim_id as bitvm2_claim_id;
 pub use fd_pl_bitvm2::withdraw_ops::{
     checkpoint_header_hash, header_hash_placeholder, mimc_leaf_hex, mimc_root_hex_from_leaves,
     pegout_txid_bytes, prove_withdraw_attest, prove_withdraw_attest_with_keys,
-    verify_withdraw_attest, verify_withdraw_attest_vk_bytes,
+    verify_stored_withdraw_attest_vk_bytes, verify_withdraw_attest, verify_withdraw_attest_vk_bytes,
 };
 
 /// M1: compressed Groth16 verifying key for `FplWithdrawValid` (arkworks compressed,

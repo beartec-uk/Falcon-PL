@@ -321,6 +321,17 @@ mod tests {
     }
 
     #[test]
+    fn bitvm2_leaf_prune_armed_at_904k_after_m1() {
+        assert_eq!(TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT, 904_000, "Scott 2026-11-16: Fix B at 904k");
+        assert_eq!(bitvm2_leaf_prune_from_height(NETWORK_ID_PUBLIC_TESTNET_2300), 904_000);
+        assert!(TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT >= TESTNET_2300_BITVM2_M1_FROM_HEIGHT);
+        // Other networks: env, else never (no process-wide set_var here).
+        if std::env::var("FPL_BITVM2_LEAF_PRUNE_FROM_HEIGHT").is_err() {
+            assert_eq!(bitvm2_leaf_prune_from_height(2200), u64::MAX);
+        }
+    }
+
+    #[test]
     fn splits_sum_to_100() {
         assert!(FEE_BURN_PCT + FEE_PROPOSER_PCT < 100);
         assert!(POT_PROPOSER_PCT + POT_VOTER_PCT < 100);
@@ -444,6 +455,21 @@ pub fn btc4_lend_scale_from_height(network_id: u32) -> u64 {
     env_u64("FPL_BTC4_LEND_SCALE_FROM_HEIGHT")
         .or_else(|| env_u64("FPL_V2_10_4_FROM_HEIGHT"))
         .unwrap_or(u64::MAX)
+}
+
+/// Testnet 2300 height from which settled BitVM2 claim-tree leaves are pruned
+/// (fix B, 14 Nov 2026 claim tree full). **904,000**, chosen by Scott on
+/// 16 Nov 2026 (tip 891,771 at 03:36 GMT, ~1.3–1.4 days at 9–10 s/block).
+/// Must be >= the M1 height; every seat must run 2.11.4 before it.
+pub const TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT: u64 = 904_000;
+
+/// BitVM2 claim-tree leaf pruning activation (consensus). 2300: the constant
+/// above. Other networks: `FPL_BITVM2_LEAF_PRUNE_FROM_HEIGHT`, else never.
+pub fn bitvm2_leaf_prune_from_height(network_id: u32) -> u64 {
+    if network_id == NETWORK_ID_PUBLIC_TESTNET_2300 {
+        return TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT;
+    }
+    env_u64("FPL_BITVM2_LEAF_PRUNE_FROM_HEIGHT").unwrap_or(u64::MAX)
 }
 
 /// Order book activation = the 2.10.4 height (non-2300: env, else never).
