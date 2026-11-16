@@ -9,6 +9,9 @@ The real intake supervisor (real /proc scan, real Popen, real zombie handling) m
      kill the local participant, and alert.
 Optional real kernel OOM: FPL_TEST_REAL_OOM=1 runs the fake coordinator under
 `systemd-run --scope -p MemoryMax=…` (needs root + systemd), letting the memcg kill it.
+Or, without systemd (e.g. in a container): FPL_TEST_OOM_CGROUP=<cgroup v2 dir with
+memory.max set, writable by the test> puts the fake coordinator into that cgroup; run as
+root inside `unshare --pid --mount --fork --mount-proc` so /proc only shows the test.
 Nothing touches the network or a real bridge. Run: python3 test_ceremony_oom_sim.py -v
 """
 import importlib.util
@@ -76,7 +79,7 @@ class OomSim(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("fpl_intake_oomsim", HERE / "fpl_bridge_intake.py")
         self.I = importlib.util.module_from_spec(spec); spec.loader.exec_module(self.I)
         self.alerts = []
-        self.p = [mock.patch.object(self.I, "alert", lambda k, r, m, min_interval=900: self.alerts.append((k, m))),
+        self.p = [mock.patch.object(self.I, "alert", lambda k, r, m, min_interval=900, short=None: self.alerts.append((k, m))),
                   mock.patch.object(self.I, "tx_seen", lambda txid: False)]
         for p in self.p:
             p.start()
@@ -106,6 +109,12 @@ class OomSim(unittest.TestCase):
         self.participant = subprocess.Popen([str(self.bin / "fpl_ceremony_participant"), "--dir", d, "--id", "falcon1"],
                                             start_new_session=True)
         I.save(r)
+        # the fake binaries are bash wrappers that `exec -a`; wait until /proc shows the
+        # final argv so a fast first worker_pass (grace 0) does not see them as dead
+        t0 = time.time()
+        while not (I.ceremony_procs(d, (I.PART_BIN,)) and I.live_ceremony_coordinators().get(os.path.normpath(d))):
+            self.assertLess(time.time() - t0, 10, "fake ceremony processes did not start")
+            time.sleep(0.02)
         return r, d
 
     def wait_file(self, f, t=20):
@@ -169,6 +178,33 @@ class OomSim(unittest.TestCase):
         self.participant.wait(timeout=10)             # local participant was terminated
         self.assertEqual(self.I.ceremony_procs(d), [])
 
+    def test_intake_restart_readopts_live_coordinator(self):
+        """Intake restart (KillMode=process): a fresh intake process re-adopts the running
+        coordinator via /proc, spawns no second one, then still restarts it after an OOM."""
+        os.environ["FAKE_DIE_RUNS"] = "1"
+        r, d = self.make_request("00000000000e5ea7")
+        self.wait_file(os.path.join(d, "fake_ready_1"))
+        pid1 = self.I.live_ceremony_coordinators()[os.path.normpath(d)]
+        # "restart" the intake: brand-new module state, same disk + live processes
+        spec = importlib.util.spec_from_file_location("fpl_intake_oomsim_2", HERE / "fpl_bridge_intake.py")
+        I2 = importlib.util.module_from_spec(spec); spec.loader.exec_module(I2)
+        for p in self.p:
+            p.stop()
+        self.I = I2
+        self.p = [mock.patch.object(I2, "alert", lambda k, r, m, min_interval=900, short=None: self.alerts.append((k, m))),
+                  mock.patch.object(I2, "tx_seen", lambda txid: False)]
+        for p in self.p:
+            p.start()
+        for _ in range(5):
+            I2.worker_pass(); time.sleep(0.1)
+        cur = I2.load(r["id"])
+        self.assertEqual(cur["coord_attempts"], 1)
+        self.assertEqual(I2.live_ceremony_coordinators()[os.path.normpath(d)], pid1)
+        self.assertEqual(self.alerts, [])
+        self.oom_kill(d)
+        cur = self.drive(r["id"], lambda x: x["state"] == "presigned")
+        self.assertEqual(cur["coord_attempts"], 2)
+
     @unittest.skipUnless(os.environ.get("FPL_TEST_REAL_OOM") == "1" and os.geteuid() == 0
                          and shutil.which("systemd-run"), "real memcg OOM needs root + systemd (FPL_TEST_REAL_OOM=1)")
     def test_real_memcg_oom_kill(self):
@@ -188,6 +224,48 @@ class OomSim(unittest.TestCase):
             os.environ["FAKE_ALLOC_MB"] = "8"
             r = self.drive(r["id"], lambda x: x["state"] == "presigned", t=60)
         self.assertIn("coordinator_restarted", [k for k, _ in self.alerts])
+
+    @unittest.skipUnless(os.environ.get("FPL_TEST_OOM_CGROUP"),
+                         "real memcg OOM via a prepared cgroup v2 dir (FPL_TEST_OOM_CGROUP=<dir>)")
+    def test_real_memcg_oom_kill_cgroupfs(self):
+        """Kernel memcg OOM (no systemd): the fake coordinator joins a cgroup whose
+        memory.max is below what it allocates; the kernel kills it, the supervisor
+        restarts it outside the cgroup and the ceremony completes."""
+        cg = os.environ["FPL_TEST_OOM_CGROUP"]
+        limit = Path(cg, "memory.max").read_text().strip()
+        self.assertNotEqual(limit, "max", "set memory.max on the test cgroup")
+
+        def oom_kills():
+            for line in Path(cg, "memory.events").read_text().splitlines():
+                k, v = line.split()
+                if k == "oom_kill":
+                    return int(v)
+            return 0
+        before = oom_kills()
+        os.environ["FAKE_DIE_RUNS"] = "1"
+        os.environ["FAKE_ALLOC_MB"] = str(4 * (int(limit) >> 20))
+        real_popen = subprocess.Popen
+        first = {"done": False}
+
+        def in_cgroup(args, **kw):
+            if os.path.basename(args[0]) == "fpl_ceremony_coordinator" and not first["done"]:
+                first["done"] = True
+                args = ["/bin/sh", "-c", f'echo $$ > {cg}/cgroup.procs && exec "$@"', "sh"] + list(args)
+            return real_popen(args, **kw)
+        with mock.patch.object(self.I.subprocess, "Popen", in_cgroup):
+            r, d = self.make_request("00000000000c9b0f")
+            t0 = time.time()
+            while oom_kills() == before:
+                self.assertLess(time.time() - t0, 30, "kernel did not OOM-kill the coordinator")
+                time.sleep(0.1)
+            os.environ["FAKE_ALLOC_MB"] = "8"
+            r = self.drive(r["id"], lambda x: x["state"] == "presigned", t=60)
+        self.assertEqual(oom_kills() - before, 1)
+        kinds = [k for k, _ in self.alerts]
+        self.assertIn("coordinator_died", kinds)
+        self.assertIn("coordinator_restarted", kinds)
+        self.assertEqual(r["coord_attempts"], 2)
+        self.assertTrue(os.path.exists(os.path.join(d, "final.json")))
 
 
 if __name__ == "__main__":

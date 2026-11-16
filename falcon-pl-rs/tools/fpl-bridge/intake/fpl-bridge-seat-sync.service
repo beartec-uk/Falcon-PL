@@ -9,5 +9,9 @@ Restart=always
 RestartSec=5
 User=root
 MemoryMax=6G
+# KillMode=process: restarting seat_sync does not kill an in-flight participant (its
+# RAM-only key would be lost and the ceremony would fail). The new seat_sync adopts it
+# via /proc (no second participant) and stops it when the lead drops the request.
+KillMode=process
 [Install]
 WantedBy=multi-user.target

@@ -26,6 +26,7 @@ Ceremony supervision (see "ceremony supervision" below): FPL_MAX_CEREMONIES(2) F
      FPL_MEM_HEADROOM_MB(1024) FPL_COORD_MAX_RETRIES(3) FPL_COORD_BACKOFF_SECS(60) FPL_COORD_BACKOFF_MAX_SECS(900)
      FPL_COORD_GRACE_SECS(45) FPL_STAGE_TIMEOUT_<STATE>(secs) FPL_STALL_REALERT_SECS(21600)
      FPL_DISCORD_WEBHOOK_URL / DISCORD_HEALTH_WEBHOOK_URL or FPL_DISCORD_ENV_FILE (0600; URL never logged)
+     FPL_ALERT_BATCH_SECS(5) FPL_ALERT_MAX_RETRIES(6): alerts are batched into few posts, 429 honours Retry-After
 CLI: fpl_bridge_intake.py --plan   print what the supervisor would do to each live request (no changes)
 """
 import hashlib, json, os, re, secrets, signal, subprocess, sys, threading, time, urllib.error, urllib.request
@@ -310,20 +311,143 @@ def _webhook_url():
     return u
 
 
-def _post_discord(text):
+DISCORD_LIMIT = 1900                                   # Discord content cap is 2000 chars
+ALERT_BATCH_SECS = _env_int("FPL_ALERT_BATCH_SECS", 5)   # gather alerts this long into one post
+ALERT_MAX_RETRIES = _env_int("FPL_ALERT_MAX_RETRIES", 6)
+ALERT_UA = "fpl-bridge-intake"                         # Discord's edge 403s the urllib default UA
+
+
+def _post_discord_once(text):
+    """One POST. Returns (ok, retry_after_secs|None, code). Never logs the URL."""
     u = _webhook_url()
     if not u:
-        return
+        return True, None, 0
+    q = urllib.request.Request(u, data=json.dumps({"content": text[:DISCORD_LIMIT + 100]}).encode(),
+                               method="POST", headers={"Content-Type": "application/json", "User-Agent": ALERT_UA})
     try:
-        q = urllib.request.Request(u, data=json.dumps({"content": text[:1800]}).encode(), method="POST",
-                                   headers={"Content-Type": "application/json", "User-Agent": "fpl-bridge-intake"})
-        urllib.request.urlopen(q, timeout=10).read()
+        with urllib.request.urlopen(q, timeout=10) as resp:
+            resp.read()
+            h = getattr(resp, "headers", None) or {}
+            # pace proactively when the bucket is empty
+            if str(h.get("X-RateLimit-Remaining", "")) == "0":
+                try:
+                    return True, float(h.get("X-RateLimit-Reset-After") or 0) or None, 200
+                except ValueError:
+                    return True, None, 200
+        return True, None, 200
+    except urllib.error.HTTPError as e:
+        ra = None
+        if e.code == 429:
+            try:
+                ra = float((e.headers or {}).get("Retry-After") or 0) or None
+            except (TypeError, ValueError):
+                ra = None
+            if ra is None:
+                try:
+                    ra = float(json.loads(e.read().decode() or "{}").get("retry_after") or 1)
+                except Exception:
+                    ra = 1.0
+        return False, ra, e.code
     except Exception as e:
-        log("alert post failed:", type(e).__name__)  # never the URL
+        return False, None, type(e).__name__
 
 
-def alert(kind, r, msg, min_interval=900):
-    """Log always; post to Discord at most once per (request, kind) per min_interval."""
+def _post_discord(text, sleep=None):
+    """POST with retry: 429 waits Retry-After, 5xx/network back off 2,4,8.. s; other 4xx drop.
+    Returns True if delivered (or no webhook configured)."""
+    sleep = sleep or time.sleep
+    for attempt in range(1, ALERT_MAX_RETRIES + 1):
+        ok, ra, code = _post_discord_once(text)
+        if ok:
+            if ra:
+                sleep(min(ra, 60))
+            return True
+        retryable = code == 429 or not isinstance(code, int) or code >= 500
+        log("alert post failed:", code, f"attempt {attempt}/{ALERT_MAX_RETRIES}",
+            "retrying" if retryable and attempt < ALERT_MAX_RETRIES else "dropped")  # never the URL
+        if not retryable or attempt == ALERT_MAX_RETRIES:
+            return False
+        sleep(min(ra if ra else 2 ** attempt, 120))
+    return False
+
+
+def pack_alerts(msgs, limit=DISCORD_LIMIT):
+    """Join queued alert lines into as few posts as possible (each <= limit chars)."""
+    out, cur = [], ""
+    for m in msgs:
+        m = m if len(m) <= limit else m[:limit - 1] + "…"
+        if cur and len(cur) + 1 + len(m) > limit:
+            out.append(cur)
+            cur = ""
+        cur = m if not cur else cur + "\n" + m
+    if cur:
+        out.append(cur)
+    return out
+
+
+class AlertOutbox:
+    """One sender thread: batches alerts for ALERT_BATCH_SECS and posts them in order with
+    retry, so a burst (e.g. 14 cleanup alerts at a deploy) is a few posts, not 14 racing
+    threads hitting the webhook rate limit."""
+
+    def __init__(self, post=None, batch_secs=None, sleep=None):
+        self._post = post or _post_discord
+        self.batch_secs = ALERT_BATCH_SECS if batch_secs is None else batch_secs
+        self._sleep = sleep or time.sleep
+        self._q = []
+        self._cv = threading.Condition()
+        self._thread = None
+        self.dropped = 0
+
+    def put(self, text):
+        with self._cv:
+            self._q.append(text)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="alert-outbox", daemon=True)
+                self._thread.start()
+            self._cv.notify()
+
+    def pending(self):
+        with self._cv:
+            return len(self._q)
+
+    def flush(self):
+        """Send everything queued now (caller's thread). Returns number of posts made."""
+        with self._cv:
+            msgs, self._q = self._q, []
+        n = 0
+        for body in pack_alerts(msgs):
+            n += 1
+            if not self._post(body):
+                self.dropped += body.count("\n") + 1
+        return n
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while not self._q:
+                    self._cv.wait()
+            self._sleep(self.batch_secs)
+            self.flush()
+
+
+OUTBOX = AlertOutbox()
+
+
+def _flush_alerts_at_exit():
+    try:
+        OUTBOX.flush()
+    except Exception:
+        pass
+
+
+import atexit  # noqa: E402
+atexit.register(_flush_alerts_at_exit)
+
+
+def alert(kind, r, msg, min_interval=900, short=None):
+    """Log the full detail always; post the short line (if given) to Discord at most once per
+    (request, kind) per min_interval, via the batching outbox."""
     rid = r.get("id", "?") if isinstance(r, dict) else str(r)
     key = (rid, kind)
     now = time.time()
@@ -331,8 +455,33 @@ def alert(kind, r, msg, min_interval=900):
     if now - _ALERTED.get(key, 0) < min_interval:
         return
     _ALERTED[key] = now
-    text = f"[{NET} bridge intake] {kind} req {rid}: {msg}"
-    threading.Thread(target=_post_discord, args=(text,), daemon=True).start()
+    OUTBOX.put(short or f"[{NET} bridge intake] {kind} req {rid}: {msg}")
+
+
+# ---- short alert wording (item 1) ----
+STAGE_WORDS = {
+    "waiting_operator_liquidity": "waiting for operator liquidity", "funded": "queued for a ceremony",
+    "ceremony_pubkeys": "at ceremony pubkeys", "awaiting_signature": "awaiting depositor signature",
+    "signed": "signing", "presigned": "waiting for ledger binding", "broadcasting": "broadcasting",
+    "peg_in_confirmed": "confirming", "awaiting_mint": "awaiting mint",
+}
+
+
+def human_age(secs):
+    secs = max(0, int(secs))
+    if secs < 120 * 60:
+        return f"{max(1, secs // 60)} min"
+    if secs < 48 * 3600:
+        return f"{secs // 3600} h"
+    return f"{secs // 86400} days"
+
+
+def stuck_phrase(state, age):
+    return f"stuck {STAGE_WORDS.get(state, state)} {human_age(age)}"
+
+
+def short_id(r):
+    return (r.get("id") or "?")[:8] if isinstance(r, dict) else str(r)[:8]
 
 
 # ---- processes / memory ----
@@ -504,34 +653,38 @@ def broadcast_seen(r):
     return False
 
 
-def fail_request(r, reason, kind, now):
+def fail_request(r, reason, kind, now, short=None):
     """Mark failed (releases kickoff + funding reservation) only if nothing was broadcast
     AND the ceremony never produced fully signed graphs (final.json). Seats keep copies of
     final.json, so a presigned peg-in stays broadcastable; releasing its kickoff could let
     two usable graphs share one kickoff. Such requests are stalled with reservations kept."""
     if os.path.exists(os.path.join(gdir(r), "final.json")):
         return mark_stalled(r, f"{reason}; NOT failed: ceremony completed (final.json), presigned graphs "
-                               "remain usable, kickoff stays reserved; manual action needed", now)
+                               "remain usable, kickoff stays reserved; manual action needed", now,
+                            short=f"{short or reason}; signed graphs exist")
     seen = broadcast_seen(r)
     if seen is None:
         r["last_error"] = f"{reason} (fail deferred: esplora unavailable)"
         return True
     if seen:
-        return mark_stalled(r, f"{reason}; NOT failed: peg-in tx already broadcast, manual action needed", now)
+        return mark_stalled(r, f"{reason}; NOT failed: peg-in tx already broadcast, manual action needed", now,
+                            short=f"{short or reason}; peg-in already broadcast")
     killed = kill_ceremony_procs(gdir(r))
     r.update(state="failed", last_error=reason, failed_reason=kind, failed_at=int(now))
     r.pop("stalled", None)
     alert("failed", r, f"{reason}. Funds stay at the depositor address; kickoff "
-                       f"{(r.get('kickoff') or '-')[:16]} released; killed pids {killed}", min_interval=0)
+                       f"{(r.get('kickoff') or '-')[:16]} released; killed pids {killed}", min_interval=0,
+          short=f"❌ Peg-in {short_id(r)} failed: {short or reason}. Funds safe, kickoff released.")
     return True
 
 
-def mark_stalled(r, reason, now):
+def mark_stalled(r, reason, now, short=None):
     last = int(r.get("stall_alerted_at") or 0)
     r["stalled"] = reason
     if now - last >= STALL_REALERT_SECS:
         r["stall_alerted_at"] = int(now)
-        alert("stalled", r, reason, min_interval=0)
+        alert("stalled", r, reason, min_interval=0,
+              short=f"⚠️ Peg-in {short_id(r)} stalled: {short or reason}. Kickoff kept; needs a manual check.")
     return True
 
 
@@ -555,9 +708,10 @@ def supervise(r, now=None):
     ta = timeout_action(r, now)
     if ta:
         act, why = ta
+        sp = stuck_phrase(s, state_age(r, now))
         if act == "fail":
-            return fail_request(r, why, "stage_timeout_" + s, now)
-        return mark_stalled(r, why, now)
+            return fail_request(r, why, "stage_timeout_" + s, now, short=sp)
+        return mark_stalled(r, why, now, short=sp)
 
     if s in CEREMONY_STATES and not os.path.exists(os.path.join(d, "final.json")):
         if now - int(r.get("coord_spawned") or 0) < COORD_GRACE_SECS:
@@ -566,24 +720,28 @@ def supervise(r, now=None):
         if seat and not os.path.exists(os.path.join(d, "attest", seat + ".json")) \
                 and not ceremony_procs(d, (PART_BIN,)):
             return fail_request(r, f"local ceremony participant ({seat}) is gone; its RAM-only n-of-n key "
-                                   "is lost so this ceremony cannot finish", "participant_died", now)
+                                   "is lost so this ceremony cannot finish", "participant_died", now,
+                                short="local ceremony signer died")
         if live_ceremony_coordinators().get(os.path.normpath(d)):
             if r.pop("coord_dead_since", None) is not None:
                 return True
             return False
         if os.path.exists(os.path.join(d, "graphs.json")):
             return fail_request(r, "ceremony coordinator died after graphs.json was published; the signing "
-                                   "rounds cannot resume (participants hold RAM-only nonces)", "coordinator_died_mid_signing", now)
+                                   "rounds cannot resume (participants hold RAM-only nonces)", "coordinator_died_mid_signing", now,
+                                short="coordinator died mid-signing")
         attempts = int(r.get("coord_attempts") or 1)
         changed = False
         if not r.get("coord_dead_since"):
             r["coord_dead_since"] = now
             alert("coordinator_died", r, f"ceremony coordinator not running in state {s} (no final.json); "
-                                         f"attempt {attempts} of {1 + COORD_MAX_RETRIES}")
+                                         f"attempt {attempts} of {1 + COORD_MAX_RETRIES}",
+                  short=f"⚠️ Peg-in {short_id(r)}: ceremony coordinator down ({STAGE_WORDS.get(s, s)}); "
+                        f"restarting ({attempts}/{1 + COORD_MAX_RETRIES}).")
             changed = True
         if attempts > COORD_MAX_RETRIES:
             return fail_request(r, f"ceremony coordinator died {attempts} times (max retries {COORD_MAX_RETRIES})",
-                                "coordinator_retries_exhausted", now)
+                                "coordinator_retries_exhausted", now, short=f"coordinator died {attempts} times")
         backoff = min(COORD_BACKOFF_SECS * (2 ** (attempts - 1)), COORD_BACKOFF_MAX_SECS)
         if now - int(r["coord_dead_since"]) < backoff:
             return changed
@@ -599,7 +757,8 @@ def supervise(r, now=None):
         r.pop("coord_dead_since", None)
         r["last_error"] = f"coordinator restarted (attempt {attempts + 1})"
         alert("coordinator_restarted", r, f"restarted ceremony coordinator, attempt {attempts + 1} "
-                                          f"of {1 + COORD_MAX_RETRIES} (pid {r['coord_pid']})", min_interval=0)
+                                          f"of {1 + COORD_MAX_RETRIES} (pid {r['coord_pid']})", min_interval=0,
+              short=f"🔁 Peg-in {short_id(r)}: coordinator restarted ({attempts + 1}/{1 + COORD_MAX_RETRIES}).")
         return True
 
     if s == "broadcasting":
@@ -612,14 +771,16 @@ def supervise(r, now=None):
         attempts = int(r.get("bcast_attempts") or 1)
         if attempts > COORD_MAX_RETRIES:
             return mark_stalled(r, f"peg-in broadcast process died {attempts} times and the confirm tx is "
-                                   "not on chain; manual action needed", now)
+                                   "not on chain; manual action needed", now,
+                                short=f"broadcast died {attempts} times, confirm tx not on chain")
         backoff = min(COORD_BACKOFF_SECS * (2 ** (attempts - 1)), COORD_BACKOFF_MAX_SECS)
         if now - int(r.get("bcast_spawned") or 0) < backoff:
             return False
         r["bcast_attempts"] = attempts + 1
         spawn_broadcast(r, d)
         alert("broadcast_restarted", r, f"peg-in broadcast process gone, confirm tx unseen; respawned "
-                                        f"(attempt {attempts + 1})", min_interval=0)
+                                        f"(attempt {attempts + 1})", min_interval=0,
+              short=f"🔁 Peg-in {short_id(r)}: broadcast restarted (attempt {attempts + 1}).")
         return True
     return False
 
@@ -646,7 +807,14 @@ def plan(reqs, now=None, check_chain=True):
                     and not ceremony_procs(d, (PART_BIN,)):
                 act, why = "participant_dead", "local participant gone"
             elif not live_ceremony_coordinators().get(os.path.normpath(d)):
-                act, why = "coordinator_dead", f"no live coordinator (attempts {int(r.get('coord_attempts') or 1)})"
+                attempts = int(r.get("coord_attempts") or 1)
+                # same order as supervise(): graphs.json published or retries used up -> fail
+                if os.path.exists(os.path.join(d, "graphs.json")):
+                    act, why = "fail", "coordinator died after graphs.json (cannot resume)"
+                elif attempts > COORD_MAX_RETRIES:
+                    act, why = "fail", f"coordinator died {attempts} times (max retries {COORD_MAX_RETRIES})"
+                else:
+                    act, why = "coordinator_dead", f"no live coordinator (attempts {attempts})"
         if act in ("fail", "participant_dead"):
             if os.path.exists(os.path.join(d, "final.json")):
                 act, why = "stall", why + "; final.json exists (kickoff kept)"
