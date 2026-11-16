@@ -222,11 +222,21 @@ fn snapshot_replay_14nov_tree_full() {
     let base = Node::load_snapshot(&snap, KeyRing::new(scheme)).unwrap();
     let txs: Vec<Tx> = serde_json::from_str(&std::fs::read_to_string(&txp).unwrap()).unwrap();
     println!("tip {} net {} txs {}", base.tip_height, base.cfg.network_id, txs.len());
-    assert_eq!(base.bitvm2_leaf_prune_from_height, u64::MAX, "2300 placeholder: not scheduled");
+    assert_eq!(base.bitvm2_leaf_prune_from_height, 904_000, "2300: Fix B armed at 904,000");
+    assert!(base.tip_height < 904_000, "snapshot is before activation");
+    assert!(!base.bitvm2_leaf_prune_at(base.tip_height + 1), "no prune before 904,000");
 
-    // 1. Before activation: consensus unchanged, every burn hits the full tree,
-    // and with no prune scheduled the packer may drop it (never debited).
+    // 1. Before activation: consensus unchanged, every burn hits the full tree.
+    // With 904,000 scheduled the burns wait in the mempool (not permanent);
+    // a binary with no prune height may drop them (never debited).
     let mut pre = Node::load_snapshot(&snap, KeyRing::new(scheme)).unwrap();
+    assert!(pre.bitvm2_leaf_prune_scheduled());
+    for tx in &txs {
+        let e = pre.dry_run_head(tx).unwrap_err();
+        assert!(crate::bridge::is_bitvm2_claim_tree_full(&e), "{e}");
+        assert!(!pre.is_permanent_tx_failure_here(&e), "scheduled: burns wait");
+    }
+    pre.bitvm2_leaf_prune_from_height = u64::MAX;
     let rail0 = serde_json::to_value(pre.bridge.rail(RAIL_BTC4).unwrap()).unwrap();
     for tx in &txs {
         let e = pre.dry_run_head(tx).unwrap_err();

@@ -3705,7 +3705,7 @@ pub struct Node {
     pub btc4_fork_slot_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::btc4_lend_scale_from_height`]; runtime only.
     pub btc4_lend_scale_from_height: u64,
-    /// Fix B (TBD): [`crate::params_v2::bitvm2_leaf_prune_from_height`]; runtime only.
+    /// Fix B (2300: 904,000): [`crate::params_v2::bitvm2_leaf_prune_from_height`]; runtime only.
     pub bitvm2_leaf_prune_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::orderbook_from_height`] (= the single
     /// 2.10.4 height); runtime only.

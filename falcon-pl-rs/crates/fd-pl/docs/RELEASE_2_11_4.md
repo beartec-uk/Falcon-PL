@@ -9,9 +9,10 @@ Combined release (PR #39 + PR #46, 15 Nov 2026; round-split recovery added
   full tree, before debit and at submit) is not a consensus change. Fix B
   (prune settled leaves; Disprove against the attest-time root) is a
   consensus change **gated by `TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT`**,
-  which ships as `u64::MAX` (never) until Scott picks a height. Until then
-  state is byte-identical to 2.11.3, so 2.11.3 and 2.11.4 seats interoperate.
-  Setting the height later needs every seat on a release that has it.
+  set to **904,000** (Scott, 16 Nov 2026). Below 904,000 state is
+  byte-identical to 2.11.3, so 2.11.3 and 2.11.4 seats interoperate until
+  then. **Every seat must run 2.11.4 before 904,000**; a 2.11.3 seat
+  diverges at the first ledger that prunes a leaf.
 * **Round-split recovery (16 Nov 2026, h=891419):** node-local liveness
   only. No payload, cert, wire, state-root or activation change.
 
@@ -56,9 +57,19 @@ packed. Details, tests and the snapshot replay are in PR #46.
 | A | `bridge.rs` `bitvm2_claim_tree_check`, `bridge_operators.rs` `btc4_withdraw`, `lib.rs` submit | A burn into a full tree fails with `bitvm2 claim tree full (n/16) on BTC4`, before any debit and at submit. Tree-full is a permanent packer failure only while no prune height is scheduled; once it is scheduled, queued burns wait for a free leaf. |
 | B | `bridge.rs` `prune_settled_bitvm2_leaves`, `disprove_bitvm2_v2_ex`; `bridge_operators.rs` `bridge_finalize_rail`; `fd-pl-bitvm2` `verify_stored_withdraw_attest_vk_bytes` | From the prune height (also needs M1): settled claims' leaves (PaidOptimistic/Refunded/Disproved) are pruned every ledger; in-window claims keep their leaf until the 21,600-ledger window closes. Disprove checks the stored proof against its attest-time root, so honest claims stay valid after appends/prunes. |
 
-Activation: `TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT = u64::MAX`
-(placeholder). It must be ≥ the M1 height (692,000) and far enough out for all
-seats to upgrade first.
+Activation: `TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT = 904_000` (Scott,
+16 Nov 2026; ≥ the M1 height 692,000). At 03:36 GMT on 16 Nov 2026 the tip was
+891,771: 12,229 ledgers to go, so about 29.6 h at the observed 8.7 s/ledger
+(Tue 17 Nov ~09:10 GMT) or 34 h at 10 s (~13:35 GMT). Blocks are load-driven,
+so it arrives sooner under heavy load. Every seat must be on 2.11.4 well
+before then (aim: all seats by Tue 17 Nov 06:00 GMT); a seat still on 2.11.3
+at 904,000 forks off at the first prune.
+
+Before 904,000, a 2.11.4 seat already treats `claim tree full` as temporary
+(the burn waits in its mempool, never debited); a 2.11.3 seat drops it as
+permanent. That is local mempool policy, not block validity. The queued
+burns apply after 904,000, once settled leaves free (snapshot replay: 3 of 16
+leaves free on the 14 Nov tree).
 
 ## Round-split recovery (stall at h=891419, 15 Nov 07:07 GMT → 16 Nov 02:41 GMT)
 
