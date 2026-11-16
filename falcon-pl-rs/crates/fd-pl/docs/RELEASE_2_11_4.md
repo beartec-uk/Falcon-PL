@@ -1,6 +1,7 @@
-# Falcon PL 2.11.4: stall prevention + BTC4 claim-tree capacity
+# Falcon PL 2.11.4: stall prevention + BTC4 claim-tree capacity + round-split recovery
 
-Combined release (PR #39 + PR #46, 15 Nov 2026).
+Combined release (PR #39 + PR #46, 15 Nov 2026; round-split recovery added
+16 Nov 2026 after the h=891419 stall).
 
 * **Stall prevention (PR #39, 12 Nov 2026, h=869559):** no consensus-rule,
   wire, state-root or activation change.
@@ -11,6 +12,8 @@ Combined release (PR #39 + PR #46, 15 Nov 2026).
   which ships as `u64::MAX` (never) until Scott picks a height. Until then
   state is byte-identical to 2.11.3, so 2.11.3 and 2.11.4 seats interoperate.
   Setting the height later needs every seat on a release that has it.
+* **Round-split recovery (16 Nov 2026, h=891419):** node-local liveness
+  only. No payload, cert, wire, state-root or activation change.
 
 ## Incident (15:13–15:36 GMT, ~22 min at h=869559)
 
@@ -57,19 +60,81 @@ Activation: `TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT = u64::MAX`
 (placeholder). It must be ≥ the M1 height (692,000) and far enough out for all
 seats to upgrade first.
 
-## Not in this release (recommended design)
+## Round-split recovery (stall at h=891419, 15 Nov 07:07 GMT → 16 Nov 02:41 GMT)
 
-**D part 2 — adopt an already-applied round QC.** A seat that never applied
-the round-r QC (falcon-node in the incident) still votes round r while the
-rest vote r+1. `apply_round_advance` drops the VC votes for rounds ≤ r, so no
-seat can re-gossip the QC. Design: keep the 4 signed VC votes that formed the
-applied QC for the open height (`applied_round_qc: (height, round, voters →
-sig)`), re-fan them with the seat's own VC vote, and let `vote_round_change`
-accept a full signed QC for round r' > cur as a jump (signatures checked with
-`accept_vote_sig`, committee frozen for the height). This only moves a seat
-to a round 4-of-6 already entered, so it is the same rule as today's "jump on
-QC" with the evidence made durable. Needs a wire field (backward-compatible
-`#[serde(default)]`) and a multi-seat test; not shipped in a hotfix.
+Committee for 891420: v10, v12, crypto-dashboard, v6, v1, scottspersonalnode
+(4 of 6). v10 was lagging; its catch-up requests were dropped
+(`NeedSnapshot dropped`, `catch-up lane full`). v12, crypto-dashboard, v6 and
+v1 applied the round-1 ViewChange QC at 07:07:56; v10 and scottspersonalnode
+never received those votes and stayed on round 0. v12 proposed `a4c12304…`
+in round 1. v1 counted the round-1 OKs of v6, v12 and crypto-dashboard
+(`soft=false` on each); its own OK was never counted anywhere, and its pipes
+were being shed (`shed stuck inbound/outbound pipe`). From then on:
+
+* v10 and scottspersonalnode voted round 1 every ~10 s (`view-change vote
+  h=891420 round=1 applied=false`), 2 votes;
+* the round-1 seats voted round 2 (`round=2 applied=false`), never 4
+  delivered votes;
+* 2 + 3 < 4, for 19.5 hours, until v1 was restarted.
+
+Root cause in code (2.11.4 before this change):
+
+1. `consensus_rounds.rs` `apply_round_advance`: `view_change_votes` for
+   rounds ≤ r are deleted the moment the round-r QC is applied, and
+   `view_change_votes` (`lib.rs`) holds voter ids only, no signatures. The
+   evidence for round r is gone on every seat that has it.
+2. `falcon_pl_node.rs` `WireMsg::ViewChange`: a vote is re-fanned only when
+   it is new to the receiver (`vote_new`). `maybe_round_timeout_vote` then
+   votes r+1 only. Nobody ever sends a round-r vote again, so a seat that
+   missed them can only reach round r with the other laggards (2 of 6).
+3. `vote_round_change` already lets a seat jump to any higher round
+   (≤ +64) at a verified 4-of-6, so the round-0 seats *would* have adopted
+   round 1, or round 2, if 4 signed votes for either had reached them.
+4. `falcon_pl_node.rs` `WireMsg::LedgerOk`: an OK is re-fanned once, when
+   new and not yet soft, and never re-sent. Soft needs 4 OKs in **one**
+   round (`retally_round`). An OK lost on a shed pipe, or a seat's own OK
+   not cast in the round it later sits in, is never re-tallied anywhere.
+
+Fix (E):
+
+| | Where | Change |
+|---|---|---|
+| E | `lib.rs` `vc_vote_sigs`, `applied_round_qc`, `last_round_regossip_ms`, `vote_view_change_ex`; `consensus_rounds.rs` `note_vc_vote_sig`, `capture_applied_round_qc`, `apply_round_advance`, `stalled_round_regossip`, `round_regossip_interval_ms`; `falcon_pl_node.rs` tick loop | Keep the verified signature of each round-scoped VC vote at the open height. When a round QC is applied, keep its 4-of-6 signed votes (`applied_round_qc`; only a full quorum, never a partial set). While the open height is stalled with work (round open ≥ one proposal timeout, 36 s on 2300; at most once per interval; never while lagging), re-send those VC votes as ordinary `ViewChange` messages, plus every committee `LedgerOk` this seat holds for its current round (the voters' original signatures), plus its own OK for the staged body if it has not cast one in this round (normal `own_ok_vote` lock rules). |
+
+Safety: a seat still moves rounds only through `vote_view_change_ex` →
+`vote_round_change`: committee voter, signature checked with
+`accept_vote_sig`, same tip and height, 4-of-6 for that exact round. A
+re-sent vote is byte-identical to the original. OKs are counted by the
+unchanged `record_round_ok` (one vote per voter per round, equivocation
+evidence unchanged) and soft still needs 4 in one round with the lock rule.
+The only new signature is a seat's own OK under the same lock rules it would
+have signed at staging. So it adds no new way to form a cert and no fork
+risk.
+
+Activation: **none needed.** Nothing that is signed, stored in state, carried
+in a ledger or cert, or validated by other seats changes; old and new seats
+treat the re-sent messages as ordinary (duplicate or late) votes. It takes
+effect on each seat as soon as that seat runs 2.11.4; even one upgraded seat
+holding the QC can unstick the laggards. Load: ≤ 12 small vote messages per
+seat per 36 s, and only while stalled.
+
+Tests (`round_split_tests.rs`, signed votes through an in-process mesh that
+mirrors the wire handlers): the exact split (6 members, 4 needed, order[0]
+and order[5] stuck on round 0, round-1 OKs landing 2 s and 3 s apart, the
+4th round-1 seat cut off) stays stuck for 30 simulated minutes without
+re-gossip (exactly 3 round-2 VC votes at the round-0 seats) and commits the
+round-1 body with a round-1 cert with it; 3 votes, foreign or garbage
+signatures, a wrong tip/height or a non-committee voter never move a seat;
+re-gossip waits for a stall, is rate-limited, silent while lagging or idle;
+a missing own OK is signed once and sent.
+
+## Not in this release
+
+D part 2 as designed earlier (a new wire field carrying a full QC) is not
+needed: E re-sends the original VC votes as ordinary messages instead.
+`applied_round_qc` is not persisted, so a restarted seat cannot re-send the
+QC itself (it re-enters its round from its own vote, D part 1); any seat that
+did not restart can.
 
 ## Operator upgrade (external seats: nodesafe, crypto-dashboard, scottspersonalnode)
 

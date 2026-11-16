@@ -45,10 +45,48 @@
 //!    small own-vote journal, so a restarted seat keeps its lock and never
 //!    signs a second hash in a round it already voted in. Re-gossiped old
 //!    votes stay in their own round and cannot block a newer round.
+//! 9. **Round-split recovery (2.11.4, h=891419).** A seat keeps the signed
+//!    ViewChange votes that formed the round QC it applied and, while the
+//!    height stays stalled, re-sends them together with the committee OKs of
+//!    its current round ([`Node::stalled_round_regossip`]). A seat that
+//!    missed the QC (still on round r−1) applies round r only once it has
+//!    verified 4-of-6 signed votes for it, the same rule as an on-time QC;
+//!    OKs cast at different times combine into one round's soft QC.
+//!    Node-local liveness only: no payload, cert, wire or state change.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{AcceptResult, ConsensusStall, Ledger, LivenessStatus, Node};
+
+/// 2.11.4: the verified signed ViewChange votes behind a round QC this seat
+/// applied at the open height (`votes`: committee voter → signature).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppliedRoundQc {
+    pub height: u64,
+    pub tip_hash: String,
+    pub round: u64,
+    pub votes: BTreeMap<String, String>,
+}
+
+/// 2.11.4: one vote to re-send while a round is stalled. Maps 1:1 onto the
+/// existing `ViewChange` / `LedgerOk` wire messages (no new wire type).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoundRegossip {
+    ViewChange {
+        height: u64,
+        tip_hash: String,
+        round: u64,
+        voter: String,
+        signature: String,
+    },
+    Ok {
+        height: u64,
+        ledger_hash: String,
+        voter: String,
+        signature: String,
+        round: u64,
+    },
+}
 
 impl Node {
     /// Round used for re-certifying an already committed tip (cert rebuild
@@ -491,6 +529,185 @@ impl Node {
         (false, fresh)
     }
 
+    /// 2.11.4: remember the verified signature of a round-scoped ViewChange
+    /// vote at the open height (only rounds this seat can still enter).
+    pub(crate) fn note_vc_vote_sig(&mut self, height: u64, round: u64, voter: &str, signature: &str) {
+        let cur = self.height_view_round;
+        if height != self.tip_height.saturating_add(1)
+            || round <= cur
+            || round > cur.saturating_add(Self::MAX_ROUND_JUMP)
+        {
+            return;
+        }
+        self.vc_vote_sigs.retain(|h, _| *h == height);
+        let rounds = self.vc_vote_sigs.entry(height).or_default();
+        rounds
+            .entry(round)
+            .or_default()
+            .entry(voter.to_string())
+            .or_insert_with(|| signature.to_string());
+        while rounds.len() > Self::ROUND_HISTORY {
+            let Some(lowest) = rounds.keys().next().copied() else {
+                break;
+            };
+            if lowest == round {
+                break;
+            }
+            rounds.remove(&lowest);
+        }
+    }
+
+    /// 2.11.4: store the committee VC votes (with signatures) that make up the
+    /// QC for (`height`, `round`). Only a full quorum is kept; a partial set
+    /// is never evidence.
+    fn capture_applied_round_qc(&mut self, height: u64, round: u64) {
+        let qc = self.qc_voters();
+        let votes: BTreeMap<String, String> = self
+            .vc_vote_sigs
+            .get(&height)
+            .and_then(|m| m.get(&round))
+            .map(|v| {
+                v.iter()
+                    .filter(|(id, _)| qc.is_empty() || qc.iter().any(|c| c == *id))
+                    .map(|(id, sig)| (id.clone(), sig.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if votes.len() >= self.commit_votes_needed() {
+            self.applied_round_qc = Some(AppliedRoundQc {
+                height,
+                tip_hash: self.tip_hash.clone(),
+                round,
+                votes,
+            });
+        }
+    }
+
+    /// 2.11.4 (h=891419 round split): what this seat re-sends while the open
+    /// height is stalled, at most once per [`Self::round_regossip_interval_ms`].
+    ///
+    /// * The signed ViewChange votes behind the round QC this seat applied
+    ///   (`applied_round_qc`). A seat still on a lower round counts them with
+    ///   the normal `vote_view_change_ex` rules (committee member, signature,
+    ///   same tip and height) and applies the round only at 4-of-6, exactly
+    ///   as if the original votes had arrived on time.
+    /// * Every committee OK it holds for the open height in its current round
+    ///   (the voters' own signatures, unchanged), so OKs cast at different
+    ///   times, or lost on a shed pipe, combine into one round's soft QC.
+    /// * Its own OK for the staged body in the current round if it has not
+    ///   cast one yet (same `own_ok_vote` lock rules as staging).
+    ///
+    /// Nothing new is signed except that own OK; no message type, payload or
+    /// cert changes. Seats on any version treat these as ordinary votes.
+    pub fn stalled_round_regossip(&mut self) -> Vec<RoundRegossip> {
+        let height = self.tip_height.saturating_add(1);
+        if !self.vote_rounds_at(height) || self.still_lagging() {
+            return Vec::new();
+        }
+        let pending_here = self
+            .pending_proposal
+            .as_ref()
+            .map(|p| p.height == height)
+            .unwrap_or(false);
+        let qc_here = self
+            .applied_round_qc
+            .as_ref()
+            .map(|q| q.height == height && q.tip_hash == self.tip_hash)
+            .unwrap_or(false);
+        if !(pending_here || qc_here || !self.open_bodies.is_empty() || self.network_has_pack_work()) {
+            return Vec::new();
+        }
+        let interval = self.round_regossip_interval_ms();
+        let open_since = self.round_open_ms.max(self.work_seen_since_ms);
+        if self.now_ms.saturating_sub(open_since) < interval
+            || (self.last_round_regossip_ms > 0
+                && self.now_ms.saturating_sub(self.last_round_regossip_ms) < interval)
+        {
+            return Vec::new();
+        }
+        self.last_round_regossip_ms = self.now_ms.max(1);
+        let need_sig = self.cfg.require_vote_sigs;
+        let mut out = Vec::new();
+        if qc_here {
+            if let Some(q) = self.applied_round_qc.clone() {
+                for (voter, signature) in q.votes {
+                    if need_sig && signature.is_empty() {
+                        continue;
+                    }
+                    out.push(RoundRegossip::ViewChange {
+                        height,
+                        tip_hash: q.tip_hash.clone(),
+                        round: q.round,
+                        voter,
+                        signature,
+                    });
+                }
+            }
+        }
+        let round = self.height_view_round;
+        if let Some(hash) = self
+            .pending_proposal
+            .as_ref()
+            .filter(|p| p.height == height)
+            .map(|p| p.ledger_hash.clone())
+        {
+            let me = self.id.clone();
+            let have_own = self
+                .round_votes
+                .get(&height)
+                .and_then(|m| m.get(&round))
+                .map(|v| v.contains_key(&me))
+                .unwrap_or(false);
+            if !have_own && self.in_committee(&me) {
+                if let Some((r, sig)) = self.own_ok_vote(height, &hash) {
+                    let _ = self.vote_ok_round_ex(&hash, &me, &sig, r);
+                    out.push(RoundRegossip::Ok {
+                        height,
+                        ledger_hash: hash.clone(),
+                        voter: me.clone(),
+                        signature: sig,
+                        round: r,
+                    });
+                    if self.tip_height >= height {
+                        // Our OK completed the soft QC: send it, nothing else.
+                        return out;
+                    }
+                }
+            }
+        }
+        let qc = self.qc_voters();
+        let sent_own = out
+            .iter()
+            .any(|m| matches!(m, RoundRegossip::Ok { voter, .. } if *voter == self.id));
+        if let Some(v) = self.round_votes.get(&height).and_then(|m| m.get(&round)) {
+            for (voter, (hash, sig)) in v {
+                if !(qc.is_empty() || qc.iter().any(|c| c == voter)) {
+                    continue;
+                }
+                if sent_own && *voter == self.id {
+                    continue;
+                }
+                if need_sig && sig.is_empty() {
+                    continue;
+                }
+                out.push(RoundRegossip::Ok {
+                    height,
+                    ledger_hash: hash.clone(),
+                    voter: voter.clone(),
+                    signature: sig.clone(),
+                    round,
+                });
+            }
+        }
+        out
+    }
+
+    /// 2.11.4: re-gossip cadence for a stalled round (one proposal timeout,
+    /// 36 s on 2300): ≤ 12 small vote messages per seat per interval.
+    pub fn round_regossip_interval_ms(&self) -> u64 {
+        self.proposal_timeout_ms().max(1_000)
+    }
+
     /// Enter `round` at `height` after a ViewChange QC.
     pub(crate) fn apply_round_advance(&mut self, height: u64, round: u64) {
         if height != self.tip_height.saturating_add(1) || round <= self.height_view_round {
@@ -498,7 +715,14 @@ impl Node {
         }
         let prev = self.height_view_round;
         self.height_view_round = round;
+        // 2.11.4 (h=891419): keep the signed votes that formed this QC before
+        // the per-round tallies are dropped, so a seat that missed them can
+        // still be shown the QC (see `stalled_round_regossip`).
+        self.capture_applied_round_qc(height, round);
         if let Some(m) = self.view_change_votes.get_mut(&height) {
+            m.retain(|r, _| *r > round);
+        }
+        if let Some(m) = self.vc_vote_sigs.get_mut(&height) {
             m.retain(|r, _| *r > round);
         }
         self.stall = None;

@@ -3549,6 +3549,63 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                // 2.11.4 (h=891419 round split): while the open height is
+                // stalled, re-send the signed VC votes behind our applied round
+                // QC and the committee OKs of our current round, so a seat that
+                // missed them adopts the round (only at a verified 4-of-6) and
+                // late OKs combine. Rate-limited inside the node.
+                {
+                    let mut n = shared_c.node.lock();
+                    let msgs = n.stalled_round_regossip();
+                    if !msgs.is_empty() {
+                        let h = n.tip_height.saturating_add(1);
+                        let round = n.height_view_round;
+                        drop(n);
+                        let mut vcs = 0usize;
+                        let mut oks = 0usize;
+                        for m in msgs {
+                            let wire = match m {
+                                fd_pl::RoundRegossip::ViewChange {
+                                    height,
+                                    tip_hash,
+                                    round,
+                                    voter,
+                                    signature,
+                                } => {
+                                    vcs += 1;
+                                    WireMsg::ViewChange {
+                                        height,
+                                        tip_hash,
+                                        round,
+                                        voter,
+                                        signature,
+                                    }
+                                }
+                                fd_pl::RoundRegossip::Ok {
+                                    height,
+                                    ledger_hash,
+                                    voter,
+                                    signature,
+                                    round,
+                                } => {
+                                    oks += 1;
+                                    WireMsg::LedgerOk {
+                                        height,
+                                        ledger_hash,
+                                        voter,
+                                        signature,
+                                        round,
+                                    }
+                                }
+                            };
+                            if let Ok(line) = serde_json::to_string(&wire) {
+                                shared_c.fan_line(&fanout, line + "\n");
+                            }
+                        }
+                        info!("round re-gossip h={h} round={round} vc={vcs} oks={oks}");
+                    }
+                }
+
                 // v2.5.0: proposal-timeout view-change (height-local recovery).
                 {
                     let mut n = shared_c.node.lock();

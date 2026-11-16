@@ -355,6 +355,7 @@ pub mod names;
 pub mod snapshot;
 pub mod vault;
 pub mod consensus_rounds;
+pub use consensus_rounds::{AppliedRoundQc, RoundRegossip};
 pub mod params_v2;
 pub mod operator_registry;
 pub mod bridge_operators;
@@ -3646,6 +3647,16 @@ pub struct Node {
     pub view_change_votes: HashMap<u64, HashMap<u64, BTreeSet<String>>>,
     /// Rate-limit local ViewChange casting.
     pub last_view_change_vote_ms: u64,
+    /// 2.11.4 (h=891419 round split): signed ViewChange votes at the open
+    /// height, `height → round → voter → signature`, so the votes that formed
+    /// a round QC survive `apply_round_advance` and can be re-gossiped.
+    /// Node-local, never persisted, never part of state.
+    pub vc_vote_sigs: HashMap<u64, BTreeMap<u64, BTreeMap<String, String>>>,
+    /// 2.11.4: the verified 4-of-6 signed ViewChange votes behind the last
+    /// round QC this seat applied at the open height (re-gossip evidence).
+    pub applied_round_qc: Option<crate::consensus_rounds::AppliedRoundQc>,
+    /// 2.11.4: last stalled-round re-gossip (ms, node clock).
+    pub last_round_regossip_ms: u64,
     /// Packers who already produced a body at `height`. Survives view-change
     /// so the same seat cannot reseal a second hash (v2.7.6).
     pub height_sealers: HashMap<u64, BTreeSet<String>>,
@@ -3952,6 +3963,9 @@ impl Node {
             height_view_round: 0,
             view_change_votes: HashMap::new(),
             last_view_change_vote_ms: 0,
+            vc_vote_sigs: HashMap::new(),
+            applied_round_qc: None,
+            last_round_regossip_ms: 0,
             height_sealers: HashMap::new(),
             certs: BTreeMap::new(),
             ok_by_height_voter: HashMap::new(),
@@ -8706,6 +8720,10 @@ impl Node {
             self.pending_rounds = 0;
         }
         self.view_change_votes.retain(|h, _| *h >= open.saturating_sub(2));
+        self.vc_vote_sigs.retain(|h, _| *h == open);
+        if self.applied_round_qc.as_ref().map(|q| q.height != open).unwrap_or(false) {
+            self.applied_round_qc = None;
+        }
     }
 
     /// ONLINE hash tag for lottery seed (frozen for open height when available).
@@ -8966,6 +8984,9 @@ impl Node {
             return (false, false);
         }
         if self.vote_rounds_at(height) {
+            // 2.11.4: keep the verified signature so an applied QC can be
+            // re-gossiped to seats that missed it (h=891419 round split).
+            self.note_vc_vote_sig(height, round, voter, signature);
             return self.vote_round_change(height, round, voter);
         }
         // Only the next round is votable (no jump-ahead storms).
@@ -24539,3 +24560,5 @@ mod orderbook_tests;
 
 #[cfg(test)]
 mod bitvm2_tree_capacity_tests;
+#[cfg(test)]
+mod round_split_tests;
