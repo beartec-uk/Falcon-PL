@@ -117,7 +117,7 @@ function renderBal(b){const x=b.balance;if(!x){$("bal-acct").textContent="· n/a
  $("b-liq").textContent=fmt(n("liquid"));$("b-bond").textContent=fmt(n("bonded"));$("b-rwd").textContent=fmt(n("pending_rewards"));
  $("b-srw").textContent=fmt(n("seat_claimable"));$("b-srws").textContent=x.seat_payout?"FPL · auto payout → "+x.seat_payout:"FPL · claim-seat";
  $("b-unb").textContent=fmt(n("unbonding"));$("b-unb").className="v "+(n("unbonding")>0?"w":"muted");
- $("b-unbs").textContent=n("unbonding")>0&&x.unbond_ready_ms?"FPL · ready "+new Date(x.unbond_ready_ms).toLocaleString("en-GB"):"FPL";
+ $("b-unbs").textContent=n("unbonding")>0?(x.unbond_ready?"FPL · ready to complete":"FPL · "+(x.unbond_remaining_ms?(x.unbond_remaining_ms/864e5).toFixed(1)+" chain days left":"cooling down")):"FPL";
  $("b-ba").textContent=x.bond_account_liquid==null?"–":fmt(x.bond_account_liquid);$("b-bas").textContent=x.bond_account?x.bond_account+" · FPL":"same as node id";
  $("b-tot").textContent=fmt(n("liquid")+n("bonded")+n("pending_rewards")+n("seat_claimable")+n("unbonding"))}
 function render(b){$("down").style.display="none";renderBal(b);

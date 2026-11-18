@@ -312,6 +312,12 @@ impl crate::Node {
             "bonded": seat.map(|v| v.bond).unwrap_or(0),
             "unbonding": seat.map(|v| v.unbonding).unwrap_or(0),
             "unbond_ready_ms": seat.map(|v| v.unbond_ready_ms).unwrap_or(0),
+            // Chain time (tip `sealed_at`), the clock CompleteUnbond is checked against.
+            "unbond_ready": seat.map(|v| v.unbonding > 0 && self.parent_sealed_at() >= v.unbond_ready_ms).unwrap_or(false),
+            "unbond_remaining_ms": seat
+                .filter(|v| v.unbonding > 0)
+                .map(|v| v.unbond_ready_ms.saturating_sub(self.parent_sealed_at()))
+                .unwrap_or(0),
             "bond_account": bond_account,
             "bond_account_liquid": bond_account.as_deref().map(liquid),
         })
@@ -801,6 +807,8 @@ pub mod balance {
             "bonded": seat.map(|v| u(v, "/bond")).unwrap_or(0),
             "unbonding": seat.map(|v| u(v, "/unbonding")).unwrap_or(0),
             "unbond_ready_ms": seat.map(|v| u(v, "/unbond_ready_ms")).unwrap_or(0),
+            "unbond_ready": seat.and_then(|v| v.get("unbond_ready")).and_then(|x| x.as_bool()).unwrap_or(false),
+            "unbond_remaining_ms": seat.map(|v| u(v, "/unbond_remaining_ms")).unwrap_or(0),
             "bond_account": bond_account,
             "bond_account_liquid": Value::Null,
             "seat": seat.and_then(|v| v.get("id")).cloned().unwrap_or(Value::Null),
