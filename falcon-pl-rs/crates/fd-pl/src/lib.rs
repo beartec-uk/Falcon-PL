@@ -15397,7 +15397,16 @@ impl Node {
                     "bond": v.bond,
                     "unbonding": v.unbonding,
                     "unbond_ready_ms": v.unbond_ready_ms,
-                    "unbond_ready": v.unbonding > 0 && self.now_ms >= v.unbond_ready_ms,
+                    // `unbond_ready_ms` is chain time (the ledger `sealed_at` the
+                    // Unbond applied at + cooldown) and CompleteUnbond is checked
+                    // against chain time. Compare with the tip's `sealed_at`, not
+                    // this node's local clock (which can run days ahead of it).
+                    "unbond_ready": v.unbonding > 0 && self.parent_sealed_at() >= v.unbond_ready_ms,
+                    "unbond_remaining_ms": if v.unbonding > 0 {
+                        v.unbond_ready_ms.saturating_sub(self.parent_sealed_at())
+                    } else {
+                        0
+                    },
                     "bond_account": v.bond_account,
                     "jailed": v.jailed,
                     "jail_count": v.jail_count,
