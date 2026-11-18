@@ -1,0 +1,16 @@
+# Copy of the live falcon1 unit (2026-11-18). Not installed by anything in this
+# repo; deploy by hand after review (see scripts/pl-btc4-header-submitter.py).
+[Unit]
+Description=Falcon PL Fast BTC4 SPV Header Submitter (Testnet4)
+After=network-online.target falcon-pl-node.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /home/falcon/falcon-pl-public-testnet-2300/scripts/pl-btc4-header-submitter.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
