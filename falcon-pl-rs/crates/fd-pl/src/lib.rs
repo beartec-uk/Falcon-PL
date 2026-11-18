@@ -3703,6 +3703,8 @@ pub struct Node {
     pub btc4_fork_fix_from_height: u64,
     /// Later-height BTC4 fork-slot replacement; runtime only.
     pub btc4_fork_slot_from_height: u64,
+    /// [`crate::params_v2::btc4_most_work_from_height`]; runtime only.
+    pub btc4_most_work_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::btc4_lend_scale_from_height`]; runtime only.
     pub btc4_lend_scale_from_height: u64,
     /// Fix B (2300: 904,000): [`crate::params_v2::bitvm2_leaf_prune_from_height`]; runtime only.
@@ -3843,6 +3845,7 @@ impl Node {
         let empty_block_from_height = crate::params_v2::empty_block_from_height(cfg.network_id);
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
+        let btc4_most_work_from_height = crate::params_v2::btc4_most_work_from_height(cfg.network_id);
         let btc4_lend_scale_from_height = crate::params_v2::btc4_lend_scale_from_height(cfg.network_id);
         let bitvm2_leaf_prune_from_height = crate::params_v2::bitvm2_leaf_prune_from_height(cfg.network_id);
         let orderbook_from_height = crate::params_v2::orderbook_from_height(cfg.network_id);
@@ -3987,6 +3990,7 @@ impl Node {
             empty_block_from_height,
             btc4_fork_fix_from_height,
             btc4_fork_slot_from_height,
+            btc4_most_work_from_height,
             btc4_lend_scale_from_height,
             bitvm2_leaf_prune_from_height,
             orderbook_from_height,
@@ -4345,6 +4349,25 @@ impl Node {
     /// Later-height BTC4 fork-slot replacement for the ledger being applied now (`tip + 1`).
     pub fn btc4_fork_slot_open(&self) -> bool {
         self.tip_height.saturating_add(1) >= self.btc4_fork_slot_from_height
+    }
+
+    /// BTC4 most-work rail for the ledger applied now (`tip + 1`), consensus
+    /// path: the 2-hour future limit uses the parent ledger's attested UTC
+    /// (`sealed_utc_ms`, only non-zero once `H_utc` is armed). See
+    /// [`crate::bridge::MostWork`].
+    pub fn btc4_most_work_apply(&self) -> Option<crate::bridge::MostWork> {
+        if self.tip_height.saturating_add(1) < self.btc4_most_work_from_height {
+            return None;
+        }
+        let utc = self.parent_sealed_utc();
+        Some(crate::bridge::MostWork { utc_now_secs: (utc > 0).then_some(utc / 1000) })
+    }
+
+    /// As [`Self::btc4_most_work_apply`] for mempool admission (local only):
+    /// the future limit uses this seat's OS wall clock.
+    pub fn btc4_most_work_admit(&self) -> Option<crate::bridge::MostWork> {
+        self.btc4_most_work_apply()
+            .map(|_| crate::bridge::MostWork { utc_now_secs: Some(self.utc_pack_clock.now_unix_ms() / 1000) })
     }
 
     /// v2.10.4: BTC4 lend markets pin 1e8 raw/coin for the ledger applied now.
@@ -6997,7 +7020,8 @@ impl Node {
         let strict = self.rv2_open();
         let fork_fix = self.btc4_fork_fix_open();
         let slot_fix = self.btc4_fork_slot_open();
-        let progressed = self.bridge.rail_mut(asset)?.submit_header_ex3(header, strict, fork_fix, slot_fix)?;
+        let most_work = self.btc4_most_work_apply();
+        let progressed = self.bridge.rail_mut(asset)?.submit_header_ex4(header, strict, fork_fix, slot_fix, most_work)?;
         if let Some(w) = watcher {
             if progressed {
                 self.watcher_credit(w, 1, true);
@@ -7941,13 +7965,14 @@ impl Node {
                     let strict = self.rv2_open();
                     let fork_fix = self.btc4_fork_fix_open();
                     let slot_fix = self.btc4_fork_slot_open();
-                    if let Err(e) = probe.submit_header_ex3(crate::bridge::RailHeader {
+                    let most_work = self.btc4_most_work_admit();
+                    if let Err(e) = probe.submit_header_ex4(crate::bridge::RailHeader {
                         height: *height,
                         hash: hash.clone(),
                         parent_hash: parent_hash.clone(),
                         merkle_root: merkle_root.clone(),
                         raw: raw.clone(),
-                    }, strict, fork_fix, slot_fix) {
+                    }, strict, fork_fix, slot_fix, most_work) {
                         if self.is_permanent_tx_failure_here(&e) {
                             return Err(e);
                         }
@@ -8063,6 +8088,7 @@ impl Node {
         let strict = self.rv2_open();
         let fork_fix = self.btc4_fork_fix_open();
         let slot_fix = self.btc4_fork_slot_open();
+        let most_work = self.btc4_most_work_admit();
         for sibs in by_seq.values() {
             let mut ok = false;
             for t in sibs {
@@ -8076,13 +8102,13 @@ impl Node {
                         raw,
                     } if asset == &rail.asset => {
                         if probe
-                            .submit_header_ex3(crate::bridge::RailHeader {
+                            .submit_header_ex4(crate::bridge::RailHeader {
                                 height: *height,
                                 hash: hash.clone(),
                                 parent_hash: parent_hash.clone(),
                                 merkle_root: merkle_root.clone(),
                                 raw: raw.clone(),
-                            }, strict, fork_fix, slot_fix)
+                            }, strict, fork_fix, slot_fix, most_work)
                             .is_ok()
                         {
                             ok = true;
@@ -15169,6 +15195,8 @@ impl Node {
                 // v2.10.1: status only (non-consensus) view of pending BTC branches.
                 "btc_fork": crate::bridge::RailState::btc_branch_summary(&r.btc_fork),
                 "btc_fork_alt": crate::bridge::RailState::btc_branch_summary(&r.btc_fork_alt),
+                // Most-work rail: status-only view of stored side branches.
+                "btc_side": r.btc_side_summary(),
                 "header_tail": r.headers.iter().rev().take(64).map(|(hgt, hdr)| serde_json::json!({
                     "height": hgt,
                     "hash": hdr.hash,
@@ -24553,6 +24581,8 @@ mod v2_10_activation_tests;
 
 #[cfg(test)]
 mod btc4_fork_fix_tests;
+#[cfg(test)]
+mod btc4_most_work_tests;
 #[cfg(test)]
 mod btc4_lend_scale_tests;
 #[cfg(test)]

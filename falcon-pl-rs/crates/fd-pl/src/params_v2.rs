@@ -401,6 +401,22 @@ pub const TESTNET_2300_BTC4_FORK_FIX_HEIGHT: u64 = 775_000;
 /// the header this rule accepts. Non-2300: `FPL_BTC4_FORK_SLOT_FROM_HEIGHT`.
 pub const TESTNET_2300_BTC4_FORK_SLOT_HEIGHT: u64 = 860_000;
 
+/// BTC4 most-work header rail + testnet4 header timestamp/difficulty checks
+/// (2300). From this ledger height the BTC4 rail keeps every valid side header
+/// (bounded store, `bridge::BTC_SIDE_DEPTH` / `BTC_SIDE_MAX`) and follows the
+/// branch with the most cumulative work; equal work keeps the current main
+/// chain (first-seen). Headers must also pass Bitcoin Core's testnet4
+/// contextual checks: time > median of the previous 11, time ≤ ledger chain
+/// time + 2h, BIP94 timewarp (≥ parent − 600s at a retarget), exact nBits
+/// (20-minute min-difficulty rule, BIP94 retarget), version ≥ 4, nBits within
+/// the pow limit. Replays the 2026-11-17 stall at 161859 (three equal-work
+/// branches; the canonical 161859 had a parent inside the pending fork, so
+/// neither slot could hold it).
+///
+/// PLACEHOLDER: `u64::MAX` (never) until Scott picks the height. All seats
+/// must run this binary before H. Non-2300: `FPL_BTC4_MOST_WORK_FROM_HEIGHT`.
+pub const TESTNET_2300_BTC4_MOST_WORK_HEIGHT: u64 = u64::MAX;
+
 /// v2.10.3 (TBD): Hello minimum-release activation (2300). From this local tip
 /// a peer must advertise `release_version >= HELLO_MIN_RELEASE`. Local only
 /// (session admission), not consensus. **PLACEHOLDER / TBD**: `u64::MAX` = never.
@@ -493,6 +509,15 @@ pub fn btc4_fork_slot_from_height(network_id: u32) -> u64 {
         return TESTNET_2300_BTC4_FORK_SLOT_HEIGHT;
     }
     env_u64("FPL_BTC4_FORK_SLOT_FROM_HEIGHT").unwrap_or(u64::MAX)
+}
+
+/// BTC4 most-work rail activation (`u64::MAX` = never). Non-2300 networks may
+/// set `FPL_BTC4_MOST_WORK_FROM_HEIGHT` (devnets / tests).
+pub fn btc4_most_work_from_height(network_id: u32) -> u64 {
+    if network_id == NETWORK_ID_PUBLIC_TESTNET_2300 {
+        return TESTNET_2300_BTC4_MOST_WORK_HEIGHT;
+    }
+    env_u64("FPL_BTC4_MOST_WORK_FROM_HEIGHT").unwrap_or(u64::MAX)
 }
 
 /// External-address activation height (`u64::MAX` = never). Non-2300 networks
