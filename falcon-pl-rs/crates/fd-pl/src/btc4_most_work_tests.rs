@@ -431,9 +431,11 @@ fn side_store_is_bounded_and_pruned_by_depth() {
 }
 
 #[test]
-fn activation_placeholder_is_never() {
-    assert_eq!(crate::params_v2::TESTNET_2300_BTC4_MOST_WORK_HEIGHT, u64::MAX);
-    assert_eq!(crate::params_v2::btc4_most_work_from_height(crate::NETWORK_ID_PUBLIC_TESTNET_2300), u64::MAX);
+fn activation_height_is_930000_on_2300() {
+    assert_eq!(crate::params_v2::TESTNET_2300_BTC4_MOST_WORK_HEIGHT, 930_000);
+    assert_eq!(crate::params_v2::btc4_most_work_from_height(crate::NETWORK_ID_PUBLIC_TESTNET_2300), 930_000);
+    // Armed after every height already on the live chain (tip 913,917 on 19 Nov 2026).
+    assert!(crate::params_v2::TESTNET_2300_BTC4_MOST_WORK_HEIGHT > 913_917);
 }
 
 /// Before the UTC header is armed there is no consensus UTC, so block apply
