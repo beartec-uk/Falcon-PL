@@ -715,3 +715,209 @@ mod tests {
         assert_eq!(ex.dest_id20, dest_id20("scott.personal"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Testnet4 contextual header rules (Bitcoin Core `GetNextWorkRequired` with
+// `fPowAllowMinDifficultyBlocks` + BIP94, `ContextualCheckBlockHeader`).
+// Used by the BTC4 most-work rail (`btc4_most_work_from_height`).
+// ---------------------------------------------------------------------------
+
+/// Two weeks (`nPowTargetTimespan`).
+pub const POW_TARGET_TIMESPAN: u64 = 14 * 24 * 60 * 60;
+/// Ten minutes (`nPowTargetSpacing`).
+pub const POW_TARGET_SPACING: u32 = 600;
+/// BIP94 `MAX_TIMEWARP`: the first header of a period may be at most this
+/// many seconds earlier than its parent.
+pub const MAX_TIMEWARP_SECS: u32 = 600;
+/// `MAX_FUTURE_BLOCK_TIME`: two hours.
+pub const MAX_FUTURE_BLOCK_TIME_SECS: u64 = 2 * 60 * 60;
+/// Median-time-past window.
+pub const MEDIAN_TIME_SPAN: usize = 11;
+/// testnet4 is BIP34/65/66 active from genesis: `bad-version` below 4.
+pub const MIN_HEADER_VERSION: u32 = 4;
+
+/// 256-bit unsigned integer as 4 little-endian u64 limbs (tiny, no deps).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct U256(pub [u64; 4]);
+
+impl U256 {
+    pub fn from_be_bytes(b: &[u8; 32]) -> Self {
+        let mut l = [0u64; 4];
+        for (i, limb) in l.iter_mut().enumerate() {
+            let s = 32 - 8 * (i + 1);
+            *limb = u64::from_be_bytes(b[s..s + 8].try_into().unwrap());
+        }
+        U256(l)
+    }
+    pub fn bits(&self) -> u32 {
+        for i in (0..4).rev() {
+            if self.0[i] != 0 {
+                return 64 * i as u32 + (64 - self.0[i].leading_zeros());
+            }
+        }
+        0
+    }
+    pub fn mul_u64(&self, m: u64) -> Option<Self> {
+        let mut out = [0u64; 4];
+        let mut carry: u128 = 0;
+        for i in 0..4 {
+            let v = self.0[i] as u128 * m as u128 + carry;
+            out[i] = v as u64;
+            carry = v >> 64;
+        }
+        if carry != 0 {
+            return None;
+        }
+        Some(U256(out))
+    }
+    pub fn div_u64(&self, d: u64) -> Self {
+        let mut out = [0u64; 4];
+        let mut rem: u128 = 0;
+        for i in (0..4).rev() {
+            let cur = (rem << 64) | self.0[i] as u128;
+            out[i] = (cur / d as u128) as u64;
+            rem = cur % d as u128;
+        }
+        U256(out)
+    }
+    fn shr_bytes(&self, n: u32) -> Self {
+        let bits = n * 8;
+        let mut out = [0u64; 4];
+        let limb = (bits / 64) as usize;
+        let sh = bits % 64;
+        for i in 0..4 {
+            if i + limb >= 4 {
+                break;
+            }
+            out[i] = self.0[i + limb] >> sh;
+            if sh != 0 && i + limb + 1 < 4 {
+                out[i] |= self.0[i + limb + 1] << (64 - sh);
+            }
+        }
+        U256(out)
+    }
+    /// Bitcoin Core `arith_uint256::GetCompact` (non-negative).
+    pub fn to_compact(&self) -> u32 {
+        let mut size = (self.bits() + 7) / 8;
+        let mut compact: u32 = if size <= 3 {
+            (self.0[0] << (8 * (3 - size))) as u32
+        } else {
+            self.shr_bytes(size - 3).0[0] as u32
+        };
+        if compact & 0x0080_0000 != 0 {
+            compact >>= 8;
+            size += 1;
+        }
+        compact | (size << 24)
+    }
+}
+
+impl PartialOrd for U256 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for U256 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for i in (0..4).rev() {
+            match self.0[i].cmp(&other.0[i]) {
+                std::cmp::Ordering::Equal => continue,
+                o => return o,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+/// `nBits` → target, `None` for negative / zero / overflowing encodings.
+pub fn target_u256(bits: u32) -> Option<U256> {
+    compact_target(bits).map(|t| U256::from_be_bytes(&t))
+}
+
+/// Core `CheckProofOfWork` range check: target non-zero and ≤ `pow_limit_bits`'s target.
+pub fn bits_within_pow_limit(bits: u32, pow_limit_bits: u32) -> bool {
+    match (target_u256(bits), target_u256(pow_limit_bits)) {
+        (Some(t), Some(lim)) => t <= lim && t != U256([0; 4]),
+        _ => false,
+    }
+}
+
+/// BIP94 retarget (`CalculateNextWorkRequired` with `enforce_BIP94`): start
+/// from the **first** header of the period's nBits, scale by the clamped
+/// actual timespan, cap at the pow limit.
+pub fn retarget_bip94(first_bits: u32, first_time: u32, last_time: u32, pow_limit_bits: u32) -> Option<u32> {
+    let lim = target_u256(pow_limit_bits)?;
+    let mut span = last_time as i64 - first_time as i64;
+    let t = POW_TARGET_TIMESPAN as i64;
+    span = span.clamp(t / 4, t * 4);
+    let base = target_u256(first_bits)?;
+    // 320-bit product so easy (regtest-style) limits cannot overflow.
+    let mut wide = [0u64; 5];
+    let mut carry: u128 = 0;
+    for i in 0..4 {
+        let v = base.0[i] as u128 * span as u128 + carry;
+        wide[i] = v as u64;
+        carry = v >> 64;
+    }
+    wide[4] = carry as u64;
+    let mut rem: u128 = 0;
+    for i in (0..5).rev() {
+        let cur = (rem << 64) | wide[i] as u128;
+        wide[i] = (cur / POW_TARGET_TIMESPAN as u128) as u64;
+        rem = cur % POW_TARGET_TIMESPAN as u128;
+    }
+    let mut new = if wide[4] != 0 { lim } else { U256([wide[0], wide[1], wide[2], wide[3]]) };
+    if new > lim {
+        new = lim;
+    }
+    Some(new.to_compact())
+}
+
+/// Median of up to the last 11 timestamps (Core `GetMedianTimePast`).
+pub fn median_time_past(times: &[u32]) -> Option<u32> {
+    if times.is_empty() {
+        return None;
+    }
+    let mut v: Vec<u32> = times.iter().copied().take(MEDIAN_TIME_SPAN).collect();
+    v.sort_unstable();
+    Some(v[v.len() / 2])
+}
+
+#[cfg(test)]
+mod testnet4_rules_tests {
+    use super::*;
+
+    #[test]
+    fn compact_roundtrip() {
+        for b in [0x1d00ffffu32, 0x1902a986, 0x19046aef, 0x190424d1, 0x207fffff, 0x1b0404cb] {
+            assert_eq!(target_u256(b).unwrap().to_compact(), b, "{b:08x}");
+        }
+    }
+
+    #[test]
+    fn pow_limit_range() {
+        assert!(bits_within_pow_limit(0x1d00ffff, POW_LIMIT_BITS));
+        assert!(bits_within_pow_limit(0x1902a986, POW_LIMIT_BITS));
+        // Easier than testnet4's limit (regtest-style) and the first value above it.
+        assert!(!bits_within_pow_limit(0x207fffff, POW_LIMIT_BITS));
+        assert!(!bits_within_pow_limit(0x1d010000, POW_LIMIT_BITS));
+        assert!(!bits_within_pow_limit(0x1d00ffff | 0x0080_0000, POW_LIMIT_BITS));
+        assert!(!bits_within_pow_limit(0x1d000000, POW_LIMIT_BITS));
+    }
+
+    /// Real testnet4 retargets (headers read from Bitcoin Core on falcon1).
+    #[test]
+    fn bip94_retarget_matches_testnet4() {
+        // 159264: first 157248 (190424d1 @1792637587), last 159263 @1793927142.
+        assert_eq!(retarget_bip94(0x190424d1, 1_792_637_587, 1_793_927_142, POW_LIMIT_BITS), Some(0x19046aef));
+        // 161280: first 159264 (19046aef @1793926558), last 161279 @1794655488.
+        assert_eq!(retarget_bip94(0x19046aef, 1_793_926_558, 1_794_655_488, POW_LIMIT_BITS), Some(0x1902a986));
+    }
+
+    #[test]
+    fn mtp_is_median_of_11() {
+        let t: Vec<u32> = (0..11).rev().map(|i| 1000 + i * 10).collect();
+        assert_eq!(median_time_past(&t), Some(1050));
+        assert_eq!(median_time_past(&[5, 1, 3]), Some(3));
+    }
+}
