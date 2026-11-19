@@ -69,7 +69,7 @@ class RequestMinted(unittest.TestCase):
 
 
 class ReservedKickoffs(unittest.TestCase):
-    def test_minted_and_terminal_states_release(self):
+    def test_only_never_broadcast_states_release(self):
         reqs = [
             {"kickoff": "aa:0", "state": "awaiting_mint"},
             {"kickoff": "bb:0", "state": "minted"},
@@ -79,9 +79,10 @@ class ReservedKickoffs(unittest.TestCase):
             {"kickoff": "ff:0", "state": "waiting_operator_liquidity"},
             {"state": "funded"},
         ]
-        self.assertEqual(intake.reserved_kickoff_set(reqs), {"aa:0", "ee:0", "ff:0"})
+        # minted keeps its kickoff: the graph's PegOutConfirm still spends it.
+        self.assertEqual(intake.reserved_kickoff_set(reqs), {"aa:0", "bb:0", "ee:0", "ff:0"})
 
-    def test_consumed_proofs_release_after_mark_minted(self):
+    def test_minted_requests_keep_kickoff_after_mark_minted(self):
         status = {"body": {"rails": [{"asset": "BTC4", "spent_deposits": list(CONSUMED)}]}}
         spent = intake.spent_deposit_txids(status)
         reqs = [
@@ -105,8 +106,22 @@ class ReservedKickoffs(unittest.TestCase):
         for req in reqs:
             if intake.request_minted(req, spent):
                 req["state"] = "minted"
-        self.assertEqual(intake.reserved_kickoff_set(reqs), {"still:0"})
+        self.assertEqual(
+            intake.reserved_kickoff_set(reqs),
+            {"ko0:0", "ko1:0", "ko2:0", "ko3:0", "still:0"},
+        )
         self.assertEqual(sum(1 for r in reqs if r["state"] == "minted"), 4)
+
+    def test_pick_kickoff_never_reuses_a_minted_requests_kickoff(self):
+        # 17 Nov regression: a minted request's kickoff (unspent, waiting for its
+        # PegOutConfirm) must not be handed to the next peg-in.
+        from unittest import mock
+        utxos = [{"txid": "k1", "vout": 0, "value": 5_052_397, "status": {"confirmed": True}},
+                 {"txid": "k2", "vout": 0, "value": 5_100_384, "status": {"confirmed": True}}]
+        reqs = [{"id": "a977391ba6a384bc", "state": "minted", "kickoff": "k1:0"}]
+        with mock.patch.object(intake, "esplora", lambda path: utxos), \
+                mock.patch.object(intake, "all_reqs", lambda: reqs):
+            self.assertEqual(intake.pick_kickoff(55_000), ("k2:0", 5_100_384))
 
 
 if __name__ == "__main__":

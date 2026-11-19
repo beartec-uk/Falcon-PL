@@ -169,14 +169,20 @@ def request_minted(req, spent):
 
 
 def reserved_kickoff_set(reqs):
-    """Kickoff outpoints still pinned by a live request.
+    """Kickoff outpoints still pinned by a request.
 
-    Minted requests release their kickoff after the peg-in proof is consumed
-    (BTC4 spent_deposits). awaiting_mint still reserves: the ceremony graph may
-    still need that unspent outpoint until mint completes.
+    Minted requests KEEP their kickoff: the presigned peg-out graph's
+    PegOutConfirm spends exactly that outpoint when the user later pegs out
+    (operator reimbursement). Releasing it at mint (#33) let the next peg-in
+    reuse the same coin, so whichever graph pegged out first consumed it and the
+    others' PegOutConfirm failed forever with bad-txns-inputs-missingorspent
+    (17 Nov: req-a977391b, req-0f81bc45, req-b92a2cd4). Liquidity is not tied up
+    for ever: `pick_kickoff` only considers unspent UTXOs, so a kickoff drops out
+    on its own once its PegOutConfirm confirms. Only requests that never
+    broadcast (failed / expired) release theirs.
     """
     return {r.get("kickoff") for r in reqs
-            if r.get("kickoff") and r.get("state") not in ("failed", "expired", "minted")}
+            if r.get("kickoff") and r.get("state") not in ("failed", "expired")}
 
 
 def reserved_kickoffs():
