@@ -339,6 +339,9 @@ def main():
                     continue
                 if not r:
                     break
+                # Accepted into a mempool: not stuck, even if it lands in a later
+                # block than the 4.5 s wait below (no backoff for slow inclusion).
+                progressed = True
                 t0 = time.time()
                 while time.time() - t0 < 4.5:
                     time.sleep(0.15)
