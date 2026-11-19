@@ -406,16 +406,20 @@ pub const TESTNET_2300_BTC4_FORK_SLOT_HEIGHT: u64 = 860_000;
 /// (bounded store, `bridge::BTC_SIDE_DEPTH` / `BTC_SIDE_MAX`) and follows the
 /// branch with the most cumulative work; equal work keeps the current main
 /// chain (first-seen). Headers must also pass Bitcoin Core's testnet4
-/// contextual checks: time > median of the previous 11, time ≤ ledger chain
-/// time + 2h, BIP94 timewarp (≥ parent − 600s at a retarget), exact nBits
+/// contextual checks: time > median of the previous 11, time ≤ UTC + 2h
+/// (parent ledger `sealed_utc_ms` once `H_utc` is armed; mempool admission
+/// uses the seat's wall clock), BIP94 timewarp (≥ parent − 600s at a retarget), exact nBits
 /// (20-minute min-difficulty rule, BIP94 retarget), version ≥ 4, nBits within
 /// the pow limit. Replays the 2026-11-17 stall at 161859 (three equal-work
 /// branches; the canonical 161859 had a parent inside the pending fork, so
 /// neither slot could hold it).
 ///
-/// PLACEHOLDER: `u64::MAX` (never) until Scott picks the height. All seats
-/// must run this binary before H. Non-2300: `FPL_BTC4_MOST_WORK_FROM_HEIGHT`.
-pub const TESTNET_2300_BTC4_MOST_WORK_HEIGHT: u64 = u64::MAX;
+/// Armed at **930,000** in 2.11.5 (proposed 19 Nov 2026: tip 913,917 at
+/// 06:19 GMT; 16,083 blocks ≈ 59 h at the measured 13.3 s/block average,
+/// ≈ 45 h at 10.1 s/block). Every seat must run 2.11.5 before 930,000; a
+/// 2.11.4 seat diverges at the first BTC4 header the new rules treat
+/// differently. Non-2300: `FPL_BTC4_MOST_WORK_FROM_HEIGHT`.
+pub const TESTNET_2300_BTC4_MOST_WORK_HEIGHT: u64 = 930_000;
 
 /// v2.10.3 (TBD): Hello minimum-release activation (2300). From this local tip
 /// a peer must advertise `release_version >= HELLO_MIN_RELEASE`. Local only
