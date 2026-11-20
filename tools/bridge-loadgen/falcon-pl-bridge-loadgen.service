@@ -1,0 +1,25 @@
+[Unit]
+Description=Falcon PL 2300 BTC4 bridge loadtest (extension of falcon-pl-loadgen; testnet only)
+After=network-online.target falcon-pl-v1.service fpl-bridge-intake.service fpl-operatord.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/falcon/loadgen/bridge
+EnvironmentFile=/home/falcon/loadgen/bridge/bridge-loadgen.env
+EnvironmentFile=-/home/falcon/loadgen/bridge/discord.env
+ExecStart=/usr/bin/python3 /home/falcon/loadgen/bridge/falcon_pl_bridge_loadgen.py /home/falcon/loadgen/bridge/bridge-loadgen.env run
+Restart=always
+RestartSec=30
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUQuota=25%
+MemoryMax=512M
+StandardOutput=append:/home/falcon/loadgen/bridge/logs/bridge-loadgen.log
+StandardError=append:/home/falcon/loadgen/bridge/logs/bridge-loadgen.log
+
+[Install]
+WantedBy=multi-user.target

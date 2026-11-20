@@ -355,6 +355,7 @@ pub mod names;
 pub mod snapshot;
 pub mod vault;
 pub mod consensus_rounds;
+pub use consensus_rounds::{AppliedRoundQc, RoundRegossip};
 pub mod params_v2;
 pub mod operator_registry;
 pub mod bridge_operators;
@@ -384,7 +385,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.3";
+pub const PRODUCT_VERSION: &str = "2.11.5";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -3745,6 +3746,16 @@ pub struct Node {
     pub view_change_votes: HashMap<u64, HashMap<u64, BTreeSet<String>>>,
     /// Rate-limit local ViewChange casting.
     pub last_view_change_vote_ms: u64,
+    /// 2.11.4 (h=891419 round split): signed ViewChange votes at the open
+    /// height, `height → round → voter → signature`, so the votes that formed
+    /// a round QC survive `apply_round_advance` and can be re-gossiped.
+    /// Node-local, never persisted, never part of state.
+    pub vc_vote_sigs: HashMap<u64, BTreeMap<u64, BTreeMap<String, String>>>,
+    /// 2.11.4: the verified 4-of-6 signed ViewChange votes behind the last
+    /// round QC this seat applied at the open height (re-gossip evidence).
+    pub applied_round_qc: Option<crate::consensus_rounds::AppliedRoundQc>,
+    /// 2.11.4: last stalled-round re-gossip (ms, node clock).
+    pub last_round_regossip_ms: u64,
     /// Packers who already produced a body at `height`. Survives view-change
     /// so the same seat cannot reseal a second hash (v2.7.6).
     pub height_sealers: HashMap<u64, BTreeSet<String>>,
@@ -3791,8 +3802,12 @@ pub struct Node {
     pub btc4_fork_fix_from_height: u64,
     /// Later-height BTC4 fork-slot replacement; runtime only.
     pub btc4_fork_slot_from_height: u64,
+    /// [`crate::params_v2::btc4_most_work_from_height`]; runtime only.
+    pub btc4_most_work_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::btc4_lend_scale_from_height`]; runtime only.
     pub btc4_lend_scale_from_height: u64,
+    /// Fix B (2300: 904,000): [`crate::params_v2::bitvm2_leaf_prune_from_height`]; runtime only.
+    pub bitvm2_leaf_prune_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::orderbook_from_height`] (= the single
     /// 2.10.4 height); runtime only.
     pub orderbook_from_height: u64,
@@ -3929,7 +3944,9 @@ impl Node {
         let empty_block_from_height = crate::params_v2::empty_block_from_height(cfg.network_id);
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
+        let btc4_most_work_from_height = crate::params_v2::btc4_most_work_from_height(cfg.network_id);
         let btc4_lend_scale_from_height = crate::params_v2::btc4_lend_scale_from_height(cfg.network_id);
+        let bitvm2_leaf_prune_from_height = crate::params_v2::bitvm2_leaf_prune_from_height(cfg.network_id);
         let orderbook_from_height = crate::params_v2::orderbook_from_height(cfg.network_id);
         let hello_min_release_from_height = crate::params_v2::hello_min_release_from_height(cfg.network_id);
         let network_id_for_utc_hello = cfg.network_id;
@@ -4048,6 +4065,9 @@ impl Node {
             height_view_round: 0,
             view_change_votes: HashMap::new(),
             last_view_change_vote_ms: 0,
+            vc_vote_sigs: HashMap::new(),
+            applied_round_qc: None,
+            last_round_regossip_ms: 0,
             height_sealers: HashMap::new(),
             certs: BTreeMap::new(),
             ok_by_height_voter: HashMap::new(),
@@ -4069,7 +4089,9 @@ impl Node {
             empty_block_from_height,
             btc4_fork_fix_from_height,
             btc4_fork_slot_from_height,
+            btc4_most_work_from_height,
             btc4_lend_scale_from_height,
+            bitvm2_leaf_prune_from_height,
             orderbook_from_height,
             hello_min_release_from_height,
             utc_hello_enforce_from_height: utc_header::network_utc_hello_enforce_from_height(network_id_for_utc_hello),
@@ -4196,6 +4218,29 @@ impl Node {
     /// M1 BitVM2 rules for a ledger at `height`.
     pub fn bitvm2_m1_at(&self, height: u64) -> bool {
         height >= self.bitvm2_m1_from_height
+    }
+
+    /// Fix B: settled claim-tree leaves are pruned, and Disprove checks the
+    /// stored attestation against its attest-time root, for the ledger applied
+    /// at `height`. Needs M1 (Disprove v2) too. Consensus: activation height.
+    pub fn bitvm2_leaf_prune_at(&self, height: u64) -> bool {
+        height >= self.bitvm2_leaf_prune_from_height && self.bitvm2_m1_at(height)
+    }
+
+    /// A pruning height is configured (not the `never` placeholder), so a full
+    /// claim tree is temporary: queued burns are kept and apply once a leaf frees.
+    pub fn bitvm2_leaf_prune_scheduled(&self) -> bool {
+        self.bitvm2_leaf_prune_from_height != u64::MAX
+    }
+
+    /// [`Self::is_permanent_tx_failure`] plus the claim-tree-full case, which is
+    /// permanent only while no pruning height is scheduled (local policy, not
+    /// block validity).
+    fn is_permanent_tx_failure_here(&self, err: &str) -> bool {
+        if crate::bridge::is_bitvm2_claim_tree_full(err) {
+            return !self.bitvm2_leaf_prune_scheduled();
+        }
+        Self::is_permanent_tx_failure(err)
     }
 
     /// v2.9.62: consensus-safety rules for txs/ledgers applied at `height`.
@@ -4403,6 +4448,25 @@ impl Node {
     /// Later-height BTC4 fork-slot replacement for the ledger being applied now (`tip + 1`).
     pub fn btc4_fork_slot_open(&self) -> bool {
         self.tip_height.saturating_add(1) >= self.btc4_fork_slot_from_height
+    }
+
+    /// BTC4 most-work rail for the ledger applied now (`tip + 1`), consensus
+    /// path: the 2-hour future limit uses the parent ledger's attested UTC
+    /// (`sealed_utc_ms`, only non-zero once `H_utc` is armed). See
+    /// [`crate::bridge::MostWork`].
+    pub fn btc4_most_work_apply(&self) -> Option<crate::bridge::MostWork> {
+        if self.tip_height.saturating_add(1) < self.btc4_most_work_from_height {
+            return None;
+        }
+        let utc = self.parent_sealed_utc();
+        Some(crate::bridge::MostWork { utc_now_secs: (utc > 0).then_some(utc / 1000) })
+    }
+
+    /// As [`Self::btc4_most_work_apply`] for mempool admission (local only):
+    /// the future limit uses this seat's OS wall clock.
+    pub fn btc4_most_work_admit(&self) -> Option<crate::bridge::MostWork> {
+        self.btc4_most_work_apply()
+            .map(|_| crate::bridge::MostWork { utc_now_secs: Some(self.utc_pack_clock.now_unix_ms() / 1000) })
     }
 
     /// v2.10.4: BTC4 lend markets pin 1e8 raw/coin for the ledger applied now.
@@ -7055,7 +7119,8 @@ impl Node {
         let strict = self.rv2_open();
         let fork_fix = self.btc4_fork_fix_open();
         let slot_fix = self.btc4_fork_slot_open();
-        let progressed = self.bridge.rail_mut(asset)?.submit_header_ex3(header, strict, fork_fix, slot_fix)?;
+        let most_work = self.btc4_most_work_apply();
+        let progressed = self.bridge.rail_mut(asset)?.submit_header_ex4(header, strict, fork_fix, slot_fix, most_work)?;
         if let Some(w) = watcher {
             if progressed {
                 self.watcher_credit(w, 1, true);
@@ -7535,10 +7600,11 @@ impl Node {
         if self.bitvm2_m1_at(self.tip_height.saturating_add(1)) {
             let vk = self.bitvm2_vk.clone();
             let rail = self.bitvm2_rail_for_note(note_id);
+            let stored_root = self.bitvm2_leaf_prune_at(self.tip_height.saturating_add(1));
             return self
                 .bridge
                 .rail_mut(rail)?
-                .disprove_bitvm2_v2(note_id, &vk);
+                .disprove_bitvm2_v2_ex(note_id, &vk, stored_root);
         }
         self.bridge.rail_mut(crate::bridge::RAIL_BTC)?.disprove_bitvm2(
             note_id,
@@ -7942,6 +8008,15 @@ impl Node {
         if let Err(e) = self.verify_account_tx(&tx) {
             return Err(e);
         }
+        // Tell the submitter now (ctl exits non-zero) instead of accepting a
+        // BTC4 burn that can never pack. Admission policy only, not validity.
+        if let TxBody::RailWithdraw { asset, .. } = &tx.body {
+            if asset == crate::bridge::RAIL_BTC4 {
+                if let Ok(r) = self.bridge.rail(asset) {
+                    r.bitvm2_claim_tree_check()?;
+                }
+            }
+        }
         if matches!(tx.body, TxBody::WatcherCredit { .. }) {
             return Err("watcher-credit disabled; use WatcherHeartbeat or rail work".into());
         }
@@ -7989,14 +8064,15 @@ impl Node {
                     let strict = self.rv2_open();
                     let fork_fix = self.btc4_fork_fix_open();
                     let slot_fix = self.btc4_fork_slot_open();
-                    if let Err(e) = probe.submit_header_ex3(crate::bridge::RailHeader {
+                    let most_work = self.btc4_most_work_admit();
+                    if let Err(e) = probe.submit_header_ex4(crate::bridge::RailHeader {
                         height: *height,
                         hash: hash.clone(),
                         parent_hash: parent_hash.clone(),
                         merkle_root: merkle_root.clone(),
                         raw: raw.clone(),
-                    }, strict, fork_fix, slot_fix) {
-                        if Self::is_permanent_tx_failure(&e) {
+                    }, strict, fork_fix, slot_fix, most_work) {
+                        if self.is_permanent_tx_failure_here(&e) {
                             return Err(e);
                         }
                     }
@@ -8041,7 +8117,7 @@ impl Node {
         // cannot be dry-run against committed state.
         if replacing && tx.sequence == need {
             if let Err(e) = self.dry_run_head(&tx) {
-                if Self::is_permanent_tx_failure(&e) {
+                if self.is_permanent_tx_failure_here(&e) {
                     let tip = self.tip_hash.clone();
                     self.perm_dropped.insert(&tx.tx_id, self.now_ms, &tip);
                     return Err(format!("refused same-seq replacement: {e}"));
@@ -8111,6 +8187,7 @@ impl Node {
         let strict = self.rv2_open();
         let fork_fix = self.btc4_fork_fix_open();
         let slot_fix = self.btc4_fork_slot_open();
+        let most_work = self.btc4_most_work_admit();
         for sibs in by_seq.values() {
             let mut ok = false;
             for t in sibs {
@@ -8124,13 +8201,13 @@ impl Node {
                         raw,
                     } if asset == &rail.asset => {
                         if probe
-                            .submit_header_ex3(crate::bridge::RailHeader {
+                            .submit_header_ex4(crate::bridge::RailHeader {
                                 height: *height,
                                 hash: hash.clone(),
                                 parent_hash: parent_hash.clone(),
                                 merkle_root: merkle_root.clone(),
                                 raw: raw.clone(),
-                            }, strict, fork_fix, slot_fix)
+                            }, strict, fork_fix, slot_fix, most_work)
                             .is_ok()
                         {
                             ok = true;
@@ -8768,6 +8845,10 @@ impl Node {
             self.pending_rounds = 0;
         }
         self.view_change_votes.retain(|h, _| *h >= open.saturating_sub(2));
+        self.vc_vote_sigs.retain(|h, _| *h == open);
+        if self.applied_round_qc.as_ref().map(|q| q.height != open).unwrap_or(false) {
+            self.applied_round_qc = None;
+        }
     }
 
     /// ONLINE hash tag for lottery seed (frozen for open height when available).
@@ -9028,6 +9109,9 @@ impl Node {
             return (false, false);
         }
         if self.vote_rounds_at(height) {
+            // 2.11.4: keep the verified signature so an applied QC can be
+            // re-gossiped to seats that missed it (h=891419 round split).
+            self.note_vc_vote_sig(height, round, voter, signature);
             return self.vote_round_change(height, round, voter);
         }
         // Only the next round is votable (no jump-ahead storms).
@@ -9536,7 +9620,8 @@ impl Node {
     pub fn take_catchup_pull(&mut self) -> Option<u64> {
         // Exclusive snap: residual on this lane is what starved NeedSnapshot
         // for minutes before the 2.9.24 offer (v11 still waiting).
-        if self.wants_snapshot() {
+        // 2.11.4: except a small-lag hole (see `snapshot_blocks_residual`).
+        if self.snapshot_blocks_residual() {
             return None;
         }
         self.rebase_future_stamps();
@@ -9840,6 +9925,47 @@ impl Node {
         if self.stale_snap_offer_ms > self.now_ms {
             self.stale_snap_offer_ms = 0;
         }
+    }
+
+    /// A few heights behind, on our own (non-poisoned) chain: NeedLedgers
+    /// stays available even when `wants_snapshot()` is set by the small-hole
+    /// rule (`residual_hole_needs_snapshot`, lag < `SNAPSHOT_SERVE_STALE_LAG`).
+    ///
+    /// 2.11.4 (12 Nov 2026, h=869559 stall, v13): a seat 3 behind collected
+    /// three empty residuals while it sat in a DualProposal stall, the hole
+    /// rule flipped `wants_snapshot()`, `take_catchup_pull` went silent and
+    /// every NeedSnapshot was dropped on a full hub catch lane. It sat at
+    /// tip-3 for 20 minutes; after a restart NeedLedgers pulled the 3 blocks
+    /// from the archive in seconds. Empty residuals at small lag are often
+    /// rejected/unanswered pulls, not missing data, so the ledger lane must
+    /// keep running alongside the (rate-limited) NeedSnapshot.
+    ///
+    /// Large lags keep the exclusive snapshot lane (`SNAPSHOT_JOIN_LAG`, the
+    /// no-archive hub fallback above `SNAPSHOT_SERVE_STALE_LAG`), and a
+    /// fork-poisoned chain or an operator hard-resync never takes this path.
+    pub fn small_lag_residual_allowed(&self) -> bool {
+        let lag = self.tip_lag();
+        self.tip_height > 0
+            && !self.need_hard_resync
+            && lag > 0
+            && lag < Self::SNAPSHOT_SERVE_STALE_LAG
+            && !self.catchup_conflict_is_fork_poison()
+    }
+
+    /// A downloaded peer snapshot may be adopted while it is still ahead of
+    /// our tip. With NeedLedgers running beside a small-lag snapshot pull
+    /// (2.11.4), residual batches can overtake the pin mid-download; an
+    /// overtaken pin would rewind committed state. Fork heal (poisoned chain)
+    /// and an operator hard-resync keep adopting as before.
+    pub fn peer_snapshot_adoptable(&self, snap_tip: u64) -> bool {
+        snap_tip > self.tip_height
+            || self.need_hard_resync
+            || self.catchup_conflict_is_fork_poison()
+    }
+
+    /// Residual NeedLedgers must stay off because a snapshot owns the lane.
+    pub fn snapshot_blocks_residual(&self) -> bool {
+        self.wants_snapshot() && !self.small_lag_residual_allowed()
     }
 
     /// Unanswered/empty residual pulls (~2.6 s each) after which a lagging
@@ -10699,7 +10825,7 @@ impl Node {
                 &tx,
             );
             match r {
-                Err(e) if Self::is_permanent_tx_failure(&e) => {
+                Err(e) if self.is_permanent_tx_failure_here(&e) => {
                     eprintln!(
                         "falcon-pl sanitize drop {} seq {} {}: {e}",
                         tx.tx_id, tx.sequence, tx.account
@@ -13078,7 +13204,7 @@ impl Node {
                         list.remove(0);
                         progressed = true;
                     }
-                    Err(e) if Self::is_permanent_tx_failure(&e) => {
+                    Err(e) if self.is_permanent_tx_failure_here(&e) => {
                         // Drop poison txs so they cannot stall every packer forever.
                         eprintln!(
                             "falcon-pl pack drop {} seq {} {}: {e}",
@@ -15182,6 +15308,8 @@ impl Node {
                 // v2.10.1: status only (non-consensus) view of pending BTC branches.
                 "btc_fork": crate::bridge::RailState::btc_branch_summary(&r.btc_fork),
                 "btc_fork_alt": crate::bridge::RailState::btc_branch_summary(&r.btc_fork_alt),
+                // Most-work rail: status-only view of stored side branches.
+                "btc_side": r.btc_side_summary(),
                 "header_tail": r.headers.iter().rev().take(64).map(|(hgt, hdr)| serde_json::json!({
                     "height": hgt,
                     "hash": hdr.hash,
@@ -16802,8 +16930,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.3");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.3");
+        assert_eq!(PRODUCT_VERSION, "2.11.5");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.5");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
@@ -18843,6 +18971,115 @@ mod tests {
             !n.wants_snapshot(),
             "a ~100 height tail must stay on NeedLedgers, not another join snap"
         );
+    }
+
+    /// 2.11.4 (12 Nov 2026, h=869559, v13): three behind, three empty
+    /// residuals. The small-hole rule still asks for a snapshot, but
+    /// NeedLedgers must keep running next to it. Before the fix
+    /// `take_catchup_pull` returned None for 20 minutes while every
+    /// NeedSnapshot was dropped on a full hub catch lane.
+    fn small_lag_hole_node() -> Node {
+        let mut n = Node::new(
+            "v13",
+            ChainConfig::default(),
+            crate::crypto::KeyRing::new(crate::crypto::CryptoScheme::HmacDev),
+            &users(),
+        );
+        n.register_validator("v1", 1000);
+        n.register_validator("v13", 1000);
+        n.cfg.archive = false;
+        n.now_ms = 1_000_000;
+        n.tip_height = 869_556;
+        n.tip_hash = "35da3982".into();
+        n.best_peer_tip = 869_559;
+        if let Some(v) = n.validators.get_mut("v1") {
+            v.advertised_archive = true;
+            v.advertised_hub = true;
+            v.last_advertised_tip = Some(869_559);
+            v.last_pong_ms = n.now_ms;
+        }
+        n.empty_residual_streak = 3;
+        n.last_catchup_conflict = "round 0→1 at h=869557 proposer=Some(\"v10\") target=None".into();
+        n
+    }
+
+    #[test]
+    fn small_lag_hole_keeps_need_ledgers_alongside_snapshot() {
+        let mut n = small_lag_hole_node();
+        assert!(n.wants_snapshot(), "small-hole rule still asks for a snap");
+        assert!(n.small_lag_residual_allowed());
+        assert!(!n.snapshot_blocks_residual());
+        assert_eq!(n.take_catchup_pull(), Some(869_557), "NeedLedgers must still be issued at lag 3");
+        assert!(n.take_snapshot_pull(), "NeedSnapshot stays available as the hole fallback");
+        // Unanswered pulls keep rotating hubs and keep pulling (no lock-out).
+        for k in 0..20u32 {
+            n.now_ms += Node::CATCHUP_INFLIGHT_MS + 1;
+            assert_eq!(n.take_catchup_pull(), Some(869_557), "pull {k} after an empty residual");
+            assert!(n.empty_residual_streak >= 3);
+        }
+        // A served batch resets the streak, and the hole rule turns off.
+        n.note_catchup_batch(true);
+        assert_eq!(n.empty_residual_streak, 0);
+        assert!(!n.wants_snapshot());
+        // Every lag under SNAPSHOT_SERVE_STALE_LAG keeps the ledger lane.
+        for lag in 1..Node::SNAPSHOT_SERVE_STALE_LAG {
+            let mut n = small_lag_hole_node();
+            n.best_peer_tip = n.tip_height + lag;
+            n.empty_residual_streak = 9;
+            assert!(n.wants_snapshot(), "lag={lag}");
+            assert_eq!(n.take_catchup_pull(), Some(n.tip_height + 1), "lag={lag}");
+        }
+    }
+
+    #[test]
+    fn large_lag_and_fork_poison_keep_exclusive_snapshot_lane() {
+        // Join lag: snapshot only, no residual.
+        let mut n = small_lag_hole_node();
+        n.empty_residual_streak = 0;
+        n.best_peer_tip = n.tip_height + Node::SNAPSHOT_JOIN_LAG;
+        assert!(n.wants_snapshot());
+        assert!(!n.small_lag_residual_allowed());
+        assert!(n.snapshot_blocks_residual());
+        assert_eq!(n.take_catchup_pull(), None, "join lag stays snapshot-only");
+        assert!(n.take_snapshot_pull());
+        // No-archive hub fallback above SNAPSHOT_SERVE_STALE_LAG: unchanged.
+        let mut n = upgrade_stall_node();
+        n.best_peer_tip = n.tip_height + 200;
+        n.empty_residual_streak = Node::RESIDUAL_NO_SERVER_STREAK;
+        assert!(n.wants_snapshot());
+        assert_eq!(n.take_catchup_pull(), None, "lag 200 with no archive stays on the hub snapshot");
+        // Exactly SNAPSHOT_SERVE_STALE_LAG is not "small".
+        let mut n = small_lag_hole_node();
+        n.best_peer_tip = n.tip_height + Node::SNAPSHOT_SERVE_STALE_LAG;
+        assert!(!n.small_lag_residual_allowed());
+        // Fork poison at small lag: the chain diverged, ledgers cannot apply.
+        let mut n = small_lag_hole_node();
+        n.last_catchup_conflict =
+            "catch-up conflict (no auto hard-resync): state root mismatch at h=869557".into();
+        assert!(n.wants_snapshot());
+        assert!(!n.small_lag_residual_allowed());
+        assert_eq!(n.take_catchup_pull(), None, "fork poison must re-snap, not residual");
+        // A pin that residual catch-up overtook mid-download is not adopted.
+        let n = small_lag_hole_node();
+        assert!(n.peer_snapshot_adoptable(869_559));
+        assert!(!n.peer_snapshot_adoptable(869_556), "same tip: would rewind nothing new");
+        assert!(!n.peer_snapshot_adoptable(869_550), "older pin must never be adopted");
+        let mut n = small_lag_hole_node();
+        n.last_catchup_conflict =
+            "catch-up conflict (no auto hard-resync): state root mismatch at h=869557".into();
+        assert!(n.peer_snapshot_adoptable(869_556), "fork heal still adopts");
+        // In sync: nothing to pull, nothing to snap.
+        let mut n = small_lag_hole_node();
+        n.best_peer_tip = n.tip_height;
+        assert!(!n.wants_snapshot());
+        assert!(!n.small_lag_residual_allowed());
+        assert_eq!(n.take_catchup_pull(), None);
+        // Fresh joiner at tip 0 never takes the small-lag path.
+        let mut n = small_lag_hole_node();
+        n.tip_height = 0;
+        n.best_peer_tip = 5;
+        assert!(!n.small_lag_residual_allowed());
+        assert!(n.snapshot_blocks_residual());
     }
 
     #[test]
@@ -24460,6 +24697,13 @@ mod v2_10_activation_tests;
 #[cfg(test)]
 mod btc4_fork_fix_tests;
 #[cfg(test)]
+mod btc4_most_work_tests;
+#[cfg(test)]
 mod btc4_lend_scale_tests;
 #[cfg(test)]
 mod orderbook_tests;
+
+#[cfg(test)]
+mod bitvm2_tree_capacity_tests;
+#[cfg(test)]
+mod round_split_tests;

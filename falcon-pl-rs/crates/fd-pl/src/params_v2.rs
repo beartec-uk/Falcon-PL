@@ -345,6 +345,17 @@ mod tests {
     }
 
     #[test]
+    fn bitvm2_leaf_prune_armed_at_904k_after_m1() {
+        assert_eq!(TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT, 904_000, "Scott 2026-11-16: Fix B at 904k");
+        assert_eq!(bitvm2_leaf_prune_from_height(NETWORK_ID_PUBLIC_TESTNET_2300), 904_000);
+        assert!(TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT >= TESTNET_2300_BITVM2_M1_FROM_HEIGHT);
+        // Other networks: env, else never (no process-wide set_var here).
+        if std::env::var("FPL_BITVM2_LEAF_PRUNE_FROM_HEIGHT").is_err() {
+            assert_eq!(bitvm2_leaf_prune_from_height(2200), u64::MAX);
+        }
+    }
+
+    #[test]
     fn splits_sum_to_100() {
         assert!(FEE_BURN_PCT + FEE_PROPOSER_PCT < 100);
         assert!(POT_PROPOSER_PCT + POT_VOTER_PCT < 100);
@@ -414,6 +425,26 @@ pub const TESTNET_2300_BTC4_FORK_FIX_HEIGHT: u64 = 775_000;
 /// the header this rule accepts. Non-2300: `FPL_BTC4_FORK_SLOT_FROM_HEIGHT`.
 pub const TESTNET_2300_BTC4_FORK_SLOT_HEIGHT: u64 = 860_000;
 
+/// BTC4 most-work header rail + testnet4 header timestamp/difficulty checks
+/// (2300). From this ledger height the BTC4 rail keeps every valid side header
+/// (bounded store, `bridge::BTC_SIDE_DEPTH` / `BTC_SIDE_MAX`) and follows the
+/// branch with the most cumulative work; equal work keeps the current main
+/// chain (first-seen). Headers must also pass Bitcoin Core's testnet4
+/// contextual checks: time > median of the previous 11, time ≤ UTC + 2h
+/// (parent ledger `sealed_utc_ms` once `H_utc` is armed; mempool admission
+/// uses the seat's wall clock), BIP94 timewarp (≥ parent − 600s at a retarget), exact nBits
+/// (20-minute min-difficulty rule, BIP94 retarget), version ≥ 4, nBits within
+/// the pow limit. Replays the 2026-11-17 stall at 161859 (three equal-work
+/// branches; the canonical 161859 had a parent inside the pending fork, so
+/// neither slot could hold it).
+///
+/// Armed at **930,000** in 2.11.5 (proposed 19 Nov 2026: tip 913,917 at
+/// 06:19 GMT; 16,083 blocks ≈ 59 h at the measured 13.3 s/block average,
+/// ≈ 45 h at 10.1 s/block). Every seat must run 2.11.5 before 930,000; a
+/// 2.11.4 seat diverges at the first BTC4 header the new rules treat
+/// differently. Non-2300: `FPL_BTC4_MOST_WORK_FROM_HEIGHT`.
+pub const TESTNET_2300_BTC4_MOST_WORK_HEIGHT: u64 = 930_000;
+
 /// v2.10.3 (TBD): Hello minimum-release activation (2300). From this local tip
 /// a peer must advertise `release_version >= HELLO_MIN_RELEASE`. Local only
 /// (session admission), not consensus. **PLACEHOLDER / TBD**: `u64::MAX` = never.
@@ -470,6 +501,21 @@ pub fn btc4_lend_scale_from_height(network_id: u32) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Testnet 2300 height from which settled BitVM2 claim-tree leaves are pruned
+/// (fix B, 14 Nov 2026 claim tree full). **904,000**, chosen by Scott on
+/// 16 Nov 2026 (tip 891,771 at 03:36 GMT, ~1.3–1.4 days at 9–10 s/block).
+/// Must be >= the M1 height; every seat must run 2.11.4 before it.
+pub const TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT: u64 = 904_000;
+
+/// BitVM2 claim-tree leaf pruning activation (consensus). 2300: the constant
+/// above. Other networks: `FPL_BITVM2_LEAF_PRUNE_FROM_HEIGHT`, else never.
+pub fn bitvm2_leaf_prune_from_height(network_id: u32) -> u64 {
+    if network_id == NETWORK_ID_PUBLIC_TESTNET_2300 {
+        return TESTNET_2300_BITVM2_LEAF_PRUNE_FROM_HEIGHT;
+    }
+    env_u64("FPL_BITVM2_LEAF_PRUNE_FROM_HEIGHT").unwrap_or(u64::MAX)
+}
+
 /// Order book activation = the 2.10.4 height (non-2300: env, else never).
 pub fn orderbook_from_height(network_id: u32) -> u64 {
     v2_10_4_from_height(network_id)
@@ -491,6 +537,15 @@ pub fn btc4_fork_slot_from_height(network_id: u32) -> u64 {
         return TESTNET_2300_BTC4_FORK_SLOT_HEIGHT;
     }
     env_u64("FPL_BTC4_FORK_SLOT_FROM_HEIGHT").unwrap_or(u64::MAX)
+}
+
+/// BTC4 most-work rail activation (`u64::MAX` = never). Non-2300 networks may
+/// set `FPL_BTC4_MOST_WORK_FROM_HEIGHT` (devnets / tests).
+pub fn btc4_most_work_from_height(network_id: u32) -> u64 {
+    if network_id == NETWORK_ID_PUBLIC_TESTNET_2300 {
+        return TESTNET_2300_BTC4_MOST_WORK_HEIGHT;
+    }
+    env_u64("FPL_BTC4_MOST_WORK_FROM_HEIGHT").unwrap_or(u64::MAX)
 }
 
 /// External-address activation height (`u64::MAX` = never). Non-2300 networks

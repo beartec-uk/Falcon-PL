@@ -43,6 +43,11 @@ fn capacity() -> usize {
     1usize << MERKLE_DEPTH
 }
 
+/// Max leaves the fixed-depth claim tree (and the Groth16 circuit) can hold.
+pub fn claim_tree_capacity() -> usize {
+    capacity()
+}
+
 /// Pad leaves to 2^MERKLE_DEPTH so the circuit path is always exactly MERKLE_DEPTH.
 pub fn build_tree(leaves: &[Fr], index: usize) -> Result<(Fr, Vec<Fr>, Vec<bool>), String> {
     if leaves.is_empty() {

@@ -179,6 +179,15 @@ pub fn genesis_lock_id(rail: &str) -> String {
 }
 
 /// BTC dest-lock note id — dest, not FPL height, so Kickoff can be pre-signed.
+/// Error prefix: the fixed-depth BitVM2 claim tree has no free leaf.
+pub const BITVM2_CLAIM_TREE_FULL: &str = "bitvm2 claim tree full";
+
+/// Claim-tree-full apply error: ours, or the pre-fix leaf builder message
+/// (txs queued by older seats).
+pub fn is_bitvm2_claim_tree_full(err: &str) -> bool {
+    err.contains(BITVM2_CLAIM_TREE_FULL) || err.contains("too many leaves for MERKLE_DEPTH")
+}
+
 pub fn btc_withdraw_note_id(from: &str, amount: u64, external_to: &str) -> String {
     sha256_hex(format!("wd:BTC:{from}:{amount}:{external_to}").as_bytes())
 }
@@ -252,6 +261,37 @@ pub fn merkle_root_protocol(leaf: &str, path: &[String], index: u32) -> String {
 pub const BTC_FORK_MAX: usize = 144;
 /// v2.10.1: a pending fork this many headers behind a heavier main tip is dropped.
 pub const BTC_FORK_STALE_N: u64 = 6;
+
+/// Most-work rail: side headers deeper than this below the tip are dropped
+/// (and a new side header must fork within it). One day of blocks.
+pub const BTC_SIDE_DEPTH: u64 = 144;
+/// Most-work rail: hard cap on stored side headers.
+pub const BTC_SIDE_MAX: usize = 1024;
+
+/// Contextual rules the most-work rail enforces (testnet4 by default; tests
+/// use a regtest-style limit so headers can be mined in microseconds).
+#[derive(Debug, Clone, Copy)]
+pub struct BtcHeaderRules {
+    pub pow_limit_bits: u32,
+}
+
+impl BtcHeaderRules {
+    pub const TESTNET4: BtcHeaderRules = BtcHeaderRules { pow_limit_bits: btc_spv::POW_LIMIT_BITS };
+}
+
+/// Most-work rail context for one header.
+///
+/// `utc_now_secs` is the clock for Bitcoin's 2-hour future limit. FPL chain
+/// time (`sealed_at_ms`) counts from genesis and is not UTC, so it cannot be
+/// used. Consensus (block apply) passes the parent ledger's attested
+/// `sealed_utc_ms` once the UTC header (`utc_header`, `H_utc`) is armed, and
+/// `None` until then (no consensus future check). Mempool admission passes
+/// the seat's OS wall clock, so honest packers never pack a header more than
+/// 2 h ahead even before `H_utc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MostWork {
+    pub utc_now_secs: Option<u64>,
+}
 
 fn header_work(h: &RailHeader) -> u128 {
     btc_spv::parse_header_hex(&h.raw)
@@ -347,6 +387,13 @@ pub struct RailState {
     /// is byte-identical to 2.10.0 until then.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub btc_fork_alt: Vec<RailHeader>,
+    /// BTC4 most-work rail (`btc4_most_work_from_height`): every valid side
+    /// header within [`BTC_SIDE_DEPTH`] of the tip, keyed by lowercase display
+    /// hash. Replaces the two fixed `btc_fork` / `btc_fork_alt` slots, so any
+    /// number of equal-work branches can be held at once. Always empty (and not
+    /// serialized) before activation, so the commitment is unchanged until then.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub btc_side: BTreeMap<String, RailHeader>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,6 +462,7 @@ impl RailState {
             bitvm2_instance_spk: None,
             btc_fork: Vec::new(),
             btc_fork_alt: Vec::new(),
+            btc_side: BTreeMap::new(),
         }
     }
 
@@ -505,6 +553,434 @@ impl RailState {
         let fork_fix = fork_fix && self.asset == RAIL_BTC4;
         let slot_fix = slot_fix && fork_fix;
         self.submit_btc_header_strict(h, fork_fix, slot_fix)
+    }
+
+    /// BTC4 most-work rail (`btc4_most_work_from_height`) on top of
+    /// [`Self::submit_header_ex3`]. `most_work = Some(..)` switches the BTC4
+    /// rail to [`Self::submit_btc_header_most_work`] with testnet4 rules;
+    /// `None` is exactly the pre-activation behaviour. See [`MostWork`] for
+    /// which clock the 2-hour future limit uses.
+    pub fn submit_header_ex4(
+        &mut self,
+        h: RailHeader,
+        strict: bool,
+        fork_fix: bool,
+        slot_fix: bool,
+        most_work: Option<MostWork>,
+    ) -> Result<bool, String> {
+        if let Some(mw) = most_work {
+            if strict && self.asset == RAIL_BTC4 {
+                return self.submit_btc_header_most_work(h, mw.utc_now_secs, BtcHeaderRules::TESTNET4);
+            }
+        }
+        self.submit_header_ex3(h, strict, fork_fix, slot_fix)
+    }
+
+    fn btc_side_key(hash: &str) -> String {
+        hash.trim().to_ascii_lowercase()
+    }
+
+    /// Header `(height, hash)` on the main chain or in the side store.
+    fn btc_mw_get(&self, height: u64, hash: &str) -> Option<&RailHeader> {
+        if let Some(m) = self.headers.get(&height) {
+            if btc_spv::hex_eq(&m.hash, hash) {
+                return Some(m);
+            }
+        }
+        self.btc_side
+            .get(&Self::btc_side_key(hash))
+            .filter(|s| s.height == height)
+    }
+
+    fn btc_mw_on_main(&self, height: u64, hash: &str) -> bool {
+        self.headers
+            .get(&height)
+            .map(|m| btc_spv::hex_eq(&m.hash, hash))
+            .unwrap_or(false)
+    }
+
+    /// Up to `n` headers from `(height, hash)` back (inclusive), newest first.
+    fn btc_mw_ancestors(&self, height: u64, hash: &str, n: usize) -> Vec<(u64, btc_spv::ParsedHeader)> {
+        let mut out = Vec::with_capacity(n.min(64));
+        let mut cur = (height, hash.to_string());
+        while out.len() < n && cur.0 > 0 {
+            let Some(hh) = self.btc_mw_get(cur.0, &cur.1) else { break };
+            let Ok(p) = btc_spv::parse_header_hex(&hh.raw) else { break };
+            cur = (cur.0 - 1, p.prev_display.clone());
+            out.push((hh.height, p));
+        }
+        out
+    }
+
+    /// Required nBits for a child of `parent` at `child_height` (Core
+    /// `GetNextWorkRequired`, testnet4: min-difficulty after > 20 minutes,
+    /// BIP94 retarget from the first header of the period).
+    fn btc_mw_required_bits(
+        &self,
+        parent_height: u64,
+        parent: &btc_spv::ParsedHeader,
+        child_height: u64,
+        child_time: u32,
+        rules: BtcHeaderRules,
+    ) -> Result<u32, String> {
+        let lim = rules.pow_limit_bits;
+        if child_height % btc_spv::DIFF_INTERVAL != 0 {
+            if child_time as u64 > parent.timestamp as u64 + 2 * btc_spv::POW_TARGET_SPACING as u64 {
+                return Ok(lim);
+            }
+            // Last header that is a retarget or not min-difficulty.
+            let mut h = parent_height;
+            let mut p = parent.clone();
+            loop {
+                if h % btc_spv::DIFF_INTERVAL == 0 || p.bits != lim {
+                    return Ok(p.bits);
+                }
+                match self
+                    .btc_mw_get(h - 1, &p.prev_display)
+                    .and_then(|x| btc_spv::parse_header_hex(&x.raw).ok())
+                {
+                    Some(q) => {
+                        h -= 1;
+                        p = q;
+                    }
+                    // Walked past stored history (fresh anchor only): use
+                    // the rail's tracked last non-min-diff nBits.
+                    None if self.last_real_bits != 0 => return Ok(self.last_real_bits),
+                    None => return Err("BTC bits: no stored non-min-difficulty ancestor".into()),
+                }
+            }
+        }
+        // Retarget: the first header of the closing period is child - 2016.
+        let first_h = child_height - btc_spv::DIFF_INTERVAL;
+        let mut h = parent_height;
+        let mut p = parent.clone();
+        while h > first_h {
+            match self
+                .btc_mw_get(h - 1, &p.prev_display)
+                .and_then(|x| btc_spv::parse_header_hex(&x.raw).ok())
+            {
+                Some(q) => {
+                    h -= 1;
+                    p = q;
+                }
+                None => {
+                    return Err(format!(
+                        "BTC retarget at {child_height}: period start {first_h} is not stored"
+                    ))
+                }
+            }
+        }
+        btc_spv::retarget_bip94(p.bits, p.timestamp, parent.timestamp, lim)
+            .ok_or_else(|| "BTC retarget: invalid nBits in period".to_string())
+    }
+
+    /// Bitcoin Core contextual header checks for testnet4: version, pow
+    /// limit, median-time-past, 2-hour future limit, BIP94 timewarp and the
+    /// exact required nBits.
+    fn btc_mw_check_context(
+        &self,
+        height: u64,
+        parsed: &btc_spv::ParsedHeader,
+        parent_height: u64,
+        parent: &btc_spv::ParsedHeader,
+        utc_now_secs: Option<u64>,
+        rules: BtcHeaderRules,
+    ) -> Result<(), String> {
+        if parsed.version < btc_spv::MIN_HEADER_VERSION {
+            return Err(format!("BTC header version {} below 4 (bad-version)", parsed.version));
+        }
+        if !btc_spv::bits_within_pow_limit(parsed.bits, rules.pow_limit_bits) {
+            return Err(format!("BTC header nBits {:08x} outside the pow limit (bad-diffbits)", parsed.bits));
+        }
+        let times: Vec<u32> = self
+            .btc_mw_ancestors(parent_height, &parent.hash_display, btc_spv::MEDIAN_TIME_SPAN)
+            .iter()
+            .map(|(_, p)| p.timestamp)
+            .collect();
+        // Core always has the full window; a freshly anchored rail does not,
+        // and a partial median is not Core's rule, so wait for 11 ancestors.
+        let mtp = if times.len() == btc_spv::MEDIAN_TIME_SPAN { btc_spv::median_time_past(&times) } else { None };
+        if let Some(mtp) = mtp {
+            if parsed.timestamp <= mtp {
+                return Err(format!(
+                    "BTC header time {} not after median time past {} (time-too-old)",
+                    parsed.timestamp, mtp
+                ));
+            }
+        }
+        if let Some(now) = utc_now_secs {
+            if parsed.timestamp as u64 > now.saturating_add(btc_spv::MAX_FUTURE_BLOCK_TIME_SECS) {
+                return Err(format!(
+                    "BTC header time {} more than 2h after UTC {} (time-too-new)",
+                    parsed.timestamp, now
+                ));
+            }
+        }
+        if height % btc_spv::DIFF_INTERVAL == 0
+            && parsed.timestamp < parent.timestamp.saturating_sub(btc_spv::MAX_TIMEWARP_SECS)
+        {
+            return Err(format!(
+                "BTC header time {} more than 600s before parent {} at a retarget (time-timewarp-attack)",
+                parsed.timestamp, parent.timestamp
+            ));
+        }
+        let want = self.btc_mw_required_bits(parent_height, parent, height, parsed.timestamp, rules)?;
+        if parsed.bits != want {
+            return Err(format!(
+                "BTC bits {:08x} != required {:08x} at {} (bad-diffbits)",
+                parsed.bits, want, height
+            ));
+        }
+        Ok(())
+    }
+
+    /// One-time move of the two legacy fork slots into the side store.
+    fn btc_mw_migrate_slots(&mut self) {
+        if self.btc_fork.is_empty() && self.btc_fork_alt.is_empty() {
+            return;
+        }
+        let mut v = std::mem::take(&mut self.btc_fork);
+        v.extend(std::mem::take(&mut self.btc_fork_alt));
+        for f in v {
+            if !self.btc_mw_on_main(f.height, &f.hash) {
+                self.btc_side.insert(Self::btc_side_key(&f.hash), f);
+            }
+        }
+    }
+
+    /// Side headers from `(height, hash)` back to (excluding) the first main
+    /// ancestor, oldest first, plus that fork height. `None` if disconnected.
+    fn btc_mw_branch(&self, height: u64, hash: &str) -> Option<(u64, Vec<RailHeader>)> {
+        let mut out = Vec::new();
+        let mut cur = (height, Self::btc_side_key(hash));
+        loop {
+            if self.btc_mw_on_main(cur.0, &cur.1) {
+                out.reverse();
+                return Some((cur.0, out));
+            }
+            let s = self.btc_side.get(&cur.1).filter(|s| s.height == cur.0)?;
+            if cur.0 == 0 {
+                return None;
+            }
+            out.push(s.clone());
+            cur = (cur.0 - 1, Self::btc_side_key(&s.parent_hash));
+        }
+    }
+
+    fn btc_mw_branch_work(v: &[RailHeader]) -> u128 {
+        v.iter().map(header_work).fold(0, u128::saturating_add)
+    }
+
+    /// Drop side headers more than [`BTC_SIDE_DEPTH`] below the tip and any
+    /// side header whose parent is no longer stored.
+    fn btc_mw_prune_side(&mut self) {
+        let tip = self.tip_height;
+        self.btc_side.retain(|_, s| s.height.saturating_add(BTC_SIDE_DEPTH) > tip);
+        loop {
+            let orphans: Vec<String> = self
+                .btc_side
+                .iter()
+                .filter(|(_, s)| s.height == 0 || self.btc_mw_get(s.height - 1, &s.parent_hash).is_none())
+                .map(|(k, _)| k.clone())
+                .collect();
+            if orphans.is_empty() {
+                break;
+            }
+            for k in orphans {
+                self.btc_side.remove(&k);
+            }
+        }
+    }
+
+    /// Store a validated side header. When full, evict the lowest-work leaf
+    /// (ties: lowest height, then greatest hash) if the newcomer's branch has
+    /// at least that much work; otherwise refuse.
+    fn btc_mw_insert_side(&mut self, h: RailHeader) -> Result<(), String> {
+        if self.btc_side.len() >= BTC_SIDE_MAX {
+            self.btc_mw_prune_side();
+        }
+        if self.btc_side.len() >= BTC_SIDE_MAX {
+            let parents: BTreeSet<String> =
+                self.btc_side.values().map(|s| Self::btc_side_key(&s.parent_hash)).collect();
+            let mut victim: Option<(u128, u64, String)> = None;
+            for (k, s) in &self.btc_side {
+                if parents.contains(k) {
+                    continue;
+                }
+                let w = self
+                    .btc_mw_branch(s.height, &s.hash)
+                    .map(|(_, b)| Self::btc_mw_branch_work(&b))
+                    .unwrap_or(0);
+                let better = match &victim {
+                    None => true,
+                    Some((vw, vh, vk)) => (w, s.height) < (*vw, *vh) || ((w, s.height) == (*vw, *vh) && k > vk),
+                };
+                if better {
+                    victim = Some((w, s.height, k.clone()));
+                }
+            }
+            let parent_branch = self
+                .btc_mw_branch(h.height - 1, &h.parent_hash)
+                .map(|(_, b)| Self::btc_mw_branch_work(&b))
+                .unwrap_or(0);
+            let mine = parent_branch.saturating_add(header_work(&h));
+            match victim {
+                Some((vw, _, vk)) if mine >= vw => {
+                    self.btc_side.remove(&vk);
+                }
+                _ => return Err("BTC side header store full".into()),
+            }
+        }
+        self.btc_side.insert(Self::btc_side_key(&h.hash), h);
+        Ok(())
+    }
+
+    /// Reorg onto the branch ending at `h` iff its work from the fork point
+    /// is strictly greater than the main suffix it replaces. Equal work keeps
+    /// the current main chain (first-seen). Returns whether the tip moved.
+    fn btc_mw_try_reorg(&mut self, h: &RailHeader) -> Result<bool, String> {
+        let (fork_h, branch) = self
+            .btc_mw_branch(h.height, &h.hash)
+            .ok_or("BTC side branch disconnected")?;
+        if branch.is_empty() {
+            return Ok(false);
+        }
+        let bw = Self::btc_mw_branch_work(&branch);
+        if bw <= self.btc_main_work_from(fork_h + 1) {
+            return Ok(false);
+        }
+        // Old main suffix becomes a side branch (it may win back later).
+        let old: Vec<u64> = self.headers.range(fork_h + 1..).map(|(k, _)| *k).collect();
+        for k in old {
+            if let Some(o) = self.headers.remove(&k) {
+                self.btc_side.insert(Self::btc_side_key(&o.hash), o);
+            }
+        }
+        for b in branch {
+            self.btc_side.remove(&Self::btc_side_key(&b.hash));
+            self.tip_height = b.height;
+            self.tip_hash = b.hash.clone();
+            self.tip_merkle_root = b.merkle_root.clone();
+            self.headers.insert(b.height, b);
+        }
+        let lrb = self.btc_last_real_bits(self.tip_height, 0);
+        if lrb != 0 {
+            self.last_real_bits = lrb;
+        }
+        self.btc_fork.clear();
+        self.btc_fork_alt.clear();
+        self.prune_btc_headers();
+        Ok(true)
+    }
+
+    /// BTC4 most-work rail. Every valid header whose parent is stored (main
+    /// chain or side store) is kept; the rail follows the branch with the
+    /// most cumulative work. Tie-break on equal work: **first-seen** — the
+    /// main chain stays where it is until a branch has strictly more work
+    /// (Bitcoin Core's rule; FPL ledger order makes "first" identical on
+    /// every seat). Any number of equal-work branches can wait side by side,
+    /// so the 161859-style split cannot jam the rail. Headers also pass
+    /// Bitcoin Core's testnet4 contextual checks (see
+    /// [`Self::btc_mw_check_context`]).
+    pub(crate) fn submit_btc_header_most_work(
+        &mut self,
+        mut h: RailHeader,
+        utc_now_secs: Option<u64>,
+        rules: BtcHeaderRules,
+    ) -> Result<bool, String> {
+        if h.raw.is_empty() {
+            return Err("BTC rail requires 80-byte Bitcoin header".into());
+        }
+        let parsed = btc_spv::parse_header_hex(&h.raw)?;
+        if !btc_spv::bits_within_pow_limit(parsed.bits, rules.pow_limit_bits) {
+            return Err(format!("BTC header nBits {:08x} outside the pow limit (bad-diffbits)", parsed.bits));
+        }
+        if !btc_spv::hash_meets_target(&parsed.hash_internal, parsed.bits) {
+            return Err("BTC header does not meet target".into());
+        }
+        h.hash = parsed.hash_display.clone();
+        h.parent_hash = parsed.prev_display.clone();
+        h.merkle_root = parsed.merkle_display.clone();
+        h.raw = parsed.raw_hex.clone();
+
+        let tip_is_fixture = self.tip_height > 0
+            && self
+                .headers
+                .get(&self.tip_height)
+                .map(|t| t.raw.is_empty())
+                .unwrap_or(true);
+        if self.tip_height == 0 || tip_is_fixture {
+            // Anchoring rules are unchanged.
+            return self.submit_btc_header(h).map(|_| true);
+        }
+        self.btc_mw_migrate_slots();
+        if h.height == 0 {
+            return Err("header height 0".into());
+        }
+        if self.btc_mw_on_main(h.height, &h.hash) {
+            return Err(format!("BTC duplicate header at {}", h.height));
+        }
+        if self.btc_side.contains_key(&Self::btc_side_key(&h.hash)) {
+            return Err(format!("BTC duplicate header at {} (side branch)", h.height));
+        }
+        let ph = h.height - 1;
+        let parent = self.btc_mw_get(ph, &h.parent_hash).cloned().ok_or_else(|| {
+            format!(
+                "BTC header parent mismatch: parent {} of {} is not stored (main or side)",
+                h.parent_hash, h.height
+            )
+        })?;
+        let parent_p = btc_spv::parse_header_hex(&parent.raw)?;
+        let extends_tip = ph == self.tip_height && self.btc_mw_on_main(ph, &h.parent_hash);
+        if !extends_tip && h.height.saturating_add(BTC_SIDE_DEPTH) <= self.tip_height {
+            return Err(format!(
+                "BTC side header at {} is more than {} below tip {}",
+                h.height, BTC_SIDE_DEPTH, self.tip_height
+            ));
+        }
+        self.btc_mw_check_context(h.height, &parsed, ph, &parent_p, utc_now_secs, rules)?;
+        if extends_tip {
+            if parsed.bits != btc_spv::POW_LIMIT_BITS {
+                self.last_real_bits = parsed.bits;
+            }
+            self.commit_header(h, false)?;
+            self.btc_mw_prune_side();
+            return Ok(true);
+        }
+        self.btc_mw_insert_side(h.clone())?;
+        let moved = self.btc_mw_try_reorg(&h)?;
+        self.btc_mw_prune_side();
+        Ok(moved)
+    }
+
+    /// Status only (non-consensus): side-store summary, best tips first.
+    pub fn btc_side_summary(&self) -> Option<serde_json::Value> {
+        if self.btc_side.is_empty() {
+            return None;
+        }
+        let parents: BTreeSet<String> =
+            self.btc_side.values().map(|s| Self::btc_side_key(&s.parent_hash)).collect();
+        let mut tips: Vec<(u128, u64, String, u64, usize)> = self
+            .btc_side
+            .iter()
+            .filter(|(k, _)| !parents.contains(*k))
+            .filter_map(|(_, s)| {
+                let (fh, b) = self.btc_mw_branch(s.height, &s.hash)?;
+                Some((Self::btc_mw_branch_work(&b), s.height, s.hash.clone(), fh, b.len()))
+            })
+            .collect();
+        tips.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        Some(serde_json::json!({
+            "len": self.btc_side.len(),
+            "tips": tips.iter().take(8).map(|(w, ht, hs, fh, n)| serde_json::json!({
+                "tip_height": ht,
+                "tip_hash": hs,
+                "fork_height": fh,
+                "len": n,
+                "work": w.to_string(),
+                "main_work": self.btc_main_work_from(fh + 1).to_string(),
+            })).collect::<Vec<_>>(),
+        }))
     }
 
     fn submit_btc_header_strict(&mut self, mut h: RailHeader, fork_fix: bool, slot_fix: bool) -> Result<bool, String> {
@@ -1492,6 +1968,65 @@ impl RailState {
     }
 
     /// Open a BitVM2 withdraw (no Kickoff). Operator fronts BTC + posts Claim.
+    /// Fix B: drop claim-tree leaves whose claim is settled, keep every leaf a
+    /// live claim may still need. Live = `AwaitingPegout`/`PegoutPosted` (the
+    /// operator still has to prove inclusion) and `ClaimPosted`/`Challenged`
+    /// (inside the challenge window). Settled = `PaidOptimistic` (window over),
+    /// `Refunded`, `Disproved`, and leaves with no claim. Order of the kept
+    /// leaves is unchanged. Returns how many were removed; the root is rebuilt
+    /// only when something changed. Conservative: if any live claim's leaf
+    /// cannot be derived, nothing is pruned.
+    pub fn prune_settled_bitvm2_leaves(&mut self) -> Result<usize, String> {
+        use crate::bitvm2_exit::Bitvm2Status as S;
+        let mut live: BTreeMap<String, usize> = BTreeMap::new();
+        for c in self.bitvm2_claims.values() {
+            if !matches!(c.status, S::AwaitingPegout | S::PegoutPosted | S::ClaimPosted | S::Challenged) {
+                continue;
+            }
+            let leaf = if !c.mimc_leaf_hex.is_empty() {
+                c.mimc_leaf_hex.to_ascii_lowercase()
+            } else {
+                match bitvm::dest_h160_from_address(&c.dest) {
+                    Ok(h) => crate::bitvm2_exit::mimc_leaf_hex(&c.note_id, &h, c.amount),
+                    Err(_) => return Ok(0),
+                }
+            };
+            *live.entry(leaf).or_insert(0) += 1;
+        }
+        let before = self.bitvm2_claim_leaves.len();
+        let kept: Vec<String> = self
+            .bitvm2_claim_leaves
+            .iter()
+            .filter(|l| match live.get_mut(&l.to_ascii_lowercase()) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    true
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        let removed = before - kept.len();
+        if removed > 0 {
+            self.bitvm2_claim_root = crate::bitvm2_exit::mimc_root_from_leaves(&kept)?;
+            self.bitvm2_claim_leaves = kept;
+        }
+        Ok(removed)
+    }
+
+    /// `Err(BITVM2_CLAIM_TREE_FULL ..)` when no new BitVM2 claim leaf fits.
+    pub fn bitvm2_claim_tree_check(&self) -> Result<(), String> {
+        let cap = fd_pl_bitvm2::leaf::claim_tree_capacity();
+        if self.bitvm2_claim_leaves.len() >= cap {
+            return Err(format!(
+                "{BITVM2_CLAIM_TREE_FULL} ({}/{cap}) on {}: peg-outs need a capacity release",
+                self.bitvm2_claim_leaves.len(),
+                self.asset
+            ));
+        }
+        Ok(())
+    }
+
     pub fn open_bitvm2_withdraw(
         &mut self,
         note_id: &str,
@@ -1503,6 +2038,11 @@ impl RailState {
         if self.bitvm2_claims.contains_key(note_id) {
             return Err("bitvm2 claim exists".into());
         }
+        // Refuse before touching the tree. The leaf list is append-only and the
+        // circuit depth is fixed, so once it is full every later withdraw failed
+        // with the transient-looking "too many leaves" and sat unpacked at the
+        // account head forever (BTC4, 14 Nov 2026: 16/16 leaves).
+        self.bitvm2_claim_tree_check()?;
         let dest_h160 = bitvm::dest_h160_from_address(dest)?;
         crate::bitvm2_exit::append_mimc_leaf(
             &mut self.bitvm2_claim_leaves,
@@ -1755,6 +2295,19 @@ impl RailState {
     /// bytes are ignored, so a garbage submission can no longer disprove an
     /// honest claim.
     pub fn disprove_bitvm2_v2(&mut self, note_id: &str, vk_bytes: &[u8]) -> Result<bool, String> {
+        self.disprove_bitvm2_v2_ex(note_id, vk_bytes, false)
+    }
+
+    /// [`Self::disprove_bitvm2_v2`]. `stored_root` (fix B, from the leaf-prune
+    /// height) checks the stored proof against the claim root it was attested
+    /// under instead of the live tree, so pruning settled leaves (or appending
+    /// new ones) cannot make an honest in-window claim look disproved.
+    pub fn disprove_bitvm2_v2_ex(
+        &mut self,
+        note_id: &str,
+        vk_bytes: &[u8],
+        stored_root: bool,
+    ) -> Result<bool, String> {
         if vk_bytes.is_empty() {
             return Err("bitvm2 v2: no ceremony verifying key in this release".into());
         }
@@ -1779,19 +2332,35 @@ impl RailState {
         let dest_h160 = bitvm::dest_h160_from_address(&c.dest)?;
         let pegout = crate::bitvm2_exit::pegout_txid_bytes(&c.pegout_txid_hex)?;
         let header = crate::bitvm2_exit::checkpoint_header_hash(c.checkpoint_height, &ckpt_hash);
-        match crate::bitvm2_exit::verify_withdraw_attest_vk_bytes(
-            vk_bytes,
-            note_id,
-            &dest_h160,
-            c.amount,
-            c.checkpoint_height,
-            &header,
-            &pegout,
-            &self.bitvm2_claim_leaves,
-            &c.proof_hex,
-            &c.public_hex,
-            &c.statement_digest_hex,
-        ) {
+        let verdict = if stored_root {
+            crate::bitvm2_exit::verify_stored_withdraw_attest_vk_bytes(
+                vk_bytes,
+                note_id,
+                &dest_h160,
+                c.amount,
+                c.checkpoint_height,
+                &header,
+                &pegout,
+                &c.proof_hex,
+                &c.public_hex,
+                &c.statement_digest_hex,
+            )
+        } else {
+            crate::bitvm2_exit::verify_withdraw_attest_vk_bytes(
+                vk_bytes,
+                note_id,
+                &dest_h160,
+                c.amount,
+                c.checkpoint_height,
+                &header,
+                &pegout,
+                &self.bitvm2_claim_leaves,
+                &c.proof_hex,
+                &c.public_hex,
+                &c.statement_digest_hex,
+            )
+        };
+        match verdict {
             Ok(()) => Ok(false),
             Err(_) => {
                 if let Some(cl) = self.bitvm2_claims.get_mut(note_id) {
@@ -3485,6 +4054,86 @@ mod tests {
             f.rail.bitvm2_claims.get(&f.note).unwrap().status,
             crate::bitvm2_exit::Bitvm2Status::Disproved
         );
+    }
+
+    /// Fix B: an honest in-window (`ClaimPosted`) claim stays undisprovable
+    /// after the live tree changes (later burns append, settled leaves are
+    /// pruned), while a tampered stored attestation is still disproved.
+    #[test]
+    fn fixb_disprove_in_window_claim_after_append_and_prune() {
+        use crate::bitvm2_exit::Bitvm2Status as S;
+        let (pk, vk, vkb) = m1_keys();
+        let mut f = m1_fixture(&pk, &vk);
+        // A settled claim opened before ours, so its leaf sits in the tree.
+        let mut r0 = RailState::new(RAIL_BTC);
+        r0.open_bitvm2_withdraw("settled-1", "bob", &f.dest, 7_000, 90).unwrap();
+        let settled_leaf = r0.bitvm2_claim_leaves[0].clone();
+        f.rail.attest_bitvm2_claim_v2(&f.attest, "op", &vkb, 200).unwrap();
+        assert_eq!(f.rail.bitvm2_claims[&f.note].status, S::ClaimPosted);
+        // Later burns append leaves: the live root moves on.
+        f.rail.open_bitvm2_withdraw("later-1", "carol", &f.dest, 5_000, 210).unwrap();
+        f.rail.open_bitvm2_withdraw("later-2", "carol", &f.dest, 6_000, 211).unwrap();
+        // Legacy Disprove (live tree) now wrongly calls the honest claim invalid.
+        let mut legacy = f.rail.clone();
+        assert!(legacy.disprove_bitvm2_v2_ex(&f.note, &vkb, false).unwrap());
+        // Fix B Disprove (attest-time root) holds.
+        let mut fixed = f.rail.clone();
+        assert!(!fixed.disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+        assert_eq!(fixed.bitvm2_claims[&f.note].status, S::ClaimPosted);
+        // Prune: add a refunded claim's leaf in front, then prune it.
+        let mut p = f.rail.clone();
+        p.bitvm2_claim_leaves.insert(0, settled_leaf.clone());
+        let mut sc = r0.bitvm2_claims["settled-1"].clone();
+        sc.status = S::Refunded;
+        p.bitvm2_claims.insert("settled-1".into(), sc);
+        assert_eq!(p.prune_settled_bitvm2_leaves().unwrap(), 1);
+        assert!(!p.bitvm2_claim_leaves.contains(&settled_leaf));
+        assert!(p.bitvm2_claim_leaves.contains(&p.bitvm2_claims[&f.note].mimc_leaf_hex));
+        assert!(!p.clone().disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+        // Tampering is still caught in stored-root mode.
+        let mut t = p.clone();
+        t.bitvm2_claims.get_mut(&f.note).unwrap().statement_digest_hex = "00".repeat(32);
+        assert!(t.disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+        assert_eq!(t.bitvm2_claims[&f.note].status, S::Disproved);
+        let mut t2 = p.clone();
+        t2.bitvm2_claims.get_mut(&f.note).unwrap().amount = 19_999;
+        assert!(t2.disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+        let mut t3 = p.clone();
+        t3.bitvm2_claims.get_mut(&f.note).unwrap().public_hex[4] = format!("{:064x}", 1);
+        assert!(t3.disprove_bitvm2_v2_ex(&f.note, &vkb, true).unwrap());
+    }
+
+    #[test]
+    fn fixb_prune_keeps_live_statuses_and_is_a_noop_when_nothing_settles() {
+        use crate::bitvm2_exit::Bitvm2Status as S;
+        let mut r = RailState::new(RAIL_BTC4);
+        let pk = crate::btc_tx::compressed_pubkey_from_secret(&[9u8; 32]).unwrap();
+        let dest = crate::vault::p2wpkh_testnet_address(&pk).unwrap();
+        let st = [S::AwaitingPegout, S::PegoutPosted, S::ClaimPosted, S::Challenged, S::PaidOptimistic, S::Refunded, S::Disproved];
+        for (i, s_) in st.iter().enumerate() {
+            let note = format!("n{i}");
+            r.open_bitvm2_withdraw(&note, "a", &dest, 1_000 + i as u64, 1).unwrap();
+            r.bitvm2_claims.get_mut(&note).unwrap().status = s_.clone();
+        }
+        // An orphan leaf with no claim is settled too.
+        r.bitvm2_claim_leaves.push("11".repeat(32));
+        let root0 = r.bitvm2_claim_root.clone();
+        assert_eq!(r.prune_settled_bitvm2_leaves().unwrap(), 4);
+        assert_eq!(r.bitvm2_claim_leaves.len(), 4);
+        assert_ne!(r.bitvm2_claim_root, root0);
+        for i in 0..4 {
+            assert_eq!(r.bitvm2_claim_leaves[i], r.bitvm2_claims[&format!("n{i}")].mimc_leaf_hex, "order kept");
+        }
+        let root1 = r.bitvm2_claim_root.clone();
+        assert_eq!(r.prune_settled_bitvm2_leaves().unwrap(), 0);
+        assert_eq!(r.bitvm2_claim_root, root1);
+        // Everything settled: empty tree, empty root (same as a fresh rail).
+        for c in r.bitvm2_claims.values_mut() {
+            c.status = S::PaidOptimistic;
+        }
+        assert_eq!(r.prune_settled_bitvm2_leaves().unwrap(), 4);
+        assert!(r.bitvm2_claim_leaves.is_empty());
+        assert_eq!(r.bitvm2_claim_root, "");
     }
 
     #[test]
