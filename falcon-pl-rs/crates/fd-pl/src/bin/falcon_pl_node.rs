@@ -327,7 +327,14 @@ async fn emit_or_shed(
     bytes: &[u8],
     who: &str,
     dir: &str,
+    lean: bool,
 ) -> Result<(), PipeShed> {
+    // Lean tx gossip: queued lines are always hex. A session whose peer advertised
+    // `lean-tx-gossip-v1` in its Hello gets tx gossip with `b64:` sigs; the
+    // choice is made here, per socket, so a line queued before a peer
+    // restarted on an older binary is never sent lean to it.
+    let lean_line = if lean { fd_pl::lean_tx_gossip_line(bytes) } else { None };
+    let bytes = lean_line.as_deref().map(str::as_bytes).unwrap_or(bytes);
     match write_or_shed(writer, probe, bytes).await {
         Ok(()) => Ok(()),
         Err(WriteEnd::Dropped { unsent }) => {
@@ -1843,7 +1850,7 @@ impl Shared {
         for id in send {
             let tx = {
                 let n = self.node.lock();
-                n.mempool.get(&id).cloned()
+                n.mempool.get_tx(&id)
             };
             let Some(tx) = tx else {
                 continue;
@@ -4229,6 +4236,10 @@ async fn peer_session(
     // the biased select can see a closed reply channel before the task.
     let yield_dial = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let yield_dial_r = yield_dial.clone();
+    // Lean tx gossip: this session's peer advertised lean tx gossip (false until
+    // its Hello on *this* socket says so; never carried across reconnects).
+    let lean_sess = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lean_r = lean_sess.clone();
     let my_id_r = my_id.to_string();
     let peer_id_w = peer_id.clone();
     let hello_rejected: Arc<parking_lot::Mutex<Option<String>>> =
@@ -4250,8 +4261,13 @@ async fn peer_session(
                 continue;
             };
             {
-                if let WireMsg::Hello { id, .. } = &msg {
+                if let WireMsg::Hello { id, capabilities, .. } = &msg {
                     *peer_id.lock() = id.clone();
+                    lean_r.store(
+                        fd_pl::crypto::lean_tx_gossip_enabled()
+                            && fd_pl::crypto::peer_has_lean_tx_gossip(capabilities),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if !we_dial(&my_id_r, id) {
                         yield_dial_r.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -4270,8 +4286,8 @@ async fn peer_session(
                 }
                 *shared_r.wire_from.lock() = peer_id.lock().clone();
                 for reply in dispatch_wire(&shared_r, msg, Some(&fanout_r), false, false) {
-                    if let Ok(s) = serde_json::to_string(&reply) {
-                        let out = s + "\n";
+                    // Lean before piecing: a pieced reply is not rewritten later.
+                    if let Ok(out) = reply.to_wire_line(lean_r.load(std::sync::atomic::Ordering::Relaxed)) {
                         let is_catchup = matches!(
                             reply,
                             WireMsg::LedgersBatch { .. }
@@ -4327,7 +4343,7 @@ async fn peer_session(
                     "dish-gate {why} to {who} unsent={}",
                     tcp_unsent(probe).unwrap_or(0)
                 );
-                if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                     read_task.abort();
                     unsafe { libc::close(probe) };
                     return Err(PipeShed.into());
@@ -4347,7 +4363,7 @@ async fn peer_session(
             if let Ok(line) = body_rx.try_recv() {
                 recved(body_used, line.len());
                 if is_tx_dish(line.as_bytes()) {
-                    if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                    if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                         read_task.abort();
                         unsafe { libc::close(probe) };
                         return Err(PipeShed.into());
@@ -4356,7 +4372,7 @@ async fn peer_session(
                     inv_left = DISH_INV_BUDGET;
                     continue;
                 }
-                if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                     read_task.abort();
                     unsafe { libc::close(probe) };
                     return Err(PipeShed.into());
@@ -4370,7 +4386,7 @@ async fn peer_session(
             line = catchup_rx.recv() => {
                 match line {
                     Some(line) => {
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4385,7 +4401,7 @@ async fn peer_session(
             line = reply_rx.recv() => {
                 match line {
                     Some(line) => {
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4398,7 +4414,7 @@ async fn peer_session(
                 match line {
                     Some(line) => {
                         recved(cons_used, line.len());
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4411,7 +4427,7 @@ async fn peer_session(
                 match line {
                     Some(line) => {
                         recved(catch_used, line.len());
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4426,7 +4442,7 @@ async fn peer_session(
                         recved(body_used, line.len());
                         if is_tx_dish(line.as_bytes()) {
                             succ_hold.clear();
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 read_task.abort();
                                 unsafe { libc::close(probe) };
                                 return Err(PipeShed.into());
@@ -4435,7 +4451,7 @@ async fn peer_session(
                             inv_left = DISH_INV_BUDGET;
                         } else if is_body_successor(line.as_bytes()) && dish_blocking(&dish_since, probe) {
                             succ_hold.push_back(line);
-                        } else if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        } else if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4468,7 +4484,7 @@ async fn peer_session(
                         if unsent > CONS_LOW_WATER {
                             inv_left = inv_left.saturating_sub(line.len());
                         }
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4704,6 +4720,9 @@ async fn handle_inbound(
     let large_w = large_out.clone();
     let remote_w = remote.clone();
     let shared_w = shared.clone();
+    // Lean tx gossip for this inbound session (set from its Hello).
+    let lean_in = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lean_w = lean_in.clone();
     let mut writer_task = tokio::spawn(async move {
         let mut high_since = None;
         let mut last_unsent = 0usize;
@@ -4730,7 +4749,7 @@ async fn handle_inbound(
                         if dish_since.unwrap().elapsed() >= DISH_GATE { "timeout" } else { "release" },
                         tcp_unsent(probe).unwrap_or(0)
                     );
-                    if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound").await.is_err() {
+                    if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                         shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
@@ -4748,7 +4767,7 @@ async fn handle_inbound(
                 line = catch_reply_rx.recv() => {
                     match line {
                         Some(line) => {
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound").await.is_err() {
+                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -4759,7 +4778,7 @@ async fn handle_inbound(
                 line = reply_rx.recv() => {
                     match line {
                         Some(line) => {
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound").await.is_err() {
+                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -4791,7 +4810,7 @@ async fn handle_inbound(
                                 }
                                 inv_left = inv_left.saturating_sub(line.len());
                             }
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound").await.is_err() {
+                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -4862,6 +4881,13 @@ async fn handle_inbound(
                 }
             }
         }
+        if let WireMsg::Hello { capabilities, .. } = &msg {
+            lean_in.store(
+                fd_pl::crypto::lean_tx_gossip_enabled()
+                    && fd_pl::crypto::peer_has_lean_tx_gossip(capabilities),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if !inbound_registered {
             if let WireMsg::Hello { id, .. } = &msg {
                 if we_dial(my_id, id) {
@@ -4888,7 +4914,8 @@ async fn handle_inbound(
         let was_hello = matches!(msg, WireMsg::Hello { .. });
         let replies = dispatch_wire(&shared, msg, Some(&fanout), true, false);
         for r in replies {
-            let out = serde_json::to_string(&r)? + "\n";
+            // Lean before piecing: a pieced reply is not rewritten later.
+            let out = r.to_wire_line(lean_in.load(std::sync::atomic::Ordering::Relaxed))?;
             let pieces = shared.pieces_for(&seen_id, &out);
             if is_catchup_reply(&r) {
                 if !reply_send_pieced(&catch_reply_tx, out, pieces) {
@@ -5176,11 +5203,24 @@ fn serve_snap_chunk(shared: &Shared, sha256: &str, index: u32) -> Result<WireMsg
 /// One NeedSnapshot must finish the transfer; stop-and-wait died on WAN.
 fn dispatch_wire(
     shared: &Shared,
-    msg: WireMsg,
+    mut msg: WireMsg,
     fanout: Option<&Arc<Vec<PeerOut>>>,
     relay_state: bool,
     from_admin: bool,
 ) -> Vec<WireMsg> {
+    // Lean tx gossip carries `b64:` sigs; everything past this point
+    // (mempool, body fill, relay, pack) sees the same hex the sender held.
+    match msg.normalize_gossip_tx_sigs() {
+        Ok(0) => {}
+        Ok(dropped) => warn!(
+            "lean tx gossip from {}: dropped {dropped} tx(s) with non-canonical b64 sig",
+            shared.wire_from.lock()
+        ),
+        Err(e) => {
+            warn!("{e} from {}", shared.wire_from.lock());
+            return vec![WireMsg::Err { msg: e }];
+        }
+    }
     let push = matches!(msg, WireMsg::NeedSnapshot {});
     let mut out = Vec::new();
     if let Some(r) = process_msg(shared, msg, fanout, relay_state, from_admin) {
@@ -5543,7 +5583,7 @@ fn process_msg(
             let n = shared.node.lock();
             let txs: Vec<_> = ids
                 .iter()
-                .filter_map(|id| n.mempool.get(id).cloned())
+                .filter_map(|id| n.mempool.get_tx(id))
                 .take(32)
                 .collect();
             drop(n);
@@ -7328,6 +7368,74 @@ mod inbound_ack_tests {
     use std::sync::atomic::AtomicU64;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
+
+    /// Lean tx gossip lands in the pool as the sender's exact hex
+    /// tx; a non-canonical `b64:` sig is refused before anything sees it.
+    #[test]
+    fn lean_tx_gossip_is_normalised_at_dispatch() {
+        let shared = test_shared("v1");
+        let nid = shared.node.lock().cfg.network_id;
+        let mut uk = crate::KeyRing::default();
+        for acct in ["alice", "bob", "carol"] {
+            let _ = uk.generate_id(acct);
+        }
+        {
+            let mut n = shared.node.lock();
+            n.cfg.min_fee = 0;
+            n.cfg.fee_escalate = false;
+            for acct in ["alice", "bob", "carol"] {
+                let _ = n.keys.insert_public(acct, &uk.public_hex(acct).unwrap());
+                let mut a = n.state.get(acct);
+                a.balance = 50_000;
+                n.state.accounts.insert(acct.into(), a);
+            }
+        }
+        let seq = |n: &fd_pl::Node, a: &str| n.state.get(a).sequence;
+        let (tx_a, tx_b, tx_c) = {
+            let n = shared.node.lock();
+            (
+                fd_pl::Tx::sign_with(&uk, "alice", seq(&n, "alice"), "bob", 10, 2, nid).unwrap(),
+                fd_pl::Tx::sign_with(&uk, "bob", seq(&n, "bob"), "alice", 10, 2, nid).unwrap(),
+                fd_pl::Tx::sign_with(&uk, "carol", seq(&n, "carol"), "alice", 10, 2, nid).unwrap(),
+            )
+        };
+        // Lean SubmitTx, as a lean-capable peer's writer would send it.
+        let lean = WireMsg::SubmitTx { tx: tx_a.clone() }.to_wire_line(true).unwrap();
+        assert!(lean.contains("\"signature\":\"b64:"));
+        let msg: WireMsg = serde_json::from_str(lean.trim_end()).unwrap();
+        let _ = dispatch_wire(&shared, msg, None, false, false);
+        assert_eq!(shared.node.lock().mempool.get_tx(&tx_a.tx_id), Some(tx_a.clone()));
+        // Lean TxsBatch.
+        let lean = WireMsg::TxsBatch { txs: vec![tx_b.clone()] }.to_wire_line(true).unwrap();
+        let msg: WireMsg = serde_json::from_str(lean.trim_end()).unwrap();
+        let _ = dispatch_wire(&shared, msg, None, false, false);
+        assert_eq!(shared.node.lock().mempool.get_tx(&tx_b.tx_id), Some(tx_b.clone()));
+        // Non-canonical lean sig: refused, pool unchanged.
+        let mut bad = tx_c.clone();
+        let l = fd_pl::crypto::gossip_lean_sig(&bad.signature).unwrap();
+        bad.signature = format!("{}\n", l);
+        let replies = dispatch_wire(&shared, WireMsg::SubmitTx { tx: bad }, None, false, false);
+        assert!(matches!(&replies[..], [WireMsg::Err { msg }] if msg.contains("non-canonical")));
+        assert!(shared.node.lock().mempool.get(&tx_c.tx_id).is_none());
+        // Replies to a NeedMempoolTxs: hex for an old session, lean for a new one,
+        // and both decode to the same txs.
+        let replies = dispatch_wire(
+            &shared,
+            WireMsg::NeedMempoolTxs { ids: vec![tx_a.tx_id.clone(), tx_b.tx_id.clone()] },
+            None,
+            false,
+            false,
+        );
+        let [reply] = &replies[..] else { panic!("{replies:?}") };
+        let old = reply.to_wire_line(false).unwrap();
+        let new = reply.to_wire_line(true).unwrap();
+        assert!(!old.contains("b64:") && new.contains("b64:") && new.len() < old.len());
+        let mut back: WireMsg = serde_json::from_str(new.trim_end()).unwrap();
+        back.normalize_gossip_tx_sigs().unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap() + "\n", old);
+        // The writer-side rewrite of the queued hex line is the same lean line.
+        assert_eq!(fd_pl::lean_tx_gossip_line(old.as_bytes()).as_deref(), Some(new.as_str()));
+    }
 
     fn test_shared(id: &str) -> Arc<Shared> {
         let mut cfg = ChainConfig::default();

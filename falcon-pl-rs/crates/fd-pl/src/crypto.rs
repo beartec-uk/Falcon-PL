@@ -144,6 +144,127 @@ pub fn sig_to_lean(sig: &str) -> Option<String> {
     sig_bytes(sig).map(|b| format!("{LEAN_SIG_PREFIX}{}", b64_encode(&b)))
 }
 
+/// True when `s` is non-empty, even-length, lowercase hex: the only spelling
+/// that survives a bytes round trip unchanged (`hex::encode` is lowercase).
+pub fn is_canonical_hex(s: &str) -> bool {
+    !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Hello capability: this binary sends and accepts `b64:` tx signatures and
+/// carried tx public keys in tx gossip (`submit_tx`, `txs_batch`,
+/// `txs_by_ids`). Negotiated per session; not a consensus rule. A peer that
+/// does not advertise it only ever gets hex.
+pub const CAP_LEAN_TX_GOSSIP_V1: &str = "lean-tx-gossip-v1";
+
+/// Local switch for lean tx gossip. On by default; `FPL_LEAN_TX_GOSSIP=0`
+/// (or `false`/`off`) stops advertising the capability and sending `b64:`
+/// sigs. Receiving `b64:` gossip sigs is always accepted (strict decode).
+pub fn lean_tx_gossip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("FPL_LEAN_TX_GOSSIP").ok().as_deref().map(str::trim),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
+    })
+}
+
+/// True if a Hello capability list advertises [`CAP_LEAN_TX_GOSSIP_V1`].
+pub fn peer_has_lean_tx_gossip(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|c| c == CAP_LEAN_TX_GOSSIP_V1)
+}
+
+/// Gossip spelling of a pooled tx signature (or carried public key) for a
+/// lean-capable peer.
+/// Only canonical lowercase hex is rewritten, so the receiver's
+/// [`gossip_sig_to_hex`] gives back the exact same string. Anything else
+/// (empty, upper-case, already `b64:`) is sent unchanged.
+pub fn gossip_lean_sig(sig: &str) -> Option<String> {
+    if !is_canonical_hex(sig) {
+        return None;
+    }
+    hex::decode(sig).ok().map(|b| format!("{LEAN_SIG_PREFIX}{}", b64_encode(&b)))
+}
+
+/// Receiver side of tx gossip: a `b64:` sig must be canonical padded base64
+/// and becomes lowercase hex; any other spelling is returned unchanged (the
+/// normal admission checks judge it as before). `Err` = drop the tx.
+pub fn gossip_sig_to_hex(sig: &str) -> Result<std::borrow::Cow<'_, str>, String> {
+    match sig.strip_prefix(LEAN_SIG_PREFIX) {
+        Some(b) => b64_decode(b)
+            .map(|v| std::borrow::Cow::Owned(hex::encode(v)))
+            .ok_or_else(|| "non-canonical lean tx signature in gossip".to_string()),
+        None => Ok(std::borrow::Cow::Borrowed(sig)),
+    }
+}
+
+/// Lossless compact form of a hex field held in RAM (mempool). Canonical
+/// lowercase hex is kept as raw bytes (half the size); any other text is
+/// kept verbatim, so [`CompactHex::as_text`] always returns the input.
+#[derive(Clone, PartialEq, Eq)]
+pub enum CompactHex {
+    Bytes(Box<[u8]>),
+    Text(Box<str>),
+}
+
+impl CompactHex {
+    pub fn new(s: &str) -> Self {
+        if is_canonical_hex(s) {
+            if let Ok(b) = hex::decode(s) {
+                return CompactHex::Bytes(b.into_boxed_slice());
+            }
+        }
+        CompactHex::Text(s.into())
+    }
+
+    /// The original text (hex is re-encoded on demand).
+    pub fn as_text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            CompactHex::Bytes(b) => std::borrow::Cow::Owned(hex::encode(b)),
+            CompactHex::Text(t) => std::borrow::Cow::Borrowed(t),
+        }
+    }
+
+    /// Raw bytes when the field was canonical hex.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            CompactHex::Bytes(b) => Some(b),
+            CompactHex::Text(_) => None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            CompactHex::Bytes(b) => b.is_empty(),
+            CompactHex::Text(t) => t.is_empty(),
+        }
+    }
+
+    /// Equal to `s` as text, without allocating for the bytes form.
+    pub fn eq_text(&self, s: &str) -> bool {
+        match self {
+            CompactHex::Bytes(b) => {
+                s.len() == b.len() * 2 && hex::decode(s).is_ok_and(|v| v[..] == b[..]) && is_canonical_hex(s)
+            }
+            CompactHex::Text(t) => &**t == s,
+        }
+    }
+
+    /// Heap bytes held by this field.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            CompactHex::Bytes(b) => b.len(),
+            CompactHex::Text(t) => t.len(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CompactHex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.as_text())
+    }
+}
+
 /// SHA-256 hex. v2.9.59: computed with `ring` (runtime-detected SHA-NI /
 /// AVX2 / SSSE3 code; same digest as `sha2`, ~1.8x faster on CPUs without
 /// SHA-NI such as the Skylake seats).
