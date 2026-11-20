@@ -160,7 +160,7 @@ fn mempool_stores_hex_for_a_lean_submission() {
     let mut mp = Mempool::default();
     assert!(mp.insert(tx.clone(), 0).unwrap());
     let stored = mp.iter_candidates().next().unwrap();
-    assert_eq!(stored.signature, hex_sig);
+    assert_eq!(stored.signature(), hex_sig);
     assert_eq!(stored.tx_id, tx.tx_id);
 }
 
