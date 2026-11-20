@@ -263,6 +263,31 @@ pub fn bitvm2_m1_from_height(network_id: u32) -> u64 {
 /// `key_commit`) must get a `PayToKey` commit; see the 2.9.79 release notes.
 pub const TESTNET_2300_KEY_BIND_ONCHAIN_FROM_HEIGHT: u64 = 692_000;
 
+/// v2.11.6 lean block body: from this height the packer writes tx
+/// signatures as canonical `b64:` base64 (not hex) and leaves `batch_paths`
+/// off the body (receivers rebuild the Merkle root from the txs they already
+/// hold). Below it, bodies must stay in the legacy form, so old blocks are
+/// unchanged and stay valid. Hashes, roots and signed messages never change.
+///
+/// Armed at **923,200** in 2.11.6 (tip 920,972 at 06:01 GMT on 20 Nov 2026).
+/// Every seat must run 2.11.6 before this height: older binaries reject
+/// lean bodies.
+pub const TESTNET_2300_LEAN_BODY_FROM_HEIGHT: u64 = 923_200;
+
+/// Lean-body activation height (`u64::MAX` = never). Non-2300 networks may
+/// set `FPL_LEAN_BODY_FROM_HEIGHT` (devnets / soak harness).
+pub fn lean_body_from_height(network_id: u32) -> u64 {
+    if network_id == NETWORK_ID_PUBLIC_TESTNET_2300 {
+        return TESTNET_2300_LEAN_BODY_FROM_HEIGHT;
+    }
+    env_u64("FPL_LEAN_BODY_FROM_HEIGHT").unwrap_or(u64::MAX)
+}
+
+/// True when a ledger at `height` uses the lean body rules.
+pub fn lean_body_active(network_id: u32, height: u64) -> bool {
+    height >= lean_body_from_height(network_id)
+}
+
 /// On-chain-only key-bind activation height (`u64::MAX` = never). Non-2300
 /// networks may set `FPL_KEY_BIND_ONCHAIN_FROM_HEIGHT` (devnets / tests).
 pub fn key_bind_onchain_from_height(network_id: u32) -> u64 {
