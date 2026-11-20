@@ -7636,6 +7636,102 @@ mod inbound_ack_tests {
         assert_eq!(should_log_reply_dropped(21_000, &last, &sup), Some(1));
     }
 
+    /// 2.11.7 <-> 2.11.6 interop: with zstd-stream-v1 switched on and lean tx
+    /// gossip on (default), a peer whose Hello carries exactly the 2.11.6
+    /// capability set (`utc-header-v5` only) gets byte-plain NDJSON with hex
+    /// tx signatures, and its hex tx gossip is accepted unchanged.
+    #[tokio::test]
+    async fn inbound_session_2_11_6_peer_interop_plain_hex() {
+        std::env::set_var("FPL_WIRE_ZSTD", "1");
+        let shared = test_shared("v99");
+        let fanout = Arc::new(Vec::new());
+        let nid = shared.node.lock().cfg.network_id;
+        let mut uk = crate::KeyRing::default();
+        for acct in ["alice", "bob"] {
+            let _ = uk.generate_id(acct);
+        }
+        {
+            let mut n = shared.node.lock();
+            n.cfg.min_fee = 0;
+            n.cfg.fee_escalate = false;
+            for acct in ["alice", "bob"] {
+                let _ = n.keys.insert_public(acct, &uk.public_hex(acct).unwrap());
+                let mut a = n.state.get(acct);
+                a.balance = 50_000;
+                n.state.accounts.insert(acct.into(), a);
+            }
+        }
+        let (tx_a, tx_b) = {
+            let n = shared.node.lock();
+            (
+                fd_pl::Tx::sign_with(&uk, "alice", n.state.get("alice").sequence, "bob", 10, 2, nid).unwrap(),
+                fd_pl::Tx::sign_with(&uk, "bob", n.state.get("bob").sequence, "alice", 10, 2, nid).unwrap(),
+            )
+        };
+        let _ = dispatch_wire(&shared, WireMsg::SubmitTx { tx: tx_a.clone() }, None, false, false);
+        assert_eq!(shared.node.lock().mempool.get_tx(&tx_a.tx_id), Some(tx_a.clone()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, mut cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut lines = BufReader::new(cr).lines();
+        let srv_hello: WireMsg = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let WireMsg::Hello { capabilities, .. } = srv_hello else { panic!("hello") };
+        // 2.11.7 advertises both new tokens; 2.11.6 only looks for utc-header-v5.
+        assert!(fd_pl::wire_zstd::peer_has(&capabilities));
+        assert!(fd_pl::crypto::peer_has_lean_tx_gossip(&capabilities));
+        assert!(fd_pl::utc_header::peer_has_utc_header_v5(&capabilities));
+        let old_hello = WireMsg::Hello {
+            id: "v9".into(),
+            public_key: String::new(),
+            validators: BTreeMap::new(),
+            publics: BTreeMap::new(),
+            tip_height: 0,
+            tip_hash: String::new(),
+            is_hub: false,
+            mempool_len: 0,
+            product_version: PRODUCT_VERSION.into(),
+            hello_network_id: 1,
+            archive: false,
+            snap_height: 0,
+            release_version: "2.11.6".into(),
+            capabilities: vec![fd_pl::utc_header::CAP_UTC_HEADER_V5.into()],
+        };
+        let mut out = serde_json::to_string(&old_hello).unwrap() + "\n";
+        // Hex tx gossip exactly as 2.11.6 sends it.
+        out += &(serde_json::to_string(&WireMsg::SubmitTx { tx: tx_b.clone() }).unwrap() + "\n");
+        out += &(serde_json::to_string(&WireMsg::NeedMempoolTxs { ids: vec![tx_a.tx_id.clone()] }).unwrap() + "\n");
+        out += &(serde_json::to_string(&WireMsg::StatusReq { include_accounts: false, brief: true }).unwrap() + "\n");
+        cw.write_all(out.as_bytes()).await.unwrap();
+        let mut got_tx_a = false;
+        loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("reply in time")
+                .unwrap()
+                .expect("open session");
+            assert!(!line.starts_with('#'), "2.11.6 peer must never see the zstd marker: {line}");
+            assert!(!line.contains("b64:"), "2.11.6 peer must only see hex sigs");
+            let msg: WireMsg = serde_json::from_str(&line).expect("plain JSON line");
+            if line.contains(&tx_a.tx_id) {
+                assert!(line.contains(&tx_a.signature), "hex sig carried verbatim");
+                got_tx_a = true;
+            }
+            if matches!(msg, WireMsg::Status { .. }) {
+                break;
+            }
+        }
+        assert!(got_tx_a, "NeedMempoolTxs answered to the old peer");
+        assert_eq!(shared.node.lock().mempool.get_tx(&tx_b.tx_id), Some(tx_b.clone()));
+        drop(cw);
+        let _ = srv.await;
+    }
+
     #[tokio::test]
     async fn inbound_session_zstd_stream_new_and_old_peers() {
         // Only this node's env flag; old-style clients in other tests are

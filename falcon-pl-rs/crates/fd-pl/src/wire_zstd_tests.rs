@@ -272,3 +272,45 @@ async fn real_bodies_round_trip() {
     assert!(r.next_line().await.unwrap().is_none());
     eprintln!("{} real bodies: plain {plain} B, zstd-stream {} B ({:.1}%)", lines.len(), raw.len(), 100.0 * raw.len() as f64 / plain as f64);
 }
+
+/// 2.11.7: both negotiated layers on one session. Lean tx gossip re-spells
+/// tx gossip first (emit_or_shed), then zstd-stream frames the result
+/// (write_or_shed). Round-trips exactly and reports the measured sizes.
+#[tokio::test]
+async fn lean_tx_gossip_then_zstd_stream_stack() {
+    // Tx gossip lines only (the 20 SubmitTx); the rest of wire_lines() carries
+    // the same sigs again in a hex body, which zstd would dedupe for free.
+    let hex: Vec<String> = wire_lines(20).into_iter().take(20).collect();
+    assert!(hex.iter().all(|l| l.contains("submit_tx") || l.contains("SubmitTx")));
+    let lean: Vec<String> = hex
+        .iter()
+        .map(|l| {
+            crate::lean_tx_gossip_line((l.clone() + "\n").as_bytes())
+                .map(|s| s.trim_end_matches('\n').to_string())
+                .unwrap_or_else(|| l.clone())
+        })
+        .collect();
+    assert!(lean.iter().any(|l| l.contains("b64:")), "tx gossip leaned");
+    let size = |ls: &[String]| ls.iter().map(|l| l.len() + 1).sum::<usize>();
+    let zsize = |ls: &[String]| {
+        let mut w = ZWriter::new(Vec::new(), flag(true), 3);
+        for l in ls {
+            let out = w.encode((l.clone() + "\n").as_bytes()).unwrap().into_owned();
+            w.inner.extend_from_slice(&out);
+        }
+        w.inner
+    };
+    let (hex_b, lean_b) = (size(&hex), size(&lean));
+    let (zhex, zlean) = (zsize(&hex), zsize(&lean));
+    let mut r = LineReader::new(&zlean[..], true);
+    for l in &lean {
+        assert_eq!(&r.next_line().await.unwrap().unwrap(), l);
+    }
+    assert!(r.next_line().await.unwrap().is_none());
+    eprintln!(
+        "20 submit_tx: hex {hex_b} B, lean {lean_b} B, zstd(hex) {} B, zstd(lean) {} B",
+        zhex.len(),
+        zlean.len()
+    );
+    assert!(lean_b < hex_b && zlean.len() < lean_b && zhex.len() < hex_b);
+}

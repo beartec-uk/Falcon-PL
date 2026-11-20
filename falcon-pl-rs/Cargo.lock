@@ -695,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "fd-pl"
-version = "2.11.6"
+version = "2.11.7"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "fd-pl-bitvm2"
-version = "2.11.6"
+version = "2.11.7"
 dependencies = [
  "ark-bn254",
  "ark-crypto-primitives",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "fd-pl-graph"
-version = "2.11.6"
+version = "2.11.7"
 dependencies = [
  "bitcoin",
  "hex",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "fd-pl-snark"
-version = "2.11.6"
+version = "2.11.7"
 dependencies = [
  "anyhow",
  "ark-bn254",
