@@ -385,7 +385,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.5";
+pub const PRODUCT_VERSION: &str = "2.11.6";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -1550,7 +1550,7 @@ impl TxBody {
 }
 
 impl Tx {
-    /// Signature as hex for verification. v2.11.4 lean bodies carry tx sigs
+    /// Signature as hex for verification. v2.11.6 lean bodies carry tx sigs
     /// as `b64:`; the block-level rule ([`Ledger::check_lean_encoding`])
     /// decides whether that spelling is allowed at the ledger's height.
     /// Verifiers only ever see hex, so votes/certs/PoP stay hex-only.
@@ -2586,7 +2586,7 @@ impl Ledger {
         self.verify_merkle_batch_reg(keys, known, onchain_first, None)
     }
 
-    /// v2.11.4 lean-body encoding rule. Below the activation height a body
+    /// v2.11.6 lean-body encoding rule. Below the activation height a body
     /// must be legacy: no `b64:` tx signature. From it, tx sigs may be `b64:`
     /// (canonical base64 only) or hex, and `batch_paths` may be omitted.
     /// Applies to every body, batch or not, live or catch-up.
@@ -2950,7 +2950,7 @@ impl Mempool {
     /// Insert tx. Returns `Ok(true)` if new, `Ok(false)` if already present (same tx_id).
     /// When `max_txs > 0` and the pool is full, rejects **new** txs (dupes still ok).
     pub fn insert(&mut self, mut tx: Tx, max_txs: usize) -> Result<bool, String> {
-        // v2.11.4: the pool (and tx gossip) always holds hex sigs; only a
+        // v2.11.6: the pool (and tx gossip) always holds hex sigs; only a
         // sealed lean body carries `b64:`. Same bytes, so tx_id is unchanged.
         if crate::crypto::is_lean_sig(&tx.signature) {
             if let Some(h) = crate::crypto::sig_to_hex(&tx.signature) {
@@ -14306,7 +14306,7 @@ impl Node {
         self.now_ms = ledger.sealed_at_ms;
         let mut fee_total = 0u64;
         let mut err = None;
-        // v2.11.4: body spelling rule (legacy below the lean height).
+        // v2.11.6: body spelling rule (legacy below the lean height).
         if let Err(e) = ledger.check_lean_encoding(crate::params_v2::lean_body_active(
             self.cfg.network_id,
             ledger.height,
@@ -14642,7 +14642,7 @@ impl Node {
         self.orderbook_ledger_hook(&mut draft_state, &mut draft_defi, ledger.height);
         let mut fee_total = 0u64;
         let mut apply_err = None;
-        // v2.11.4: body spelling rule (legacy below the lean height).
+        // v2.11.6: body spelling rule (legacy below the lean height).
         ledger.check_lean_encoding(crate::params_v2::lean_body_active(
             self.cfg.network_id,
             ledger.height,
@@ -16930,8 +16930,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.5");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.5");
+        assert_eq!(PRODUCT_VERSION, "2.11.6");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.6");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);

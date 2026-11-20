@@ -1,5 +1,5 @@
 // Copyright (c) 2025-2026 BEARTEC. All rights reserved. See LICENSE.
-//! v2.11.4 lean block body: `b64:` tx signatures and no Merkle paths from the
+//! v2.11.6 lean block body: `b64:` tx signatures and no Merkle paths from the
 //! activation height; legacy bodies unchanged below it and still valid above.
 
 use super::*;
@@ -75,10 +75,17 @@ fn sig_spellings_convert_both_ways() {
 }
 
 #[test]
-fn activation_height_is_a_placeholder_on_2300() {
-    assert_eq!(params_v2::TESTNET_2300_LEAN_BODY_FROM_HEIGHT, u64::MAX);
+fn activation_height_is_923200_on_2300() {
+    assert_eq!(params_v2::TESTNET_2300_LEAN_BODY_FROM_HEIGHT, 923_200);
+    assert_eq!(params_v2::lean_body_from_height(NETWORK_ID_PUBLIC_TESTNET_2300), 923_200);
+    // Armed after every height already on the live chain (tip 920,972 on 20 Nov 2026),
+    // and well clear of the BTC4 most-work rail at 930,000.
+    assert!(params_v2::TESTNET_2300_LEAN_BODY_FROM_HEIGHT > 920_972);
+    assert!(params_v2::TESTNET_2300_LEAN_BODY_FROM_HEIGHT < params_v2::TESTNET_2300_BTC4_MOST_WORK_HEIGHT);
     assert!(!params_v2::lean_body_active(NETWORK_ID_PUBLIC_TESTNET_2300, 0));
-    assert!(!params_v2::lean_body_active(NETWORK_ID_PUBLIC_TESTNET_2300, 10_000_000));
+    assert!(!params_v2::lean_body_active(NETWORK_ID_PUBLIC_TESTNET_2300, 923_199));
+    assert!(params_v2::lean_body_active(NETWORK_ID_PUBLIC_TESTNET_2300, 923_200));
+    assert!(params_v2::lean_body_active(NETWORK_ID_PUBLIC_TESTNET_2300, 10_000_000));
 }
 
 #[test]

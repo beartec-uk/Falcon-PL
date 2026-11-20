@@ -51,7 +51,7 @@ pub enum CryptoErr {
     Sign(String),
 }
 
-/// v2.11.4 lean body: prefix of a signature carried as canonical, padded,
+/// v2.11.6 lean body: prefix of a signature carried as canonical, padded,
 /// standard-alphabet base64 instead of hex (~33% fewer bytes per Falcon sig).
 /// Hex never contains ':', so the two forms cannot be confused.
 pub const LEAN_SIG_PREFIX: &str = "b64:";
