@@ -341,7 +341,12 @@ pub const CAP_UTC_HEADER_V5: &str = "utc-header-v5";
 
 /// Capabilities this binary advertises on Hello (additive; empty on ancient peers).
 pub fn local_hello_capabilities() -> Vec<String> {
-    vec![CAP_UTC_HEADER_V5.to_string()]
+    let mut caps = vec![CAP_UTC_HEADER_V5.to_string()];
+    // Negotiated lean tx gossip (off with FPL_LEAN_TX_GOSSIP=0).
+    if crate::crypto::lean_tx_gossip_enabled() {
+        caps.push(crate::crypto::CAP_LEAN_TX_GOSSIP_V1.to_string());
+    }
+    caps
 }
 
 pub fn peer_has_utc_header_v5(capabilities: &[String]) -> bool {

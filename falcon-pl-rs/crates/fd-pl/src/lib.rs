@@ -323,6 +323,9 @@
 
 pub mod accounts;
 pub mod pieces;
+pub mod wire_zstd;
+#[cfg(test)]
+mod wire_zstd_tests;
 pub mod bitvm;
 pub mod bitvm2_exit;
 pub mod bitvm2_instance;
@@ -385,7 +388,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.6";
+pub const PRODUCT_VERSION: &str = "2.11.7";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -2940,15 +2943,130 @@ impl LedgerHeader {
     }
 }
 
+/// Read access shared by [`Tx`] and [`PoolTx`] for checks that only look at
+/// the body (activation gates), so pool scans need not rebuild a full `Tx`.
+pub trait TxView {
+    fn tx_body(&self) -> &TxBody;
+}
+
+impl TxView for Tx {
+    fn tx_body(&self) -> &TxBody {
+        &self.body
+    }
+}
+
+impl TxView for PoolTx {
+    fn tx_body(&self) -> &TxBody {
+        &self.body
+    }
+}
+
+/// A pending tx as held in the [`Mempool`]. Same fields as [`Tx`], but the
+/// two big hex strings (Falcon-512 public key ~1.8 KB, signature ~1.3 KB of
+/// hex) are kept as raw bytes when they are canonical lowercase hex. Any other
+/// spelling is kept verbatim, so [`PoolTx::to_tx`] always rebuilds the exact
+/// `Tx` that was inserted: tx_id, payload, sig root and every hash are
+/// unchanged. Local memory only; never serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolTx {
+    pub account: String,
+    pub sequence: u64,
+    pub destination: String,
+    pub amount: u64,
+    pub fee: u64,
+    pub network_id: u32,
+    public_key: crate::crypto::CompactHex,
+    signature: crate::crypto::CompactHex,
+    pub tx_id: String,
+    pub body: TxBody,
+}
+
+impl PoolTx {
+    pub fn from_tx(tx: Tx) -> Self {
+        PoolTx {
+            public_key: crate::crypto::CompactHex::new(&tx.public_key),
+            signature: crate::crypto::CompactHex::new(&tx.signature),
+            account: tx.account,
+            sequence: tx.sequence,
+            destination: tx.destination,
+            amount: tx.amount,
+            fee: tx.fee,
+            network_id: tx.network_id,
+            tx_id: tx.tx_id,
+            body: tx.body,
+        }
+    }
+
+    /// The exact `Tx` that was inserted.
+    pub fn to_tx(&self) -> Tx {
+        Tx {
+            account: self.account.clone(),
+            sequence: self.sequence,
+            destination: self.destination.clone(),
+            amount: self.amount,
+            fee: self.fee,
+            network_id: self.network_id,
+            public_key: self.public_key.as_text().into_owned(),
+            signature: self.signature.as_text().into_owned(),
+            tx_id: self.tx_id.clone(),
+            body: self.body.clone(),
+        }
+    }
+
+    /// Carried public key, as the text that was inserted.
+    pub fn public_key(&self) -> std::borrow::Cow<'_, str> {
+        self.public_key.as_text()
+    }
+
+    /// True when the carried public key is empty (stripped / known account).
+    pub fn public_key_is_empty(&self) -> bool {
+        self.public_key.is_empty()
+    }
+
+    /// Carried public key equals `pk` (text compare, no allocation).
+    pub fn public_key_eq(&self, pk: &str) -> bool {
+        self.public_key.eq_text(pk)
+    }
+
+    /// Signature, as the text that was inserted (pool sigs are hex).
+    pub fn signature(&self) -> std::borrow::Cow<'_, str> {
+        self.signature.as_text()
+    }
+
+    /// True when the pooled signature is empty.
+    pub fn signature_is_empty(&self) -> bool {
+        self.signature.is_empty()
+    }
+
+    /// Raw signature bytes when the pooled sig was canonical hex.
+    pub fn signature_bytes(&self) -> Option<&[u8]> {
+        self.signature.bytes()
+    }
+
+    /// Heap bytes owned by the string and compact fields (the body enum is
+    /// not counted). Diagnostics only.
+    pub fn approx_heap_bytes(&self) -> usize {
+        self.account.capacity()
+            + self.destination.capacity()
+            + self.tx_id.capacity()
+            + self.public_key.heap_bytes()
+            + self.signature.heap_bytes()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Mempool {
-    by_id: HashMap<String, Tx>,
+    by_id: HashMap<String, PoolTx>,
     order: VecDeque<String>,
 }
 
 impl Mempool {
     /// Insert tx. Returns `Ok(true)` if new, `Ok(false)` if already present (same tx_id).
     /// When `max_txs > 0` and the pool is full, rejects **new** txs (dupes still ok).
+    ///
+    /// Lean pool: keeps the key and signature as raw bytes
+    /// ([`PoolTx`]); reads rebuild the same hex text, so nothing downstream
+    /// (pack, sig root, verify, gossip) sees a different string.
     pub fn insert(&mut self, mut tx: Tx, max_txs: usize) -> Result<bool, String> {
         // v2.11.6: the pool (and tx gossip) always holds hex sigs; only a
         // sealed lean body carries `b64:`. Same bytes, so tx_id is unchanged.
@@ -2968,7 +3086,7 @@ impl Mempool {
             ));
         }
         self.order.push_back(tx.tx_id.clone());
-        self.by_id.insert(tx.tx_id.clone(), tx);
+        self.by_id.insert(tx.tx_id.clone(), PoolTx::from_tx(tx));
         Ok(true)
     }
 
@@ -2980,7 +3098,7 @@ impl Mempool {
         self.by_id.is_empty()
     }
 
-    pub fn iter_candidates(&self) -> impl Iterator<Item = &Tx> {
+    pub fn iter_candidates(&self) -> impl Iterator<Item = &PoolTx> {
         self.order.iter().filter_map(|id| self.by_id.get(id))
     }
 
@@ -3010,8 +3128,18 @@ impl Mempool {
         self.by_id.contains_key(tx_id)
     }
 
-    pub fn get(&self, tx_id: &str) -> Option<&Tx> {
+    pub fn get(&self, tx_id: &str) -> Option<&PoolTx> {
         self.by_id.get(tx_id)
+    }
+
+    /// The pooled tx rebuilt as a full [`Tx`] (hex key and signature).
+    pub fn get_tx(&self, tx_id: &str) -> Option<Tx> {
+        self.by_id.get(tx_id).map(PoolTx::to_tx)
+    }
+
+    /// Estimated heap bytes held by pooled entries (diagnostics).
+    pub fn approx_heap_bytes(&self) -> usize {
+        self.by_id.values().map(PoolTx::approx_heap_bytes).sum()
     }
 
     /// Export up to `max` pending txs in arrival order (for NeedTxs / hub sync).
@@ -3022,7 +3150,7 @@ impl Mempool {
     /// [`Self::export_batch`] over only the txs `keep` accepts. The filter
     /// runs before the `max` limit, so skipped entries never use up the
     /// batch and starve later eligible txs.
-    pub fn export_batch_where(&self, max: usize, keep: impl Fn(&Tx) -> bool) -> Vec<Tx> {
+    pub fn export_batch_where(&self, max: usize, keep: impl Fn(&PoolTx) -> bool) -> Vec<Tx> {
         let max = max.clamp(1, 512);
         let mut out = Vec::with_capacity(max.min(self.order.len()));
         for id in &self.order {
@@ -3031,7 +3159,7 @@ impl Mempool {
             }
             if let Some(tx) = self.by_id.get(id) {
                 if keep(tx) {
-                    out.push(tx.clone());
+                    out.push(tx.to_tx());
                 }
             }
         }
@@ -4434,8 +4562,8 @@ impl Node {
 
     /// Seat payout txs (or any tx from a `#seat` sender) before activation:
     /// refused at admission, never relayed/exported, rejected at apply.
-    pub fn seat_tx_pre_activation(&self, tx: &Tx) -> bool {
-        tx.body.is_seat_tx() && !self.seat_payout_at(self.tip_height.saturating_add(1))
+    pub fn seat_tx_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
+        tx.tx_body().is_seat_tx() && !self.seat_payout_at(self.tip_height.saturating_add(1))
     }
 
     /// v2.10.0: `SetExternalAddrs` / `Account.external_addrs` rules apply to the
@@ -4497,8 +4625,8 @@ impl Node {
     /// variant), rejected at apply.
     /// v2.10.4: order-book tx kinds before the 2.10.4 height. Refused before
     /// fee / sequence and never kept or relayed (2.10.3 cannot decode them).
-    pub fn orderbook_tx_pre_activation(&self, tx: &Tx) -> bool {
-        matches!(tx.body, TxBody::PlaceLimitOrder { .. } | TxBody::CancelOrder { .. })
+    pub fn orderbook_tx_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
+        matches!(tx.tx_body(), TxBody::PlaceLimitOrder { .. } | TxBody::CancelOrder { .. })
             && !self.orderbook_open()
     }
 
@@ -4527,8 +4655,8 @@ impl Node {
         self.defi = df;
     }
 
-    pub fn external_addrs_tx_pre_activation(&self, tx: &Tx) -> bool {
-        matches!(tx.body, TxBody::SetExternalAddrs { .. })
+    pub fn external_addrs_tx_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
+        matches!(tx.tx_body(), TxBody::SetExternalAddrs { .. })
             && !self.external_addrs_at(self.tip_height.saturating_add(1))
     }
 
@@ -4978,8 +5106,8 @@ impl Node {
     /// (TxsBatch / NeedTxs replies), and never exported, so it is not kept,
     /// does not hold its submitter's sequence, and never reaches a seat that
     /// cannot decode the variant. Apply/verify are unchanged.
-    pub fn v3_deposit_pre_activation(&self, tx: &Tx) -> bool {
-        (matches!(tx.body, TxBody::EthV3Deposit { .. })
+    pub fn v3_deposit_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
+        (matches!(tx.tx_body(), TxBody::EthV3Deposit { .. })
             && !self.eth_v3_at(self.tip_height.saturating_add(1)))
             || self.rv2_tx_pre_activation(tx)
             || self.seat_tx_pre_activation(tx)
@@ -4989,9 +5117,9 @@ impl Node {
 
     /// v2.9.62: same treatment for the new v2 tx kinds before `H_act` (not
     /// kept, relayed or exported; 2.9.61 seats cannot decode them).
-    pub fn rv2_tx_pre_activation(&self, tx: &Tx) -> bool {
+    pub fn rv2_tx_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
         matches!(
-            tx.body,
+            tx.tx_body(),
             TxBody::BondV2 { .. }
                 | TxBody::Reactivate { .. }
                 | TxBody::ApproveValidator { .. }
@@ -5202,7 +5330,7 @@ impl Node {
         let mut missing = Vec::new();
         let mut txs = Vec::with_capacity(ledger.tx_ids.len());
         for id in &ledger.tx_ids {
-            if let Some(tx) = self.mempool.get(id).cloned().or_else(|| self.body_fill.get(id).cloned()) {
+            if let Some(tx) = self.mempool.get_tx(id).or_else(|| self.body_fill.get(id).cloned()) {
                 txs.push(tx);
             } else {
                 missing.push(id.clone());
@@ -5603,7 +5731,7 @@ impl Node {
             }
             let need = self.state.get(&tx.account).sequence;
             if tx.sequence >= need {
-                by.entry(tx.account.clone()).or_default().push(tx.clone());
+                by.entry(tx.account.clone()).or_default().push(tx.to_tx());
             }
         }
         let mut runs: Vec<Vec<Tx>> = Vec::new();
@@ -8174,7 +8302,7 @@ impl Node {
         if sequence <= need || sequence - need > Self::BTC_ADMIT_CHAIN_MAX {
             return rail.clone();
         }
-        let mut by_seq: BTreeMap<u64, Vec<&Tx>> = BTreeMap::new();
+        let mut by_seq: BTreeMap<u64, Vec<&PoolTx>> = BTreeMap::new();
         for t in self.mempool.iter_candidates() {
             if t.account == account && t.sequence >= need && t.sequence < sequence {
                 by_seq.entry(t.sequence).or_default().push(t);
@@ -10709,7 +10837,7 @@ impl Node {
         }
         for tx in self.mempool.iter_candidates() {
             let need = self.state.get(&tx.account).sequence;
-            if tx.sequence == need && self.is_tx_applicable(tx) {
+            if tx.sequence == need && self.is_tx_applicable(&tx.to_tx()) {
                 return true;
             }
         }
@@ -10727,7 +10855,7 @@ impl Node {
         let mut n = 0usize;
         for tx in self.mempool.iter_candidates() {
             let need = self.state.get(&tx.account).sequence;
-            if tx.sequence == need && self.is_tx_applicable(tx) {
+            if tx.sequence == need && self.is_tx_applicable(&tx.to_tx()) {
                 n += 1;
             }
         }
@@ -10800,7 +10928,7 @@ impl Node {
             .iter_candidates()
             .filter(|tx| self.state.get(&tx.account).sequence == tx.sequence)
             .filter(|tx| !self.perm_head_memo.contains(&tx.tx_id))
-            .cloned()
+            .map(PoolTx::to_tx)
             .collect();
         if heads.is_empty() {
             return 0;
@@ -11050,7 +11178,7 @@ impl Node {
             }
         }
         let mut seen = std::collections::HashSet::new();
-        let mut heads: Vec<&Tx> = Vec::new();
+        let mut head_txs: Vec<Tx> = Vec::new();
         for tx in self.mempool.iter_candidates() {
             if in_block.contains(&tx.tx_id) || seen.contains(&tx.account) {
                 continue;
@@ -11059,18 +11187,19 @@ impl Node {
                 .get(&tx.account)
                 .map(|s| s.saturating_add(1))
                 .unwrap_or_else(|| self.state.get(&tx.account).sequence);
-            if tx.sequence != need || tx.signature.is_empty() {
+            if tx.sequence != need || tx.signature_is_empty() {
                 continue;
             }
             seen.insert(tx.account.clone());
-            if !self.keys.has_public(&tx.account) && tx.public_key.is_empty() {
+            if !self.keys.has_public(&tx.account) && tx.public_key_is_empty() {
                 continue;
             }
-            heads.push(tx);
-            if heads.len() >= Self::PACK_DEFAULT_MAX_TXS {
+            head_txs.push(tx.to_tx());
+            if head_txs.len() >= Self::PACK_DEFAULT_MAX_TXS {
                 break;
             }
         }
+        let heads: Vec<&Tx> = head_txs.iter().collect();
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
@@ -13056,7 +13185,7 @@ impl Node {
         let mut drop_ids: Vec<String> = Vec::new();
         let mut by_acct: BTreeMap<String, Vec<Tx>> = BTreeMap::new();
         for tx in self.mempool.iter_candidates() {
-            by_acct.entry(tx.account.clone()).or_default().push(tx.clone());
+            by_acct.entry(tx.account.clone()).or_default().push(tx.to_tx());
         }
         for txs in by_acct.values_mut() {
             txs.sort_by_key(|t| t.sequence);
@@ -16457,6 +16586,131 @@ impl WireMsg {
     }
 }
 
+/// True when a serialized wire line is tx gossip (`submit_tx`, `txs_batch`,
+/// `txs_by_ids`). serde writes the `type` tag first, so a prefix test is enough.
+pub fn is_tx_gossip_line(line: &[u8]) -> bool {
+    line.starts_with(b"{\"type\":\"submit_tx\"")
+        || line.starts_with(b"{\"type\":\"txs_batch\"")
+        || line.starts_with(b"{\"type\":\"txs_by_ids\"")
+}
+
+/// Writer-side rewrite of one queued hex line for a lean-capable session.
+/// `None` = send the line unchanged (not tx gossip, already lean, nothing to
+/// rewrite, or not parseable). Keeps a trailing newline if the input had one.
+pub fn lean_tx_gossip_line(line: &[u8]) -> Option<String> {
+    if !is_tx_gossip_line(line) {
+        return None;
+    }
+    let text = std::str::from_utf8(line).ok()?;
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let msg: WireMsg = serde_json::from_str(body).ok()?;
+    let lean = msg.to_lean_tx_gossip()?;
+    let mut out = serde_json::to_string(&lean).ok()?;
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Lean tx gossip (negotiated). Tx-carrying gossip messages may spell each tx
+/// signature and carried public key as `b64:` (canonical padded base64)
+/// instead of hex (neither is in the signed payload or tx_id), but only
+/// towards a peer whose Hello advertised
+/// [`crate::crypto::CAP_LEAN_TX_GOSSIP_V1`]. The receiver turns every `b64:`
+/// field back into lowercase hex before the message is handled, so the mempool,
+/// body fill, pack, sig root and verifiers keep seeing the same hex string the
+/// sender held. Block bodies (`LedgerBody`, `LedgersBatch`, ...) are not
+/// touched here: their spelling is the #44 lean-body rule (activation height).
+impl WireMsg {
+    /// True for the gossip messages whose tx sigs follow the lean-gossip rule.
+    pub fn is_tx_gossip(&self) -> bool {
+        matches!(
+            self,
+            WireMsg::SubmitTx { .. } | WireMsg::TxsBatch { .. } | WireMsg::TxsByIds { .. }
+        )
+    }
+
+    /// Copy of a tx-gossip message with canonical-hex tx sigs and carried
+    /// keys re-spelled as `b64:` for a lean-capable peer. `None` = not tx gossip, or nothing to
+    /// rewrite (send the hex line unchanged).
+    pub fn to_lean_tx_gossip(&self) -> Option<WireMsg> {
+        // Signature and carried key: both outside the payload, so tx_id and
+        // every hash are unchanged; both come back as the same hex.
+        fn lean_tx(tx: &mut Tx) -> bool {
+            let mut any = false;
+            if let Some(l) = crate::crypto::gossip_lean_sig(&tx.signature) {
+                tx.signature = l;
+                any = true;
+            }
+            if let Some(l) = crate::crypto::gossip_lean_sig(&tx.public_key) {
+                tx.public_key = l;
+                any = true;
+            }
+            any
+        }
+        fn lean_txs(txs: &[Tx]) -> Option<Vec<Tx>> {
+            let mut out = txs.to_vec();
+            let mut any = false;
+            for tx in &mut out {
+                any |= lean_tx(tx);
+            }
+            any.then_some(out)
+        }
+        match self {
+            WireMsg::SubmitTx { tx } => {
+                let mut tx = tx.clone();
+                lean_tx(&mut tx).then_some(WireMsg::SubmitTx { tx })
+            }
+            WireMsg::TxsBatch { txs } => lean_txs(txs).map(|txs| WireMsg::TxsBatch { txs }),
+            WireMsg::TxsByIds { ledger_hash, txs } => lean_txs(txs).map(|txs| WireMsg::TxsByIds {
+                ledger_hash: ledger_hash.clone(),
+                txs,
+            }),
+            _ => None,
+        }
+    }
+
+    /// One wire line (JSON + `\n`) for a session. `lean` = the peer's Hello on
+    /// this session advertised lean tx gossip; then tx-gossip sigs go `b64:`.
+    pub fn to_wire_line(&self, lean: bool) -> serde_json::Result<String> {
+        if lean {
+            if let Some(m) = self.to_lean_tx_gossip() {
+                return Ok(serde_json::to_string(&m)? + "\n");
+            }
+        }
+        Ok(serde_json::to_string(self)? + "\n")
+    }
+
+    /// Receiver side: rewrite every `b64:` tx sig / carried key in tx gossip
+    /// to lowercase hex. A batch drops txs whose `b64:` field is not canonical
+    /// and returns how many it dropped; a `SubmitTx` with one is `Err`.
+    /// Non-gossip messages are left alone (`Ok(0)`).
+    pub fn normalize_gossip_tx_sigs(&mut self) -> Result<usize, String> {
+        fn fix(tx: &mut Tx) -> Result<(), String> {
+            if crate::crypto::is_lean_sig(&tx.signature) {
+                let h = crate::crypto::gossip_sig_to_hex(&tx.signature)?.into_owned();
+                tx.signature = h;
+            }
+            if crate::crypto::is_lean_sig(&tx.public_key) {
+                let h = crate::crypto::gossip_sig_to_hex(&tx.public_key)
+                    .map_err(|_| "non-canonical lean tx public key in gossip".to_string())?
+                    .into_owned();
+                tx.public_key = h;
+            }
+            Ok(())
+        }
+        match self {
+            WireMsg::SubmitTx { tx } => fix(tx).map(|_| 0),
+            WireMsg::TxsBatch { txs } | WireMsg::TxsByIds { txs, .. } => {
+                let before = txs.len();
+                txs.retain_mut(|tx| fix(tx).is_ok());
+                Ok(before - txs.len())
+            }
+            _ => Ok(0),
+        }
+    }
+}
+
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
@@ -16478,6 +16732,8 @@ mod pack_catchup_tests;
 mod merkle_batch_tests;
 #[cfg(test)]
 mod lean_body_tests;
+#[cfg(test)]
+mod lean_gossip_tests;
 
 #[cfg(test)]
 mod leak_2963_tests;
@@ -16930,8 +17186,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.6");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.6");
+        assert_eq!(PRODUCT_VERSION, "2.11.7");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.7");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
@@ -19740,7 +19996,7 @@ mod tests {
         let err = net.payment("carol", "alice", 1, 1).unwrap_err();
         assert!(err.contains("mempool full"), "{err}");
         // duplicate of existing still ok (replaces same-(account, seq) without exceeding cap)
-        let existing = net.nodes.get("v1").unwrap().mempool.iter_candidates().next().unwrap().clone();
+        let existing = net.nodes.get("v1").unwrap().mempool.iter_candidates().next().unwrap().to_tx();
         let dup_raw = net.nodes.get_mut("v1").unwrap().mempool.insert(existing.clone(), 2).unwrap();
         assert!(!dup_raw);
         let dup = net.nodes.get_mut("v1").unwrap().submit_tx(existing).unwrap();
