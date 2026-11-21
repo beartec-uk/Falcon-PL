@@ -221,6 +221,42 @@ fn line_must_send(bytes: &[u8]) -> bool {
 /// Session writer: plain lines until the peer negotiated `zstd-stream-v1`.
 type ZWire = fd_pl::wire_zstd::ZWriter<tokio::net::tcp::OwnedWriteHalf>;
 
+enum WritableWait {
+    Ready,
+    TimedOut,
+    Failed,
+}
+
+/// Kernel-level POLLOUT on the socket (not tokio's cached readiness, which
+/// stays "writable" after a write that filled the buffer without blocking).
+fn sock_pollout(fd: std::os::unix::io::RawFd) -> Option<bool> {
+    let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    let rc = unsafe { libc::poll(&mut p, 1, 0) };
+    if rc < 0 {
+        return None;
+    }
+    if p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return None;
+    }
+    Some(p.revents & libc::POLLOUT != 0)
+}
+
+/// Wait until the kernel will take at least part of the next write.
+async fn wait_writable(probe: std::os::unix::io::RawFd, hold: std::time::Duration) -> WritableWait {
+    let deadline = tokio::time::Instant::now() + hold;
+    loop {
+        match sock_pollout(probe) {
+            None => return WritableWait::Failed,
+            Some(true) => return WritableWait::Ready,
+            Some(false) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return WritableWait::TimedOut;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 async fn write_or_shed(
     writer: &mut ZWire,
     probe: std::os::unix::io::RawFd,
@@ -261,6 +297,37 @@ async fn write_or_shed(
     }
     if bytes.len() > LARGE_LINE && unsent > PIPE_PAUSE_BYTES && !must_send {
         return Err(WriteEnd::Dropped { unsent });
+    }
+    // 2.11.9: a compressed session cannot skip a line once it is encoded, so
+    // the "kernel took none of it for PIPE_SHED_HOLD" case below sheds the
+    // session where a plain session only drops the line. Live on 2.11.7 that
+    // turned every stalled vote / tx-relay line to a slow peer into a reset
+    // (8 s blackhole, queue lost, mempool re-sync). Wait for socket room
+    // *before* encoding, and drop an optional line there with the stream intact.
+    if writer.will_compress() && !must_send && !catchup_body {
+        match wait_writable(probe, PIPE_SHED_HOLD).await {
+            WritableWait::Ready => {}
+            WritableWait::TimedOut => {
+                // Same verdict a plain session reaches below: a queue over the
+                // shed line is a dead pipe; under it, only this line is skipped.
+                let unsent = tcp_unsent(probe).unwrap_or(0);
+                if unsent > PIPE_SHED_BYTES {
+                    return Err(WriteEnd::Shed {
+                        unsent,
+                        unread: tcp_unread(probe).unwrap_or(0),
+                        which: "send",
+                    });
+                }
+                return Err(WriteEnd::Dropped { unsent });
+            }
+            WritableWait::Failed => {
+                return Err(WriteEnd::Shed {
+                    unsent: tcp_unsent(probe).unwrap_or(0),
+                    unread: tcp_unread(probe).unwrap_or(0),
+                    which: "send",
+                })
+            }
+        }
     }
     // zstd-stream-v1: encode only once the line will be written. Encoding
     // advances the stream, so from here a compressed line is sent or the
@@ -8141,5 +8208,102 @@ mod inbound_ack_tests {
             assert!(sealed.txs.is_empty());
             assert!(n.mempool.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod zstd_drop_tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::AtomicBool;
+
+    fn noise_line(seed: u64, n: usize) -> String {
+        // Incompressible-ish payload so the kernel buffer actually fills.
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let d: String = (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from(b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[(x % 62) as usize])
+            })
+            .collect();
+        format!("{{\"type\":\"fill_probe\",\"seed\":{seed},\"d\":\"{d}\"}}\n")
+    }
+
+    /// 2.11.9: on a compressed session whose peer stopped reading, an optional
+    /// line must be dropped with the zstd stream intact (as on a plain
+    /// session), not shed. 2.11.7 encoded first and then reset the socket.
+    #[tokio::test]
+    async fn compressed_stalled_optional_line_drops_without_shed() {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+        let cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (srv, _) = ln.accept().await.unwrap();
+        // Live seats stall with ~260-345 KB unsent (under PIPE_SHED_BYTES):
+        // keep the kernel buffers that small so the test hits the same branch.
+        for (fd, opt) in [(cli.as_raw_fd(), libc::SO_SNDBUF), (srv.as_raw_fd(), libc::SO_RCVBUF)] {
+            let v: libc::c_int = 96 * 1024;
+            unsafe {
+                libc::setsockopt(fd, libc::SOL_SOCKET, opt, &v as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+            }
+        }
+        let probe = unsafe { libc::dup(cli.as_raw_fd()) };
+        let (_cr, cw) = cli.into_split();
+        let mut w: ZWire = fd_pl::wire_zstd::ZWriter::new(cw, Arc::new(AtomicBool::new(true)), 1);
+        assert!(w.will_compress());
+        let mut sent: Vec<String> = Vec::new();
+        let mut dropped = false;
+        for i in 0..20000u64 {
+            let line = noise_line(i, 2 * 1024);
+            assert!(!line_must_send(line.as_bytes()) && line.len() <= LARGE_LINE);
+            match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                Ok(()) => sent.push(line),
+                Err(WriteEnd::Dropped { .. }) => {
+                    dropped = true;
+                    break;
+                }
+                Err(WriteEnd::Shed { which, .. }) => {
+                    panic!("compressed optional line shed ({which}) after {} lines", sent.len())
+                }
+            }
+        }
+        assert!(dropped, "peer never stopped reading?");
+        assert!(tcp_unsent(probe).unwrap_or(0) < PIPE_SHED_BYTES);
+        // The stream is intact: drain, then one more line still decodes.
+        let after = noise_line(99_999, 512);
+        let mut rd = fd_pl::wire_zstd::LineReader::new(srv, true);
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Ok(Ok(Some(l))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), rd.next_line()).await
+            {
+                let done = l.contains("\"seed\":99999");
+                got.push(l);
+                if done {
+                    break;
+                }
+            }
+            got
+        });
+        let mut ok = false;
+        for _ in 0..200 {
+            match write_or_shed(&mut w, probe, after.as_bytes()).await {
+                Ok(()) => {
+                    ok = true;
+                    break;
+                }
+                Err(WriteEnd::Dropped { .. }) => continue,
+                Err(WriteEnd::Shed { which, .. }) => panic!("shed after drain ({which})"),
+            }
+        }
+        assert!(ok, "line after drain never sent");
+        let got = reader.await.unwrap();
+        assert_eq!(got.len(), sent.len() + 1, "every sent line decodes, nothing torn");
+        for (g, s) in got.iter().zip(sent.iter()) {
+            assert_eq!(g.as_str(), s.trim_end());
+        }
+        assert_eq!(got.last().unwrap().as_str(), after.trim_end());
+        unsafe { libc::close(probe) };
     }
 }
