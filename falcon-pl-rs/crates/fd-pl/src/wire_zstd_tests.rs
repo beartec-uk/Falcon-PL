@@ -337,3 +337,36 @@ async fn lean_tx_gossip_then_zstd_stream_stack() {
     );
     assert!(lean_b < hex_b && zlean.len() < lean_b && zhex.len() < hex_b);
 }
+
+/// 2.11.9: per-line flush cost. Every line is one flushed frame (4-byte
+/// length + zstd block headers). Measured on real-shaped lines in session
+/// order; no frame may be bigger than its plain line plus a small bound, and
+/// the stream as a whole must stay smaller.
+#[test]
+fn per_line_frames_do_not_inflate_lines() {
+    let lines = wire_lines(20);
+    let mut w = ZWriter::new(Vec::<u8>::new(), flag(true), DEFAULT_LEVEL);
+    let (mut plain_all, mut z_all, mut worst) = (0usize, 0usize, i64::MIN);
+    let mut by_kind: std::collections::BTreeMap<String, (usize, usize, usize)> = Default::default();
+    for (i, l) in lines.iter().enumerate() {
+        let p = l.len() + 1;
+        let mut f = w.encode((l.clone() + "\n").as_bytes()).unwrap().into_owned().len();
+        if i == 0 {
+            f -= MARKER_LINE.len() + 1;
+        }
+        plain_all += p;
+        z_all += f;
+        worst = worst.max(f as i64 - p as i64);
+        let kind = l.split('"').nth(3).unwrap_or("?").to_string();
+        let e = by_kind.entry(kind).or_default();
+        e.0 += 1;
+        e.1 += p;
+        e.2 += f;
+    }
+    for (k, (n, p, f)) in &by_kind {
+        eprintln!("{k}: n={n} plain {p} B -> frames {f} B ({:.1}%)", 100.0 * *f as f64 / *p as f64);
+    }
+    eprintln!("all: plain {plain_all} B -> frames {z_all} B ({:.1}%), worst frame vs line {worst:+} B", 100.0 * z_all as f64 / plain_all as f64);
+    assert!(worst <= 32, "a frame grew {worst} B over its plain line");
+    assert!(z_all < plain_all);
+}
