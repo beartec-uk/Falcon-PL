@@ -388,7 +388,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.7";
+pub const PRODUCT_VERSION: &str = "2.11.8";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -17170,6 +17170,7 @@ mod tests {
         // 2.11.0 accepts its own line and the legacy 2.9.x line.
         assert!(hello_version_compatible("2.11.0"));
         assert!(hello_version_compatible("2.11.7"));
+        assert!(hello_version_compatible("2.11.8"));
         assert!(!hello_version_compatible("2.11.07"));
         assert!(!hello_version_compatible("2.10.0"));
         assert!(!hello_version_compatible("3.9.60"));
@@ -17186,8 +17187,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.7");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.7");
+        assert_eq!(PRODUCT_VERSION, "2.11.8");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.8");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);

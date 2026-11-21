@@ -152,6 +152,29 @@ fn capability_negotiation_matrix() {
     }
 }
 
+fn restore_zstd_env(prev: Option<String>) {
+    match prev {
+        Some(v) => std::env::set_var("FPL_WIRE_ZSTD", v),
+        None => std::env::remove_var("FPL_WIRE_ZSTD"),
+    }
+}
+
+/// Default is on; `FPL_WIRE_ZSTD=0` disables; `FPL_WIRE_ZSTD=1` stays on.
+#[test]
+fn enabled_defaults_on_explicit_zero_disables_and_one_stays_on() {
+    let _g = WIRE_ZSTD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("FPL_WIRE_ZSTD").ok();
+    std::env::remove_var("FPL_WIRE_ZSTD");
+    assert!(enabled(), "unset defaults on");
+    assert_eq!(with_capability(vec![], enabled()), vec![CAP_ZSTD_STREAM_V1]);
+    std::env::set_var("FPL_WIRE_ZSTD", "1");
+    assert!(enabled(), "=1 still on");
+    std::env::set_var("FPL_WIRE_ZSTD", "0");
+    assert!(!enabled(), "=0 disables");
+    assert!(with_capability(vec![], enabled()).is_empty());
+    restore_zstd_env(prev);
+}
+
 #[tokio::test]
 async fn corrupt_frame_and_bad_lengths_end_the_session() {
     let lines = wire_lines(2);

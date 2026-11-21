@@ -1,16 +1,17 @@
 // Copyright (c) 2025-2026 BEARTEC. All rights reserved. See LICENSE.
 //! Per-connection zstd stream on the p2p wire (`zstd-stream-v1`).
 //!
-//! Negotiation: a node with `FPL_WIRE_ZSTD=1` adds [`CAP_ZSTD_STREAM_V1`] to
+//! Negotiation: a node with zstd enabled (the default; `FPL_WIRE_ZSTD=0`
+//! disables, `FPL_WIRE_ZSTD=1` leaves it on) adds [`CAP_ZSTD_STREAM_V1`] to
 //! its Hello capabilities. A sender switches **its own direction** only after
 //! it has read the peer's Hello carrying the capability. It writes one plain
 //! [`MARKER_LINE`] and from then on sends length-prefixed binary frames:
 //! `u32 big-endian length || zstd bytes`. Each frame is one wire line,
 //! compressed in a single streaming context and flushed, so message
 //! boundaries and latency are kept. A receiver only honours the marker when it
-//! advertised the capability itself. Peers that do not advertise it (old
-//! releases, ctl, load-net) never see a marker or a frame: their sessions are
-//! byte-for-byte unchanged.
+//! advertised the capability itself. Peers that do not advertise it (pre-2.11.7
+//! releases, 2.11.7 with the flag off, ctl, load-net) never see a marker or a
+//! frame: their sessions are byte-for-byte unchanged.
 //!
 //! Memory per connection is bounded by a 128 KiB window (`window_log` 17)
 //! and small match tables; see [`context_bytes`]. Decompression is capped per
@@ -21,7 +22,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use zstd::zstd_safe::{self, zstd_sys::ZSTD_EndDirective, CCtx, CParameter, DCtx, DParameter, InBuffer, OutBuffer};
@@ -42,9 +43,16 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Same as the existing piece reassembly cap, so no legal line is refused.
 pub const MAX_OUT_BYTES: usize = crate::pieces::PIECE_MAX_TOTAL;
 
-/// Opt-in switch for this node (default off): `FPL_WIRE_ZSTD=1`.
+/// Serialises tests that mutate process-global `FPL_WIRE_ZSTD`.
+pub static WIRE_ZSTD_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Whether this node advertises and will send `zstd-stream-v1`.
+///
+/// On by default. `FPL_WIRE_ZSTD=0` turns it off; `FPL_WIRE_ZSTD=1` leaves it
+/// on. Negotiation is unchanged: a peer that does not advertise the capability
+/// still gets plain NDJSON.
 pub fn enabled() -> bool {
-    std::env::var("FPL_WIRE_ZSTD").map(|v| v == "1").unwrap_or(false)
+    std::env::var("FPL_WIRE_ZSTD").map(|v| v != "0").unwrap_or(true)
 }
 
 /// Level from `FPL_WIRE_ZSTD_LEVEL`, clamped to 1..=3.

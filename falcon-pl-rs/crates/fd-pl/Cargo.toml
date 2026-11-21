@@ -45,7 +45,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 parking_lot = { workspace = true }
 libc = "0.2"
-# v2.11.x: per-connection zstd stream on the p2p wire (negotiated, opt-in).
+# v2.11.x: per-connection zstd stream on the p2p wire (negotiated, on by default).
 zstd = { version = "0.13", default-features = false }
 k256 = { workspace = true }
 ripemd = { workspace = true }

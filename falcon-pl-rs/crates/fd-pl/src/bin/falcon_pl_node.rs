@@ -7636,13 +7636,15 @@ mod inbound_ack_tests {
         assert_eq!(should_log_reply_dropped(21_000, &last, &sup), Some(1));
     }
 
-    /// 2.11.7 <-> 2.11.6 interop: with zstd-stream-v1 switched on and lean tx
-    /// gossip on (default), a peer whose Hello carries exactly the 2.11.6
-    /// capability set (`utc-header-v5` only) gets byte-plain NDJSON with hex
-    /// tx signatures, and its hex tx gossip is accepted unchanged.
+    /// 2.11.8 <-> 2.11.6 interop: with zstd-stream-v1 at its default (on) and
+    /// lean tx gossip on (default), a peer whose Hello carries exactly the
+    /// 2.11.6 capability set (`utc-header-v5` only) gets byte-plain NDJSON
+    /// with hex tx signatures, and its hex tx gossip is accepted unchanged.
     #[tokio::test]
     async fn inbound_session_2_11_6_peer_interop_plain_hex() {
-        std::env::set_var("FPL_WIRE_ZSTD", "1");
+        let _g = fd_pl::wire_zstd::WIRE_ZSTD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("FPL_WIRE_ZSTD").ok();
+        std::env::remove_var("FPL_WIRE_ZSTD"); // default-on
         let shared = test_shared("v99");
         let fanout = Arc::new(Vec::new());
         let nid = shared.node.lock().cfg.network_id;
@@ -7682,7 +7684,7 @@ mod inbound_ack_tests {
         let mut lines = BufReader::new(cr).lines();
         let srv_hello: WireMsg = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         let WireMsg::Hello { capabilities, .. } = srv_hello else { panic!("hello") };
-        // 2.11.7 advertises both new tokens; 2.11.6 only looks for utc-header-v5.
+        // 2.11.8 (zstd default on) advertises both new tokens; 2.11.6 only looks for utc-header-v5.
         assert!(fd_pl::wire_zstd::peer_has(&capabilities));
         assert!(fd_pl::crypto::peer_has_lean_tx_gossip(&capabilities));
         assert!(fd_pl::utc_header::peer_has_utc_header_v5(&capabilities));
@@ -7730,12 +7732,17 @@ mod inbound_ack_tests {
         assert_eq!(shared.node.lock().mempool.get_tx(&tx_b.tx_id), Some(tx_b.clone()));
         drop(cw);
         let _ = srv.await;
+        match prev {
+            Some(v) => std::env::set_var("FPL_WIRE_ZSTD", v),
+            None => std::env::remove_var("FPL_WIRE_ZSTD"),
+        }
     }
 
     #[tokio::test]
     async fn inbound_session_zstd_stream_new_and_old_peers() {
-        // Only this node's env flag; old-style clients in other tests are
-        // unaffected either way (no capability in their Hello).
+        // Explicit FPL_WIRE_ZSTD=1 still enables advertise/send.
+        let _g = fd_pl::wire_zstd::WIRE_ZSTD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("FPL_WIRE_ZSTD").ok();
         std::env::set_var("FPL_WIRE_ZSTD", "1");
         let shared = test_shared("v99");
         let fanout = Arc::new(Vec::new());
@@ -7802,6 +7809,68 @@ mod inbound_ack_tests {
         assert!(matches!(reply, WireMsg::Status { .. }), "got {reply:?}");
         drop(cw);
         let _ = srv.await;
+        match prev {
+            Some(v) => std::env::set_var("FPL_WIRE_ZSTD", v),
+            None => std::env::remove_var("FPL_WIRE_ZSTD"),
+        }
+    }
+
+    /// Explicit FPL_WIRE_ZSTD=0: this node does not advertise zstd-stream-v1,
+    /// and even a peer that offers the capability gets plain NDJSON (no marker).
+    #[tokio::test]
+    async fn inbound_session_zstd_stream_explicit_off() {
+        let _g = fd_pl::wire_zstd::WIRE_ZSTD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("FPL_WIRE_ZSTD").ok();
+        std::env::set_var("FPL_WIRE_ZSTD", "0");
+        let shared = test_shared("v99");
+        let fanout = Arc::new(Vec::new());
+        let hello = |caps: Vec<String>| WireMsg::Hello {
+            id: "v9".into(),
+            public_key: String::new(),
+            validators: BTreeMap::new(),
+            publics: BTreeMap::new(),
+            tip_height: 0,
+            tip_hash: String::new(),
+            is_hub: false,
+            mempool_len: 0,
+            product_version: PRODUCT_VERSION.into(),
+            hello_network_id: 1,
+            archive: false,
+            snap_height: 0,
+            release_version: String::new(),
+            capabilities: caps,
+        };
+        let status_req = serde_json::to_string(&WireMsg::StatusReq { include_accounts: false, brief: true }).unwrap() + "\n";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, mut cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut lines = BufReader::new(cr).lines();
+        let srv_hello: WireMsg = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let WireMsg::Hello { capabilities, .. } = srv_hello else { panic!("hello") };
+        assert!(!fd_pl::wire_zstd::peer_has(&capabilities), "FPL_WIRE_ZSTD=0 must not advertise");
+        let my_hello = serde_json::to_string(&hello(vec![fd_pl::wire_zstd::CAP_ZSTD_STREAM_V1.into()])).unwrap() + "\n";
+        cw.write_all(my_hello.as_bytes()).await.unwrap();
+        cw.write_all(status_req.as_bytes()).await.unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("reply in time")
+            .unwrap()
+            .expect("open session");
+        assert!(!line.starts_with('#'), "explicit-off must never emit the zstd marker: {line}");
+        let reply: WireMsg = serde_json::from_str(&line).expect("plain JSON line");
+        assert!(matches!(reply, WireMsg::Status { .. }), "got {reply:?}");
+        drop(cw);
+        let _ = srv.await;
+        match prev {
+            Some(v) => std::env::set_var("FPL_WIRE_ZSTD", v),
+            None => std::env::remove_var("FPL_WIRE_ZSTD"),
+        }
     }
 
     #[tokio::test]
