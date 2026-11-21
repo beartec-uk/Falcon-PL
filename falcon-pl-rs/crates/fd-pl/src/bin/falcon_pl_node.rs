@@ -115,6 +115,11 @@ impl LargeGate {
 /// Drop a TCP session whose kernel send or receive queue stays over this.
 const PIPE_SHED_BYTES: usize = 1_000_000;
 const PIPE_SHED_HOLD: std::time::Duration = std::time::Duration::from_secs(2);
+/// 2.11.9: a line that must be finished (a torn partial line, an encoded zstd
+/// frame, a must-send or catch-up line) sheds the session only after the
+/// kernel took no byte of it for this long. A shed costs more than this
+/// anyway (BLACKHOLE_SECS, the lost queue and a mempool re-sync).
+const PIPE_STUCK_HOLD: std::time::Duration = std::time::Duration::from_secs(8);
 /// Do not start another large body while the kernel still holds this much.
 const PIPE_PAUSE_BYTES: usize = 256 * 1024;
 /// Transaction relay may queue while a body is in flight. Inventory and
@@ -272,9 +277,16 @@ async fn write_or_shed(
     // while the kernel queue is full of transaction fan-out froze 447954:
     // the 1.33 MB body was discarded and the socket stayed open.
     let must_send = line_must_send(bytes);
+    let optional = !must_send && !catchup_body;
+    // 2.11.9: a backlog over the shed line costs the optional lines, not the
+    // session. Before, the write below shed the whole socket ("send") and the
+    // peer lost every queued vote and body with it.
+    if optional && unsent > PIPE_SHED_BYTES {
+        return Err(WriteEnd::Dropped { unsent });
+    }
     if must_send && unsent > PIPE_PAUSE_BYTES {
         // The peer is still reading. Reset only after the queue stops
-        // shrinking for PIPE_SHED_HOLD, not because it is large.
+        // shrinking for PIPE_STUCK_HOLD, not because it is large.
         let mut last = unsent;
         let mut still_since = tokio::time::Instant::now();
         loop {
@@ -285,7 +297,7 @@ async fn write_or_shed(
             if unsent < last {
                 last = unsent;
                 still_since = tokio::time::Instant::now();
-            } else if still_since.elapsed() >= PIPE_SHED_HOLD {
+            } else if still_since.elapsed() >= PIPE_STUCK_HOLD {
                 return Err(WriteEnd::Shed {
                     unsent,
                     unread: tcp_unread(probe).unwrap_or(0),
@@ -298,27 +310,16 @@ async fn write_or_shed(
     if bytes.len() > LARGE_LINE && unsent > PIPE_PAUSE_BYTES && !must_send {
         return Err(WriteEnd::Dropped { unsent });
     }
-    // 2.11.9: a compressed session cannot skip a line once it is encoded, so
-    // the "kernel took none of it for PIPE_SHED_HOLD" case below sheds the
-    // session where a plain session only drops the line. Live on 2.11.7 that
-    // turned every stalled vote / tx-relay line to a slow peer into a reset
-    // (8 s blackhole, queue lost, mempool re-sync). Wait for socket room
-    // *before* encoding, and drop an optional line there with the stream intact.
-    if writer.will_compress() && !must_send && !catchup_body {
+    // 2.11.8 (#58): a compressed session cannot skip a line once it is encoded,
+    // so wait for socket room *before* encoding, and drop an optional line
+    // there with the stream intact.
+    if writer.will_compress() && optional {
         match wait_writable(probe, PIPE_SHED_HOLD).await {
             WritableWait::Ready => {}
             WritableWait::TimedOut => {
-                // Same verdict a plain session reaches below: a queue over the
-                // shed line is a dead pipe; under it, only this line is skipped.
-                let unsent = tcp_unsent(probe).unwrap_or(0);
-                if unsent > PIPE_SHED_BYTES {
-                    return Err(WriteEnd::Shed {
-                        unsent,
-                        unread: tcp_unread(probe).unwrap_or(0),
-                        which: "send",
-                    });
-                }
-                return Err(WriteEnd::Dropped { unsent });
+                // 2.11.9: never a shed here. A backlog over the shed line is
+                // handled above (drop); under it, only this line is skipped.
+                return Err(WriteEnd::Dropped { unsent: tcp_unsent(probe).unwrap_or(0) });
             }
             WritableWait::Failed => {
                 return Err(WriteEnd::Shed {
@@ -344,46 +345,42 @@ async fn write_or_shed(
     };
     let compressed = writer.compressed();
     let out: &[u8] = &framed;
-    let mut deadline = tokio::time::Instant::now() + PIPE_SHED_HOLD;
     let mut off = 0usize;
-    let mut progressed = 0usize;
+    let mut last_progress = tokio::time::Instant::now();
     loop {
         if off == out.len() {
             return Ok(());
         }
-        if off > progressed {
-            progressed = off;
-            deadline = tokio::time::Instant::now() + PIPE_SHED_HOLD;
-        }
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // Only an untouched plain optional line may still be skipped, and it
+        // gets the short hold as before. Everything else is kept and finished:
+        // a line the kernel has started taking (torn, plain or compressed), an
+        // encoded compressed line (the stream has moved on), a must-send line
+        // and a catch-up body. The partial frame stays in `out` and is written
+        // before the next line; dropping it mid-frame would corrupt the
+        // stream. 2.11.8 shed all of these after PIPE_SHED_HOLD; live, a peer
+        // that paused reading for 2-8 s (block apply on a 2-vCPU seat) turned
+        // into a reset, an 8 s blackhole, a lost queue and a mempool re-sync.
+        let droppable = off == 0 && optional && !compressed;
+        let hold = if droppable { PIPE_SHED_HOLD } else { PIPE_STUCK_HOLD };
+        let left = (last_progress + hold).saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
             let unsent = tcp_unsent(probe).unwrap_or(0);
             let unread = tcp_unread(probe).unwrap_or(0);
-            if unsent > PIPE_SHED_BYTES {
-                return Err(WriteEnd::Shed {
-                    unsent,
-                    unread,
-                    which: "send",
-                });
-            }
-            // The kernel took none of this line, so the next pong is still framed.
-            // A block body must not be discarded: redial and send it on the new socket.
-            if off == 0 && !catchup_body {
-                if must_send || compressed {
-                    return Err(WriteEnd::Shed {
-                        unsent,
-                        unread,
-                        which: "body",
-                    });
-                }
+            if droppable {
                 return Err(WriteEnd::Dropped { unsent });
             }
-            // A partial line cannot stay on the socket. Reset it.
-            return Err(WriteEnd::Shed {
-                unsent,
-                unread,
-                which: "torn",
-            });
+            let which = if unsent > PIPE_SHED_BYTES {
+                "send"
+            } else if off == 0 {
+                // A block body must not be discarded: redial and send it on
+                // the new socket.
+                "body"
+            } else {
+                // The peer took part of this line and then nothing for
+                // PIPE_STUCK_HOLD. A partial line cannot stay on the socket.
+                "torn"
+            };
+            return Err(WriteEnd::Shed { unsent, unread, which });
         }
         match tokio::time::timeout(left, writer.inner.write(&out[off..])).await {
             Ok(Ok(0)) => {
@@ -393,7 +390,10 @@ async fn write_or_shed(
                     which: "send",
                 });
             }
-            Ok(Ok(n)) => off += n,
+            Ok(Ok(n)) => {
+                off += n;
+                last_progress = tokio::time::Instant::now();
+            }
             Ok(Err(_)) => {
                 return Err(WriteEnd::Shed {
                     unsent: tcp_unsent(probe).unwrap_or(0),
@@ -423,6 +423,13 @@ async fn emit_or_shed(
     match write_or_shed(writer, probe, bytes).await {
         Ok(()) => Ok(()),
         Err(WriteEnd::Dropped { unsent }) => {
+            if unsent > PIPE_SHED_BYTES {
+                // 2.11.9 backlog drop: can be many lines a second, so rate-limit.
+                if let Some(n) = should_log_reply_dropped(unix_ms(), &BACKLOG_DROP_LAST_MS, &BACKLOG_DROP_SUPPRESSED) {
+                    warn!("backlog drop optional {dir} to {who} bytes={} unsent={unsent} (suppressed={n})", bytes.len());
+                }
+                return Ok(());
+            }
             warn!(
                 "pause large send {dir} to {who} bytes={} unsent={unsent}",
                 bytes.len()
@@ -4696,6 +4703,8 @@ fn should_drop_inbound_reply(inbound_registered: bool, was_hello: bool, reply: &
 const REPLY_DROP_LOG_INTERVAL_MS: u64 = 10_000;
 static REPLY_DROP_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REPLY_DROP_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BACKLOG_DROP_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BACKLOG_DROP_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Rate-limit `inbound reply dropped` warnings to at most once every
 /// `REPLY_DROP_LOG_INTERVAL_MS`. Returns `Some(suppressed_count)` when a log
@@ -8305,5 +8314,306 @@ mod zstd_drop_tests {
         }
         assert_eq!(got.last().unwrap().as_str(), after.trim_end());
         unsafe { libc::close(probe) };
+    }
+
+    // ---- 2.11.9 torn-shed fix -------------------------------------------
+
+    fn set_buf(fd: std::os::unix::io::RawFd, opt: libc::c_int, v: libc::c_int) {
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, opt, &v as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        }
+    }
+
+    /// Connected pair. `snd`: fixed SO_SNDBUF on the writer (None = kernel
+    /// autotuning, which lets the backlog pass PIPE_SHED_BYTES on loopback).
+    async fn pair(snd: Option<libc::c_int>, rcv: libc::c_int, zstd: bool) -> (ZWire, std::os::unix::io::RawFd, tokio::net::TcpStream) {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+        let cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (srv, _) = ln.accept().await.unwrap();
+        if let Some(v) = snd {
+            set_buf(cli.as_raw_fd(), libc::SO_SNDBUF, v);
+        }
+        set_buf(srv.as_raw_fd(), libc::SO_RCVBUF, rcv);
+        let probe = unsafe { libc::dup(cli.as_raw_fd()) };
+        let (_cr, cw) = cli.into_split();
+        let w: ZWire = fd_pl::wire_zstd::ZWriter::new(cw, Arc::new(AtomicBool::new(zstd)), 1);
+        (w, probe, srv)
+    }
+
+    fn typed_line(kind: &str, seed: u64, n: usize) -> String {
+        let l = noise_line(seed, n);
+        l.replacen("fill_probe", kind, 1)
+    }
+
+    /// Reader that sleeps `pause`, then decodes every line until the sentinel.
+    fn slow_reader(srv: tokio::net::TcpStream, zstd: bool, pause: std::time::Duration) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            tokio::time::sleep(pause).await;
+            let mut rd = fd_pl::wire_zstd::LineReader::new(srv, zstd);
+            let mut got = Vec::new();
+            while let Ok(Ok(Some(l))) = tokio::time::timeout(std::time::Duration::from_secs(10), rd.next_line()).await {
+                let done = l.contains("\"seed\":99999,");
+                got.push(l);
+                if done {
+                    break;
+                }
+            }
+            got
+        })
+    }
+
+    /// A peer pauses reading for longer than PIPE_SHED_HOLD while an optional
+    /// line is half written. 2.11.8 shed the session ("torn"); 2.11.9 keeps
+    /// the partial frame, finishes it when the peer reads again, and every
+    /// line decodes in order.
+    async fn torn_optional_line_finishes(zstd: bool) {
+        let (mut w, probe, srv) = pair(Some(96 * 1024), 96 * 1024, zstd).await;
+        let reader = slow_reader(srv, zstd, std::time::Duration::from_millis(3500));
+        let mut sent = Vec::new();
+        let mut torn_and_finished = false;
+        for i in 0..64u64 {
+            // Bigger than both kernel buffers even after zstd, so it tears.
+            let line = noise_line(i, 400 * 1024);
+            assert!(!line_must_send(line.as_bytes()));
+            let t0 = tokio::time::Instant::now();
+            match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                Ok(()) => {
+                    sent.push(line);
+                    if t0.elapsed() > PIPE_SHED_HOLD {
+                        torn_and_finished = true;
+                        break;
+                    }
+                }
+                Err(WriteEnd::Dropped { .. }) => {}
+                Err(WriteEnd::Shed { which, .. }) => {
+                    panic!("optional line shed ({which}) after {} lines (zstd={zstd})", sent.len())
+                }
+            }
+        }
+        assert!(torn_and_finished, "no line was held across the reader pause (zstd={zstd})");
+        let last = noise_line(99_999, 256);
+        write_or_shed(&mut w, probe, last.as_bytes()).await.unwrap_or_else(|_| panic!("sentinel"));
+        let got = reader.await.unwrap();
+        assert_eq!(got.len(), sent.len() + 1, "every sent line decodes, nothing torn (zstd={zstd})");
+        for (g, s) in got.iter().zip(sent.iter()) {
+            assert_eq!(g.as_str(), s.trim_end());
+        }
+        unsafe { libc::close(probe) };
+    }
+
+    #[tokio::test]
+    async fn compressed_torn_optional_line_finishes_without_shed() {
+        torn_optional_line_finishes(true).await;
+    }
+
+    #[tokio::test]
+    async fn plain_torn_optional_line_finishes_without_shed() {
+        torn_optional_line_finishes(false).await;
+    }
+
+    /// The kernel backlog is over PIPE_SHED_BYTES and the peer is not reading.
+    /// 2.11.8 shed the session ("send") after PIPE_SHED_HOLD; 2.11.9 drops the
+    /// optional line at once and the stream stays intact.
+    async fn backlog_drops_optional(zstd: bool) {
+        let (mut w, probe, srv) = pair(None, 64 * 1024, zstd).await;
+        let mut sent = Vec::new();
+        let mut i = 0u64;
+        // Fill with optional lines until the kernel will take no more.
+        let dropped_at = loop {
+            assert!(i < 2000, "never filled");
+            let line = noise_line(i, 48 * 1024);
+            i += 1;
+            let t0 = tokio::time::Instant::now();
+            match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                Ok(()) => sent.push(line),
+                Err(WriteEnd::Dropped { unsent }) => {
+                    if unsent > PIPE_SHED_BYTES {
+                        break t0.elapsed();
+                    }
+                }
+                Err(WriteEnd::Shed { which, .. }) => panic!("shed ({which}) while filling, zstd={zstd}"),
+            }
+        };
+        let backlog = tcp_unsent(probe).unwrap_or(0);
+        assert!(backlog > PIPE_SHED_BYTES, "backlog {backlog}");
+        // More optional lines: each one drops immediately, no shed.
+        for j in 0..20u64 {
+            let t0 = tokio::time::Instant::now();
+            match write_or_shed(&mut w, probe, typed_line("tx_inv", 50_000 + j, 2048).as_bytes()).await {
+                Err(WriteEnd::Dropped { .. }) => assert!(t0.elapsed() < std::time::Duration::from_millis(500)),
+                Ok(()) => panic!("wrote into a full pipe"),
+                Err(WriteEnd::Shed { which, .. }) => panic!("backlog shed ({which}), zstd={zstd}"),
+            }
+        }
+        let _ = dropped_at;
+        // Peer reads again: the stream is intact.
+        let reader = slow_reader(srv, zstd, std::time::Duration::ZERO);
+        let last = noise_line(99_999, 256);
+        let mut ok = false;
+        for _ in 0..400 {
+            match write_or_shed(&mut w, probe, last.as_bytes()).await {
+                Ok(()) => {
+                    ok = true;
+                    break;
+                }
+                Err(WriteEnd::Dropped { .. }) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                Err(WriteEnd::Shed { which, .. }) => panic!("shed after drain ({which})"),
+            }
+        }
+        assert!(ok);
+        let got = reader.await.unwrap();
+        assert_eq!(got.len(), sent.len() + 1);
+        unsafe { libc::close(probe) };
+    }
+
+    #[tokio::test]
+    async fn compressed_backlog_over_shed_bytes_drops_optional_without_shed() {
+        backlog_drops_optional(true).await;
+    }
+
+    #[tokio::test]
+    async fn plain_backlog_over_shed_bytes_drops_optional_without_shed() {
+        backlog_drops_optional(false).await;
+    }
+
+    /// Fill the pipe of a peer that never reads (raw, so no frame is split).
+    fn fill_raw(probe: std::os::unix::io::RawFd) {
+        let chunk = vec![b'x'; 64 * 1024];
+        loop {
+            let n = unsafe { libc::send(probe, chunk.as_ptr() as *const libc::c_void, chunk.len(), libc::MSG_DONTWAIT) };
+            if n <= 0 {
+                break;
+            }
+        }
+    }
+
+    /// A must-send line to a peer that never reads still sheds the session,
+    /// after PIPE_STUCK_HOLD (2.11.8: PIPE_SHED_HOLD).
+    #[tokio::test]
+    async fn must_send_still_sheds_after_the_hold() {
+        let (mut w, probe, _srv) = pair(Some(96 * 1024), 96 * 1024, false).await;
+        fill_raw(probe);
+        let line = typed_line("propose_ledger", 7, 8 * 1024);
+        assert!(line_must_send(line.as_bytes()));
+        let t0 = tokio::time::Instant::now();
+        match write_or_shed(&mut w, probe, line.as_bytes()).await {
+            Err(WriteEnd::Shed { which, .. }) => {
+                let e = t0.elapsed();
+                assert!(e >= PIPE_STUCK_HOLD && e < PIPE_STUCK_HOLD + std::time::Duration::from_secs(3), "shed after {e:?} ({which})");
+                assert!(PIPE_STUCK_HOLD >= std::time::Duration::from_secs(8));
+            }
+            Ok(()) => panic!("wrote a must-send line into a dead pipe"),
+            Err(WriteEnd::Dropped { .. }) => panic!("must-send line dropped"),
+        }
+        unsafe { libc::close(probe) };
+    }
+
+    /// A must-send line survives a 4 s reader pause (2.11.8 shed it at 2 s).
+    #[tokio::test]
+    async fn compressed_must_send_survives_short_reader_pause() {
+        let (mut w, probe, srv) = pair(Some(96 * 1024), 96 * 1024, true).await;
+        let reader = slow_reader(srv, true, std::time::Duration::from_secs(4));
+        let mut sent = Vec::new();
+        let mut held = false;
+        for i in 0..64u64 {
+            let line = typed_line("propose_ledger", i, 400 * 1024);
+            let t0 = tokio::time::Instant::now();
+            match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                Ok(()) => {
+                    sent.push(line);
+                    if t0.elapsed() > std::time::Duration::from_secs(3) {
+                        held = true;
+                        break;
+                    }
+                }
+                Err(WriteEnd::Dropped { .. }) => panic!("must-send dropped"),
+                Err(WriteEnd::Shed { which, .. }) => panic!("must-send shed ({which}) during a 4 s pause"),
+            }
+        }
+        assert!(held);
+        write_or_shed(&mut w, probe, noise_line(99_999, 256).as_bytes()).await.unwrap_or_else(|_| panic!("sentinel"));
+        let got = reader.await.unwrap();
+        assert_eq!(got.len(), sent.len() + 1);
+        unsafe { libc::close(probe) };
+    }
+
+    /// Throttled-reader soak (manual: `cargo test ... throttled_reader_soak --
+    /// --ignored --nocapture`). One compressed session, ~40 optional tx lines/s (SOAK_TX_BYTES each)
+    /// plus a must-send 70 KB body every 4 s, to a reader that reads for 1 s
+    /// and then pauses SOAK_PAUSE_MS (default 4 s; a busy 2-vCPU seat applying a block). A shed costs
+    /// BLACKHOLE_SECS and a fresh session, as live. Prints sheds and delivery.
+    #[tokio::test]
+    #[ignore]
+    async fn throttled_reader_soak() {
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let secs = env("SOAK_SECS", 60);
+        let pause_ms = env("SOAK_PAUSE_MS", 4000);
+        let tx_bytes = env("SOAK_TX_BYTES", 6144) as usize;
+        let body_ms = env("SOAK_BODY_MS", 4000);
+        let body_bytes = env("SOAK_BODY_BYTES", 70 * 1024) as usize;
+        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let (mut sheds, mut torn, mut body, mut dropped, mut sent, mut bodies) = (0, 0, 0, 0u64, 0u64, 0u64);
+        let delivered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut seq = 0u64;
+        'session: while tokio::time::Instant::now() < end {
+            // Live stalls sit at ~260-420 KB unsent: cap the kernel buffers to match.
+            let (mut w, probe, srv) = pair(Some(160 * 1024), 64 * 1024, true).await;
+            let d = delivered.clone();
+            let rd = tokio::spawn(async move {
+                let mut rd = fd_pl::wire_zstd::LineReader::new(srv, true);
+                // next_line is not cancel-safe, so no timeout around it: read
+                // whole lines for 1 s, then stop reading for pause_ms.
+                let mut t = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                loop {
+                    match rd.next_line().await {
+                        Ok(Some(_)) => {
+                            d.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        _ => return,
+                    }
+                    if tokio::time::Instant::now() >= t {
+                        tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+                        t = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                    }
+                }
+            });
+            let mut next_body = tokio::time::Instant::now();
+            while tokio::time::Instant::now() < end {
+                seq += 1;
+                let line = if tokio::time::Instant::now() >= next_body {
+                    next_body += std::time::Duration::from_millis(body_ms);
+                    bodies += 1;
+                    typed_line("ledger_body", seq, body_bytes)
+                } else {
+                    typed_line("submit_tx", seq, tx_bytes)
+                };
+                match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                    Ok(()) => sent += 1,
+                    Err(WriteEnd::Dropped { .. }) => dropped += 1,
+                    Err(WriteEnd::Shed { which, .. }) => {
+                        sheds += 1;
+                        if which == "torn" {
+                            torn += 1;
+                        }
+                        if which == "body" {
+                            body += 1;
+                        }
+                        hard_reset(probe);
+                        unsafe { libc::close(probe) };
+                        rd.abort();
+                        tokio::time::sleep(std::time::Duration::from_secs(BLACKHOLE_SECS)).await;
+                        continue 'session;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            unsafe { libc::close(probe) };
+            rd.abort();
+        }
+        eprintln!(
+            "SOAK {secs}s pause {pause_ms} ms tx {tx_bytes} B body {body_bytes} B/{body_ms} ms: sheds {sheds} (torn {torn}, body {body}), lines written {sent}, dropped {dropped}, bodies queued {bodies}, delivered {}",
+            delivered.load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 }
