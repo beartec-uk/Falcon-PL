@@ -210,6 +210,12 @@ impl<W> ZWriter<W> {
         self.comp.is_some()
     }
 
+    /// True when the next [`encode`](Self::encode) emits a frame (the stream
+    /// is already on, or the peer opted in and the marker goes out next).
+    pub fn will_compress(&self) -> bool {
+        self.comp.is_some() || self.peer_ok.load(Ordering::Relaxed)
+    }
+
     /// Bytes to put on the socket for one line. Plain until the peer opted in;
     /// then the marker (once) and a frame. Encoding advances the stream, so a
     /// caller that encoded a line must send it or end the session.
