@@ -131,6 +131,119 @@ const CONS_LOW_WATER: usize = 64 * 1024;
 const LARGE_LINE: usize = 64 * 1024;
 /// After a shed, refuse that peer so both sides do not redial in the same second.
 const BLACKHOLE_SECS: u64 = 8;
+
+/// 2.11.10: upload budgets for non-seat sessions (outside peers, relayed
+/// joiners, ctl/load clients). On 21 Nov v1 sent ~1.3 MB/s of its ~3.4 MB/s
+/// upload to relayed peers (one plain session pulled 21.8 MB of `piece`
+/// lines in 20 s) while its seat links shed. Seats are never paced.
+/// `FPL_OBSERVER_UPLOAD_KBPS` (all non-seat sessions together, default 768)
+/// and `FPL_OBSERVER_SESSION_KBPS` (each, default 256); 0 = unlimited.
+const OBSERVER_UPLOAD_KBPS_DEFAULT: u64 = 768;
+const OBSERVER_SESSION_KBPS_DEFAULT: u64 = 256;
+/// A non-seat catch-up request is refused while the shared budget owes more
+/// than this much send time (nothing is built, pieced or encoded for it).
+const OBSERVER_REFUSE_DEBT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Token bucket that may go into bounded debt: `take` charges the bytes and
+/// returns how long the caller should wait before writing them.
+struct UploadBudget {
+    /// Bytes per second; 0 = unlimited.
+    rate: u64,
+    burst: f64,
+    state: parking_lot::Mutex<(f64, std::time::Instant)>,
+}
+
+impl UploadBudget {
+    fn new(rate: u64) -> Self {
+        // One second of burst, at least one piece line.
+        let burst = (rate as f64).max(64.0 * 1024.0);
+        Self { rate, burst, state: parking_lot::Mutex::new((burst, std::time::Instant::now())) }
+    }
+
+    fn from_env_kbps(key: &str, default_kbps: u64) -> Self {
+        let kbps = std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_kbps);
+        Self::new(kbps.saturating_mul(1024))
+    }
+
+    fn refill(&self, st: &mut (f64, std::time::Instant), now: std::time::Instant) {
+        let dt = now.saturating_duration_since(st.1).as_secs_f64();
+        st.0 = (st.0 + dt * self.rate as f64).min(self.burst);
+        st.1 = now;
+    }
+
+    fn take_at(&self, n: usize, now: std::time::Instant) -> std::time::Duration {
+        if self.rate == 0 {
+            return std::time::Duration::ZERO;
+        }
+        let mut st = self.state.lock();
+        self.refill(&mut st, now);
+        st.0 -= n as f64;
+        if st.0 >= 0.0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64(-st.0 / self.rate as f64)
+        }
+    }
+
+    fn take(&self, n: usize) -> std::time::Duration {
+        self.take_at(n, std::time::Instant::now())
+    }
+
+    /// Current debt expressed as send time (zero when tokens remain).
+    fn debt_at(&self, now: std::time::Instant) -> std::time::Duration {
+        if self.rate == 0 {
+            return std::time::Duration::ZERO;
+        }
+        let mut st = self.state.lock();
+        self.refill(&mut st, now);
+        if st.0 >= 0.0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64(-st.0 / self.rate as f64)
+        }
+    }
+}
+
+fn observer_global_budget() -> &'static UploadBudget {
+    static G: std::sync::OnceLock<UploadBudget> = std::sync::OnceLock::new();
+    G.get_or_init(|| UploadBudget::from_env_kbps("FPL_OBSERVER_UPLOAD_KBPS", OBSERVER_UPLOAD_KBPS_DEFAULT))
+}
+
+static OBSERVER_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OBSERVER_PACED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OBSERVER_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pace one line on a non-seat session through its own and the shared budget.
+async fn pace_observer(sess: &UploadBudget, observer: &std::sync::atomic::AtomicBool, n: usize) {
+    if !observer.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    OBSERVER_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    let wait = sess.take(n).max(observer_global_budget().take(n));
+    if !wait.is_zero() {
+        OBSERVER_PACED_MS.fetch_add(wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// `pace_observer`, then true (so it can lead an `&&` chain before a write).
+async fn pace_then(sess: &UploadBudget, observer: &std::sync::atomic::AtomicBool, n: usize) -> bool {
+    pace_observer(sess, observer, n).await;
+    true
+}
+
+/// Catch-up / snapshot requests a non-seat may be refused while the shared
+/// observer budget is in debt (the joiner re-asks on its own timers).
+fn is_observer_serve_request(m: &WireMsg) -> bool {
+    matches!(
+        m,
+        WireMsg::NeedLedgers { .. } | WireMsg::NeedSnapshot { .. } | WireMsg::NeedSnapshotChunk { .. }
+    )
+}
+
+fn observer_refuse_now(budget: &UploadBudget, now: std::time::Instant) -> bool {
+    budget.debt_at(now) > OBSERVER_REFUSE_DEBT
+}
 /// v2.9.67 join-serve retention (local only, not consensus). Hashed serve
 /// files `<stem>.join.serve.<sha>.json` stay fetchable by hash: the newest
 /// `JOIN_SERVE_KEEP`, anything younger than `JOIN_SERVE_MIN_AGE_MS`, the
@@ -480,6 +593,19 @@ fn pipe_stuck(
     last_unsent: &mut usize,
     last_unread: &mut usize,
 ) -> Option<(&'static str, usize, usize)> {
+    // 2.11.10: same grace as a must-finish line in write_or_shed (2.11.9).
+    // At 2 s a hub whose uplink was busy serving catch-up shed seat links
+    // ("send") that would have drained.
+    pipe_stuck_for(fd, high_since, last_unsent, last_unread, PIPE_STUCK_HOLD)
+}
+
+fn pipe_stuck_for(
+    fd: std::os::unix::io::RawFd,
+    high_since: &mut Option<std::time::Instant>,
+    last_unsent: &mut usize,
+    last_unread: &mut usize,
+    hold: std::time::Duration,
+) -> Option<(&'static str, usize, usize)> {
     let unsent = tcp_unsent(fd).unwrap_or(0);
     let unread = tcp_unread(fd).unwrap_or(0);
     let moving = unsent < *last_unsent || unread < *last_unread;
@@ -499,7 +625,7 @@ fn pipe_stuck(
         return None;
     }
     let since = high_since.get_or_insert_with(std::time::Instant::now);
-    if since.elapsed() >= PIPE_SHED_HOLD {
+    if since.elapsed() >= hold {
         Some((which.unwrap(), unsent, unread))
     } else {
         None
@@ -4131,7 +4257,10 @@ async fn main() -> Result<()> {
                         .sum();
                     drop(inbound);
                     let socks = shared_c.sock_summary();
-                    info!("mesh sockets outbound={n_out} inbound={n_in} queued_out={out_bytes} queued_in={in_bytes} live={socks}");
+                    let ob = OBSERVER_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                    let op = OBSERVER_PACED_MS.load(std::sync::atomic::Ordering::Relaxed);
+                    let orf = OBSERVER_REFUSED.load(std::sync::atomic::Ordering::Relaxed);
+                    info!("mesh sockets outbound={n_out} inbound={n_in} queued_out={out_bytes} queued_in={in_bytes} live={socks} observer_bytes={ob} observer_paced_ms={op} observer_refused={orf}");
                 }
             }
         });
@@ -4484,9 +4613,25 @@ async fn peer_session(
                 continue;
             }
         }
-        // Lanes: LedgersBatch reply → other reply → cons → NeedLedgers → body → inventory.
+        // Lanes: cons → LedgersBatch reply → other reply → NeedLedgers → body → inventory.
+        // 2.11.10: votes first. v1 dials every seat, so all its seat links
+        // are this loop; a lagging seat's pieced LedgersBatch (63 must-send
+        // pieces) used to sit ahead of every vote on that socket.
         tokio::select! {
             biased;
+            line = cons_rx.recv() => {
+                match line {
+                    Some(line) => {
+                        recved(cons_used, line.len());
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                            read_task.abort();
+                            unsafe { libc::close(probe) };
+                            return Err(PipeShed.into());
+                        }
+                    }
+                    None => break,
+                }
+            }
             line = catchup_rx.recv() => {
                 match line {
                     Some(line) => {
@@ -4505,19 +4650,6 @@ async fn peer_session(
             line = reply_rx.recv() => {
                 match line {
                     Some(line) => {
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
-                            read_task.abort();
-                            unsafe { libc::close(probe) };
-                            return Err(PipeShed.into());
-                        }
-                    }
-                    None => break,
-                }
-            }
-            line = cons_rx.recv() => {
-                match line {
-                    Some(line) => {
-                        recved(cons_used, line.len());
                         if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
@@ -4835,6 +4967,10 @@ async fn handle_inbound(
     // Lean tx gossip for this inbound session (set from its Hello).
     let lean_in = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lean_w = lean_in.clone();
+    // 2.11.10: a session is paced as a non-seat until its Hello names a seat.
+    let observer = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let observer_w = observer.clone();
+    let obs_budget = UploadBudget::from_env_kbps("FPL_OBSERVER_SESSION_KBPS", OBSERVER_SESSION_KBPS_DEFAULT);
     let mut writer_task = tokio::spawn(async move {
         let mut high_since = None;
         let mut last_unsent = 0usize;
@@ -4861,7 +4997,7 @@ async fn handle_inbound(
                         if dish_since.unwrap().elapsed() >= DISH_GATE { "timeout" } else { "release" },
                         tcp_unsent(probe).unwrap_or(0)
                     );
-                    if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                    if pace_then(&obs_budget, &observer_w, line.len()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                         shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
@@ -4879,7 +5015,7 @@ async fn handle_inbound(
                 line = catch_reply_rx.recv() => {
                     match line {
                         Some(line) => {
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                            if pace_then(&obs_budget, &observer_w, line.len()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -4890,7 +5026,7 @@ async fn handle_inbound(
                 line = reply_rx.recv() => {
                     match line {
                         Some(line) => {
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                            if pace_then(&obs_budget, &observer_w, line.len()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -4922,7 +5058,7 @@ async fn handle_inbound(
                                 }
                                 inv_left = inv_left.saturating_sub(line.len());
                             }
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                            if pace_then(&obs_budget, &observer_w, line.len()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -5016,6 +5152,8 @@ async fn handle_inbound(
                     break;
                 }
                 seen_id = id.clone();
+                let seat = shared.node.lock().validators.contains_key(id);
+                observer.store(!seat, std::sync::atomic::Ordering::Relaxed);
                 shared.close_inbound_seat(id);
                 shared.inbound.lock().push(InboundSink {
                     id: id.clone(),
@@ -5025,6 +5163,14 @@ async fn handle_inbound(
                 });
                 inbound_registered = true;
             }
+        }
+        if observer.load(std::sync::atomic::Ordering::Relaxed)
+            && is_observer_serve_request(&msg)
+            && observer_refuse_now(observer_global_budget(), std::time::Instant::now())
+        {
+            // 2.11.10: drop before anything is built, pieced or encoded.
+            OBSERVER_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
         }
         let was_hello = matches!(msg, WireMsg::Hello { .. });
         let replies = dispatch_wire(&shared, msg, Some(&fanout), true, false);
@@ -8614,6 +8760,418 @@ mod zstd_drop_tests {
         eprintln!(
             "SOAK {secs}s pause {pause_ms} ms tx {tx_bytes} B body {body_bytes} B/{body_ms} ms: sheds {sheds} (torn {torn}, body {body}), lines written {sent}, dropped {dropped}, bodies queued {bodies}, delivered {}",
             delivered.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+}
+
+#[cfg(test)]
+mod send_budget_tests {
+    //! 2.11.10 Phase 1: non-seat upload budgets, votes-first outbound lanes,
+    //! and the 8 s grace on `pipe_stuck`.
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn upload_budget_charges_bursts_then_paces() {
+        let b = UploadBudget::new(100 * 1024);
+        let t0 = Instant::now();
+        assert_eq!(b.take_at(100 * 1024, t0), Duration::ZERO, "one second of burst");
+        let w = b.take_at(50 * 1024, t0);
+        assert!((w.as_secs_f64() - 0.5).abs() < 0.01, "{w:?}");
+        assert!((b.debt_at(t0).as_secs_f64() - 0.5).abs() < 0.01);
+        assert_eq!(b.debt_at(t0 + Duration::from_secs(1)), Duration::ZERO, "refilled");
+        let unlimited = UploadBudget::new(0);
+        assert_eq!(unlimited.take_at(usize::MAX / 2, t0), Duration::ZERO);
+        assert_eq!(unlimited.debt_at(t0), Duration::ZERO);
+    }
+
+    #[test]
+    fn observer_catchup_is_refused_only_in_debt() {
+        let b = UploadBudget::new(64 * 1024);
+        let t0 = Instant::now();
+        assert!(!observer_refuse_now(&b, t0));
+        b.take_at(64 * 1024 + 64 * 1024 * 3, t0); // 3 s in debt
+        assert!(observer_refuse_now(&b, t0));
+        assert!(!observer_refuse_now(&b, t0 + Duration::from_secs(3)), "debt paid back");
+        assert!(is_observer_serve_request(&WireMsg::NeedLedgers { from_height: 1, max_count: 8 }));
+        assert!(is_observer_serve_request(&WireMsg::NeedSnapshot {}));
+        assert!(!is_observer_serve_request(&WireMsg::Ok { msg: String::new() }));
+    }
+
+    #[tokio::test]
+    async fn seats_are_never_paced() {
+        let sess = UploadBudget::new(1024); // 1 KB/s: any pacing would be obvious
+        let seat = AtomicBool::new(false);
+        let t = tokio::time::Instant::now();
+        for _ in 0..8 {
+            pace_observer(&sess, &seat, 64 * 1024).await;
+        }
+        assert!(t.elapsed() < Duration::from_millis(50));
+        let obs = AtomicBool::new(true);
+        let t = tokio::time::Instant::now();
+        pace_observer(&sess, &obs, 64 * 1024).await; // burst
+        pace_observer(&sess, &obs, 512).await; // 0.5 s debt
+        assert!(t.elapsed() >= Duration::from_millis(400), "{:?}", t.elapsed());
+    }
+
+    /// 2.11.9 shed a session whose send queue sat over PIPE_SHED_BYTES for
+    /// PIPE_SHED_HOLD (2 s), while write_or_shed already gave a stuck line
+    /// PIPE_STUCK_HOLD (8 s). Fails on 2.11.9.
+    #[tokio::test]
+    async fn full_send_queue_gets_the_stuck_hold_not_two_seconds() {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cli = tokio::net::TcpStream::connect(ln.local_addr().unwrap()).await.unwrap();
+        let (srv, _) = ln.accept().await.unwrap();
+        // Kernel autotuning on the sender (no SO_SNDBUF) lets loopback hold >1 MB;
+        // a small receive buffer and no reader keep it there.
+        set_buf(srv.as_raw_fd(), libc::SO_RCVBUF, 64 * 1024);
+        let fd = cli.as_raw_fd();
+        let chunk = vec![b'x'; 64 * 1024];
+        let t = Instant::now();
+        // Fill, let the receive window settle, top up again.
+        for _ in 0..4 {
+            while tcp_unsent(fd).unwrap_or(0) <= PIPE_SHED_BYTES + 256 * 1024 && t.elapsed() < Duration::from_secs(10) {
+                match cli.try_write(&chunk) {
+                    Ok(_) => {}
+                    Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let unsent = tcp_unsent(fd).unwrap_or(0);
+        assert!(unsent > PIPE_SHED_BYTES, "could not build a >1 MB send queue on loopback ({unsent})");
+        let (mut hs, mut lu, mut lr) = (None, 0usize, 0usize);
+        let (mut hs2, mut lu2, mut lr2) = (None, 0usize, 0usize);
+        let mut old_shed_at = None;
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(3500) {
+            assert!(pipe_stuck(fd, &mut hs, &mut lu, &mut lr).is_none(), "shed after {:?} (2 s hold)", t.elapsed());
+            if old_shed_at.is_none() && pipe_stuck_for(fd, &mut hs2, &mut lu2, &mut lr2, PIPE_SHED_HOLD).is_some() {
+                old_shed_at = Some(t.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(old_shed_at.is_some(), "the 2.11.9 hold would have shed this queue");
+        drop(srv);
+    }
+
+    // ---- shared-uplink soak (v1 model) ----------------------------------
+
+    fn soak_line(kind: &str, t_ms: u64, n: usize, seed: u64) -> String {
+        // About half incompressible, like live JSON under zstd (~-40%).
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let half = n / 2;
+        let mut d = String::with_capacity(n);
+        for _ in 0..half {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            d.push(char::from(b"0123456789abcdef"[(x % 16) as usize]));
+        }
+        d.extend(std::iter::repeat('a').take(n - half));
+        format!("{{\"type\":\"{kind}\",\"t\":{t_ms},\"d\":\"{d}\"}}\n")
+    }
+
+    fn line_t(l: &str) -> Option<u64> {
+        let i = l.find("\"t\":")? + 4;
+        let j = l[i..].find(',')? + i;
+        l[i..j].parse().ok()
+    }
+
+    fn set_buf(fd: std::os::unix::io::RawFd, opt: libc::c_int, v: libc::c_int) {
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, opt, &v as *const _ as *const libc::c_void, 4);
+        }
+    }
+
+    #[derive(Default)]
+    struct SoakStats {
+        votes_sent: AtomicU64,
+        votes_got: AtomicU64,
+        tx_sent: AtomicU64,
+        tx_got: AtomicU64,
+        bodies_got: AtomicU64,
+        obs_bytes: AtomicU64,
+        sheds: AtomicU64,
+        shed_torn: AtomicU64,
+        shed_body: AtomicU64,
+        shed_send: AtomicU64,
+        dropped: AtomicU64,
+        refused: AtomicU64,
+        vote_lat: parking_lot::Mutex<Vec<u64>>,
+        body_lat: parking_lot::Mutex<Vec<u64>>,
+    }
+
+    /// writer -> [loopback] -> uplink proxy (shared token bucket) -> [loopback] -> reader
+    async fn uplink_link(
+        up: Arc<UploadBudget>,
+    ) -> (tokio::net::tcp::OwnedWriteHalf, std::os::unix::io::RawFd, tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let w = tokio::net::TcpStream::connect(l1.local_addr().unwrap()).await.unwrap();
+        let (pin, _) = l1.accept().await.unwrap();
+        let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut pout = tokio::net::TcpStream::connect(l2.local_addr().unwrap()).await.unwrap();
+        let (r, _) = l2.accept().await.unwrap();
+        // Live v1 seat links sat at 5-290 KB send-q: a WAN-sized buffer.
+        set_buf(w.as_raw_fd(), libc::SO_SNDBUF, 256 * 1024);
+        set_buf(pin.as_raw_fd(), libc::SO_RCVBUF, 32 * 1024);
+        let proxy = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut pin = pin;
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                let n = match pin.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let wait = up.take(n);
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                if pout.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let probe = unsafe { libc::dup(w.as_raw_fd()) };
+        let (_wr, ww) = w.into_split();
+        std::mem::forget(_wr);
+        (ww, probe, r, proxy)
+    }
+
+    struct Lanes {
+        cons: mpsc::Receiver<String>,
+        catch: mpsc::Receiver<String>,
+        body: mpsc::Receiver<String>,
+        tx: mpsc::Receiver<String>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn soak_link(
+        new: bool,
+        observer: bool,
+        zstd: bool,
+        mut lanes: Lanes,
+        up: Arc<UploadBudget>,
+        obs_global: Arc<UploadBudget>,
+        st: Arc<SoakStats>,
+        base: Instant,
+        end: tokio::time::Instant,
+    ) {
+        let sess = UploadBudget::new(OBSERVER_SESSION_KBPS_DEFAULT * 1024);
+        let is_obs = AtomicBool::new(observer);
+        'session: while tokio::time::Instant::now() < end {
+            let (ww, probe, r, proxy) = uplink_link(up.clone()).await;
+            let mut w: ZWire = fd_pl::wire_zstd::ZWriter::new(ww, Arc::new(AtomicBool::new(zstd)), fd_pl::wire_zstd::DEFAULT_LEVEL);
+            let st_r = st.clone();
+            let pause_ms = std::env::var("SOAK_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0u64);
+            let every_ms = std::env::var("SOAK_PAUSE_EVERY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000u64);
+            let rd = tokio::spawn(async move {
+                let mut rd = fd_pl::wire_zstd::LineReader::new(r, zstd);
+                let mut next_pause = tokio::time::Instant::now() + Duration::from_millis(every_ms);
+                while let Ok(Some(l)) = rd.next_line().await {
+                    // A 2-vCPU seat applying a block stops reading for a while.
+                    if !observer && pause_ms > 0 && tokio::time::Instant::now() >= next_pause {
+                        tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+                        next_pause = tokio::time::Instant::now() + Duration::from_millis(every_ms);
+                    }
+                    let now = base.elapsed().as_millis() as u64;
+                    if observer {
+                        st_r.obs_bytes.fetch_add(l.len() as u64, Relaxed);
+                        continue;
+                    }
+                    let t = line_t(&l).unwrap_or(now);
+                    if l.starts_with("{\"type\":\"ledger_ok\"") {
+                        st_r.votes_got.fetch_add(1, Relaxed);
+                        st_r.vote_lat.lock().push(now.saturating_sub(t));
+                    } else if l.starts_with("{\"type\":\"submit_tx\"") {
+                        st_r.tx_got.fetch_add(1, Relaxed);
+                    } else if l.starts_with("{\"type\":\"ledger_body\"") {
+                        st_r.bodies_got.fetch_add(1, Relaxed);
+                        st_r.body_lat.lock().push(now.saturating_sub(t));
+                    }
+                }
+            });
+            let (mut hs, mut lu, mut lr) = (None, 0usize, 0usize);
+            let hold = if new { PIPE_STUCK_HOLD } else { PIPE_SHED_HOLD };
+            let shed = |which: &str, st: &SoakStats| {
+                st.sheds.fetch_add(1, Relaxed);
+                match which {
+                    "torn" => st.shed_torn.fetch_add(1, Relaxed),
+                    "body" => st.shed_body.fetch_add(1, Relaxed),
+                    _ => st.shed_send.fetch_add(1, Relaxed),
+                };
+            };
+            while tokio::time::Instant::now() < end {
+                if let Some((which, _, _)) = pipe_stuck_for(probe, &mut hs, &mut lu, &mut lr, hold) {
+                    shed(which, &st);
+                } else {
+                    let line = if new {
+                        tokio::select! {
+                            biased;
+                            Some(l) = lanes.cons.recv() => l,
+                            Some(l) = lanes.catch.recv() => l,
+                            Some(l) = lanes.body.recv() => l,
+                            Some(l) = lanes.tx.recv() => l,
+                            _ = tokio::time::sleep(Duration::from_millis(200)) => continue,
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            Some(l) = lanes.catch.recv() => l,
+                            Some(l) = lanes.cons.recv() => l,
+                            Some(l) = lanes.body.recv() => l,
+                            Some(l) = lanes.tx.recv() => l,
+                            _ = tokio::time::sleep(Duration::from_millis(200)) => continue,
+                        }
+                    };
+                    if new {
+                        pace_observer(&sess, &is_obs, line.len()).await;
+                        // pace_observer charges the process-wide budget; the soak's own
+                        // global budget stands in for it so runs stay independent.
+                        if observer {
+                            let wt = obs_global.take(line.len());
+                            if !wt.is_zero() {
+                                tokio::time::sleep(wt).await;
+                            }
+                        }
+                    }
+                    match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                        Ok(()) => continue,
+                        Err(WriteEnd::Dropped { .. }) => {
+                            st.dropped.fetch_add(1, Relaxed);
+                            continue;
+                        }
+                        Err(WriteEnd::Shed { which, .. }) => shed(which, &st),
+                    }
+                }
+                // Shed: RST, blackhole, lose the tx and body queues (as live).
+                hard_reset(probe);
+                unsafe { libc::close(probe) };
+                rd.abort();
+                proxy.abort();
+                while lanes.tx.try_recv().is_ok() {}
+                while lanes.body.try_recv().is_ok() {}
+                tokio::time::sleep(Duration::from_secs(BLACKHOLE_SECS)).await;
+                continue 'session;
+            }
+            unsafe { libc::close(probe) };
+            rd.abort();
+            proxy.abort();
+        }
+    }
+
+    fn pct(v: &mut [u64], p: f64) -> u64 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        v[((v.len() as f64 - 1.0) * p).round() as usize]
+    }
+
+    /// v1 model (manual): `SOAK_MODE=old|new cargo test -p fd-pl --bin falcon-pl-node
+    /// uplink_fanout_soak -- --ignored --nocapture`. SOAK_SEATS zstd seat links
+    /// (votes 4/s, 20 tx/s x 4 KB, a 120 KB body every 12 s, a 63-piece
+    /// LedgersBatch every 20 s) and SOAK_OBS plain outside pullers (48 KB piece
+    /// lines as fast as they are taken, like the 21.8 MB / 20 s session on v1)
+    /// share one SOAK_UPLINK_KBPS uplink (v1 measured ~3,900 kB/s on Wi-Fi).
+    /// old = 2.11.9 (catch-up ahead of votes, 2 s pipe_stuck, no budgets).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn uplink_fanout_soak() {
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let new = std::env::var("SOAK_MODE").map(|v| v != "old").unwrap_or(true);
+        let secs = env("SOAK_SECS", 120);
+        let seats = env("SOAK_SEATS", 6);
+        let nobs = env("SOAK_OBS", 3);
+        let uplink = env("SOAK_UPLINK_KBPS", 3900);
+        let up = Arc::new(UploadBudget::new(uplink * 1024));
+        let obs_global = Arc::new(UploadBudget::new(OBSERVER_UPLOAD_KBPS_DEFAULT * 1024));
+        let st = Arc::new(SoakStats::default());
+        let base = Instant::now();
+        let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+        let mut tasks = Vec::new();
+        for i in 0..(seats + nobs) {
+            let observer = i >= seats;
+            let (ctx, crx) = mpsc::channel::<String>(512);
+            let (atx, arx) = mpsc::channel::<String>(128);
+            let (btx, brx) = mpsc::channel::<String>(32);
+            let (ttx, trx) = mpsc::channel::<String>(512);
+            let lanes = Lanes { cons: crx, catch: arx, body: brx, tx: trx };
+            tasks.push(tokio::spawn(soak_link(new, observer, !observer, lanes, up.clone(), obs_global.clone(), st.clone(), base, end)));
+            let st_g = st.clone();
+            let og = obs_global.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut seq = i as u64 * 1_000_000;
+                let mut tick = 0u64;
+                while tokio::time::Instant::now() < end {
+                    let now = base.elapsed().as_millis() as u64;
+                    seq += 1;
+                    if observer {
+                        // A joiner re-asks as soon as it has room; 2.11.10 refuses
+                        // while the shared observer budget is >1 s in debt.
+                        if new && observer_refuse_now(&og, Instant::now()) {
+                            st_g.refused.fetch_add(1, Relaxed);
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        let l = format!("{{\"type\":\"piece\",\"pid\":{seq},\"t\":{now},\"d\":\"{}\"}}\n", &soak_line("x", now, 47 * 1024, seq)[30..]);
+                        if atx.send(l).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    tick += 1;
+                    if tick % 5 == 0 {
+                        st_g.votes_sent.fetch_add(1, Relaxed);
+                        let _ = ctx.try_send(soak_line("ledger_ok", now, 900, seq));
+                    }
+                    st_g.tx_sent.fetch_add(1, Relaxed);
+                    let _ = ttx.try_send(soak_line("submit_tx", now, 4096, seq));
+                    if tick % 240 == 0 {
+                        let _ = btx.try_send(soak_line("ledger_body", now, 120 * 1024, seq));
+                    }
+                    if tick % 400 == (i as u64 * 37) % 400 {
+                        for k in 0..63u64 {
+                            let l = format!("{{\"type\":\"piece\",\"pid\":{},\"t\":{now},\"d\":\"{}\"}}\n", seq * 100 + k, &soak_line("x", now, 23 * 1024, seq + k)[30..]);
+                            let _ = atx.try_send(l);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }));
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+        let mut vl = st.vote_lat.lock().clone();
+        let mut bl = st.body_lat.lock().clone();
+        let vs = st.votes_sent.load(Relaxed).max(1);
+        eprintln!(
+            "UPLINK-SOAK mode={} secs={secs} pause={}ms seats={seats} obs={nobs} uplink={uplink}kB/s: votes delivered {}/{} ({:.1}%) lat p50 {} ms p99 {} ms max {} ms | tx delivered {}/{} ({:.1}%) | bodies {} lat p50 {} ms p99 {} ms | sheds {} (torn {}, body {}, send {}) dropped {} | observer {:.0} kB/s refused {}",
+            if new { "new" } else { "old" },
+            std::env::var("SOAK_PAUSE_MS").unwrap_or_else(|_| "0".into()),
+            st.votes_got.load(Relaxed),
+            vs,
+            100.0 * st.votes_got.load(Relaxed) as f64 / vs as f64,
+            pct(&mut vl, 0.5),
+            pct(&mut vl, 0.99),
+            vl.last().copied().unwrap_or(0),
+            st.tx_got.load(Relaxed),
+            st.tx_sent.load(Relaxed),
+            100.0 * st.tx_got.load(Relaxed) as f64 / st.tx_sent.load(Relaxed).max(1) as f64,
+            st.bodies_got.load(Relaxed),
+            pct(&mut bl, 0.5),
+            pct(&mut bl, 0.99),
+            st.sheds.load(Relaxed),
+            st.shed_torn.load(Relaxed),
+            st.shed_body.load(Relaxed),
+            st.shed_send.load(Relaxed),
+            st.dropped.load(Relaxed),
+            st.obs_bytes.load(Relaxed) as f64 / 1024.0 / secs as f64,
+            st.refused.load(Relaxed),
         );
     }
 }
