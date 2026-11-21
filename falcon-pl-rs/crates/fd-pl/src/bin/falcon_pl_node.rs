@@ -8860,15 +8860,16 @@ mod send_budget_tests {
     // ---- shared-uplink soak (v1 model) ----------------------------------
 
     fn soak_line(kind: &str, t_ms: u64, n: usize, seed: u64) -> String {
-        // About half incompressible, like live JSON under zstd (~-40%).
+        // 80% random base62 + 20% filler: zstd takes ~40% off, as measured
+        // live on lean blocks (-41.4%).
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let half = n / 2;
+        let half = n * 4 / 5;
         let mut d = String::with_capacity(n);
         for _ in 0..half {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            d.push(char::from(b"0123456789abcdef"[(x % 16) as usize]));
+            d.push(char::from(b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[(x % 62) as usize]));
         }
         d.extend(std::iter::repeat('a').take(n - half));
         format!("{{\"type\":\"{kind}\",\"t\":{t_ms},\"d\":\"{d}\"}}\n")
@@ -8914,8 +8915,12 @@ mod send_budget_tests {
         let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut pout = tokio::net::TcpStream::connect(l2.local_addr().unwrap()).await.unwrap();
         let (r, _) = l2.accept().await.unwrap();
-        // Live v1 seat links sat at 5-290 KB send-q: a WAN-sized buffer.
-        set_buf(w.as_raw_fd(), libc::SO_SNDBUF, 256 * 1024);
+        // Live v1 seat links sat at 5-340 KB send-q. SOAK_SNDBUF=0 leaves the
+        // kernel autotuning (live default, up to tcp_wmem max).
+        let snd = std::env::var("SOAK_SNDBUF").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(256 * 1024);
+        if snd > 0 {
+            set_buf(w.as_raw_fd(), libc::SO_SNDBUF, snd);
+        }
         set_buf(pin.as_raw_fd(), libc::SO_RCVBUF, 32 * 1024);
         let proxy = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
@@ -8930,6 +8935,11 @@ mod send_budget_tests {
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
+                // Shared uplink stall (Wi-Fi / home router): nothing moves.
+                let stall = uplink_stall_left();
+                if !stall.is_zero() {
+                    tokio::time::sleep(stall).await;
+                }
                 if pout.write_all(&buf[..n]).await.is_err() {
                     return;
                 }
@@ -8939,6 +8949,22 @@ mod send_budget_tests {
         let (_wr, ww) = w.into_split();
         std::mem::forget(_wr);
         (ww, probe, r, proxy)
+    }
+
+    /// SOAK_STALL_MS of no uplink every SOAK_STALL_EVERY_MS (default none).
+    fn uplink_stall_left() -> Duration {
+        static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let ms = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let (stall, every) = (ms("SOAK_STALL_MS"), ms("SOAK_STALL_EVERY_MS"));
+        if stall == 0 || every == 0 {
+            return Duration::ZERO;
+        }
+        let t = T0.get_or_init(Instant::now).elapsed().as_millis() as u64 % every;
+        if t >= every - stall {
+            Duration::from_millis(every - t)
+        } else {
+            Duration::ZERO
+        }
     }
 
     struct Lanes {
@@ -9073,8 +9099,8 @@ mod send_budget_tests {
 
     /// v1 model (manual): `SOAK_MODE=old|new cargo test -p fd-pl --bin falcon-pl-node
     /// uplink_fanout_soak -- --ignored --nocapture`. SOAK_SEATS zstd seat links
-    /// (votes 4/s, 20 tx/s x 4 KB, a 120 KB body every 12 s, a 63-piece
-    /// LedgersBatch every 20 s) and SOAK_OBS plain outside pullers (48 KB piece
+    /// (votes 4/s, 20 tx/s x SOAK_TX_BYTES (8 KB), a 120 KB body every 12 s, a
+    /// 63-piece LedgersBatch every SOAK_CATCH_MS (10 s); ~320 kB/s per seat) and SOAK_OBS plain outside pullers (48 KB piece
     /// lines as fast as they are taken, like the 21.8 MB / 20 s session on v1)
     /// share one SOAK_UPLINK_KBPS uplink (v1 measured ~3,900 kB/s on Wi-Fi).
     /// old = 2.11.9 (catch-up ahead of votes, 2 s pipe_stuck, no budgets).
@@ -9087,6 +9113,10 @@ mod send_budget_tests {
         let seats = env("SOAK_SEATS", 6);
         let nobs = env("SOAK_OBS", 3);
         let uplink = env("SOAK_UPLINK_KBPS", 3900);
+        // Live v1 sent ~2.0 MB/s to 5 seats (~400 kB/s each): 20 tx/s x 8 KB
+        // plus a 1.5 MB pieced LedgersBatch every 10 s plus bodies and votes.
+        let tx_bytes = env("SOAK_TX_BYTES", 8192) as usize;
+        let catch_ticks = env("SOAK_CATCH_MS", 10_000) / 50;
         let up = Arc::new(UploadBudget::new(uplink * 1024));
         let obs_global = Arc::new(UploadBudget::new(OBSERVER_UPLOAD_KBPS_DEFAULT * 1024));
         let st = Arc::new(SoakStats::default());
@@ -9129,11 +9159,11 @@ mod send_budget_tests {
                         let _ = ctx.try_send(soak_line("ledger_ok", now, 900, seq));
                     }
                     st_g.tx_sent.fetch_add(1, Relaxed);
-                    let _ = ttx.try_send(soak_line("submit_tx", now, 4096, seq));
+                    let _ = ttx.try_send(soak_line("submit_tx", now, tx_bytes, seq));
                     if tick % 240 == 0 {
                         let _ = btx.try_send(soak_line("ledger_body", now, 120 * 1024, seq));
                     }
-                    if tick % 400 == (i as u64 * 37) % 400 {
+                    if tick % catch_ticks == (i as u64 * 37) % catch_ticks {
                         for k in 0..63u64 {
                             let l = format!("{{\"type\":\"piece\",\"pid\":{},\"t\":{now},\"d\":\"{}\"}}\n", seq * 100 + k, &soak_line("x", now, 23 * 1024, seq + k)[30..]);
                             let _ = atx.try_send(l);
