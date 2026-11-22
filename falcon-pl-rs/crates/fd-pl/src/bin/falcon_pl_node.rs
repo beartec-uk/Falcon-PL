@@ -213,7 +213,9 @@ static OBSERVER_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static OBSERVER_PACED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static OBSERVER_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Pace one line on a non-seat session through its own and the shared budget.
+/// Pace one line on a non-seat session through its own and the shared budget
+/// (the writer-loop soak; live sessions use `pace_line_then`).
+#[cfg_attr(not(test), allow(dead_code))]
 async fn pace_observer(sess: &UploadBudget, observer: &std::sync::atomic::AtomicBool, n: usize) {
     if !observer.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -226,9 +228,59 @@ async fn pace_observer(sess: &UploadBudget, observer: &std::sync::atomic::Atomic
     }
 }
 
-/// `pace_observer`, then true (so it can lead an `&&` chain before a write).
-async fn pace_then(sess: &UploadBudget, observer: &std::sync::atomic::AtomicBool, n: usize) -> bool {
-    pace_observer(sess, observer, n).await;
+/// 2.11.11: a loopback client is the node's own operator: `falcon-pl-ctl`,
+/// the installer's autoupgrade health check (`ctl status` with a 30 s limit),
+/// dashboards. 2.11.10 counted it as a non-seat (no Hello), so its ~2 MB
+/// Status reply was paced to 256 kB/s and queued behind the shared observer
+/// debt; on spn every health-check call missed the window and the upgrade
+/// rolled back twice (21 Nov). Public seed relays reach seats over the
+/// tailnet, never loopback, so relayed outsiders stay paced.
+fn remote_is_loopback(remote: &str) -> bool {
+    match remote.parse::<std::net::SocketAddr>() {
+        Ok(std::net::SocketAddr::V4(a)) => a.ip().is_loopback(),
+        Ok(std::net::SocketAddr::V6(a)) => {
+            a.ip().is_loopback() || a.ip().to_ipv4_mapped().is_some_and(|v| v.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Replies to a query (status, health, ok/err acks) are paced on a non-seat
+/// session by that session's own budget only, never by the shared observer
+/// budget: bulk serve debt (catch-up, snapshots, bodies) must not starve a
+/// status call such as the installer's public network check.
+fn is_query_reply_line(line: &[u8]) -> bool {
+    let head = &line[..line.len().min(24)];
+    head.starts_with(br#"{"type":"status","#)
+        || head.starts_with(br#"{"type":"health","#)
+        || head.starts_with(br#"{"type":"ok","#)
+        || head.starts_with(br#"{"type":"err","#)
+}
+
+/// Pace one outgoing line on a non-seat session (`observer`): query replies
+/// by the session budget, everything else by the session and shared budgets.
+async fn pace_line_with(
+    sess: &UploadBudget,
+    global: &UploadBudget,
+    observer: &std::sync::atomic::AtomicBool,
+    line: &[u8],
+) {
+    if !observer.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let n = line.len();
+    OBSERVER_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    let wait = if is_query_reply_line(line) { sess.take(n) } else { sess.take(n).max(global.take(n)) };
+    if !wait.is_zero() {
+        OBSERVER_PACED_MS.fetch_add(wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// `pace_line_with` on the process-wide budget, then true (leads an `&&`
+/// chain before a write).
+async fn pace_line_then(sess: &UploadBudget, observer: &std::sync::atomic::AtomicBool, line: &[u8]) -> bool {
+    pace_line_with(sess, observer_global_budget(), observer, line).await;
     true
 }
 
@@ -4968,7 +5020,9 @@ async fn handle_inbound(
     let lean_in = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lean_w = lean_in.clone();
     // 2.11.10: a session is paced as a non-seat until its Hello names a seat.
-    let observer = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // 2.11.11: except a loopback client (the operator's own ctl / health check).
+    let local_client = remote_is_loopback(&remote);
+    let observer = Arc::new(std::sync::atomic::AtomicBool::new(!local_client));
     let observer_w = observer.clone();
     let obs_budget = UploadBudget::from_env_kbps("FPL_OBSERVER_SESSION_KBPS", OBSERVER_SESSION_KBPS_DEFAULT);
     let mut writer_task = tokio::spawn(async move {
@@ -4997,7 +5051,7 @@ async fn handle_inbound(
                         if dish_since.unwrap().elapsed() >= DISH_GATE { "timeout" } else { "release" },
                         tcp_unsent(probe).unwrap_or(0)
                     );
-                    if pace_then(&obs_budget, &observer_w, line.len()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                    if pace_line_then(&obs_budget, &observer_w, line.as_bytes()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                         shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
@@ -5015,7 +5069,7 @@ async fn handle_inbound(
                 line = catch_reply_rx.recv() => {
                     match line {
                         Some(line) => {
-                            if pace_then(&obs_budget, &observer_w, line.len()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                            if pace_line_then(&obs_budget, &observer_w, line.as_bytes()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -5026,7 +5080,7 @@ async fn handle_inbound(
                 line = reply_rx.recv() => {
                     match line {
                         Some(line) => {
-                            if pace_then(&obs_budget, &observer_w, line.len()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                            if pace_line_then(&obs_budget, &observer_w, line.as_bytes()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -5058,7 +5112,7 @@ async fn handle_inbound(
                                 }
                                 inv_left = inv_left.saturating_sub(line.len());
                             }
-                            if pace_then(&obs_budget, &observer_w, line.len()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                            if pace_line_then(&obs_budget, &observer_w, line.as_bytes()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -5153,7 +5207,7 @@ async fn handle_inbound(
                 }
                 seen_id = id.clone();
                 let seat = shared.node.lock().validators.contains_key(id);
-                observer.store(!seat, std::sync::atomic::Ordering::Relaxed);
+                observer.store(!seat && !local_client, std::sync::atomic::Ordering::Relaxed);
                 shared.close_inbound_seat(id);
                 shared.inbound.lock().push(InboundSink {
                     id: id.clone(),
@@ -7698,7 +7752,7 @@ mod inbound_ack_tests {
         assert_eq!(fd_pl::lean_tx_gossip_line(old.as_bytes()).as_deref(), Some(new.as_str()));
     }
 
-    fn test_shared(id: &str) -> Arc<Shared> {
+    pub(super) fn test_shared(id: &str) -> Arc<Shared> {
         let mut cfg = ChainConfig::default();
         cfg.network_id = 1;
         let mut keys = crate::KeyRing::default();
@@ -9203,5 +9257,98 @@ mod send_budget_tests {
             st.obs_bytes.load(Relaxed) as f64 / 1024.0 / secs as f64,
             st.refused.load(Relaxed),
         );
+    }
+}
+
+#[cfg(test)]
+mod local_rpc_tests {
+    //! 2.11.11: the node's own loopback clients (ctl, the autoupgrade health
+    //! check) are never paced as non-seats, and a query reply on a real
+    //! non-seat session is not queued behind the shared observer debt.
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// spn, 21 Nov: 2.11.10 paced `falcon-pl-ctl status` (no Hello) as a
+    /// non-seat, so the Status reply waited out the shared observer debt and
+    /// the installer's 120 s health check never got an answer. Fails on 2.11.10.
+    #[tokio::test]
+    async fn loopback_status_is_not_held_by_observer_debt() {
+        let g = observer_global_budget();
+        if g.rate == 0 {
+            return; // FPL_OBSERVER_UPLOAD_KBPS=0: nothing is paced
+        }
+        let shared = super::inbound_ack_tests::test_shared("v99");
+        let fanout = Arc::new(Vec::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, mut cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut lines = BufReader::new(cr).lines();
+        let _srv_hello = lines.next_line().await.unwrap().unwrap();
+        // Outsiders have the shared budget 4 s in debt.
+        g.take(g.burst as usize + (g.rate as usize) * 4);
+        let t = Instant::now();
+        let req = serde_json::to_string(&WireMsg::StatusReq { include_accounts: false, brief: true }).unwrap() + "\n";
+        cw.write_all(req.as_bytes()).await.unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("status within 10 s")
+            .unwrap()
+            .unwrap();
+        let took = t.elapsed();
+        assert!(matches!(serde_json::from_str::<WireMsg>(&line).unwrap(), WireMsg::Status { .. }));
+        assert!(took < Duration::from_millis(1500), "loopback status waited {took:?} behind observer debt");
+        drop(cw);
+        let _ = srv.await;
+    }
+
+    #[test]
+    fn loopback_remotes_are_local_clients() {
+        assert!(remote_is_loopback("127.0.0.1:40000"));
+        assert!(remote_is_loopback("127.0.0.2:40000"));
+        assert!(remote_is_loopback("[::1]:40000"));
+        assert!(remote_is_loopback("[::ffff:127.0.0.1]:40000"));
+        // The seed relay reaches seats over the tailnet; public peers are public.
+        assert!(!remote_is_loopback("100.96.215.37:3333"));
+        assert!(!remote_is_loopback("88.198.67.189:51000"));
+        assert!(!remote_is_loopback(""));
+    }
+
+    #[tokio::test]
+    async fn observer_query_reply_skips_the_shared_debt_bulk_does_not() {
+        let sess = UploadBudget::new(256 * 1024);
+        let global = UploadBudget::new(64 * 1024);
+        global.take(64 * 1024 + 64 * 1024 * 2); // 2 s in debt
+        let obs = AtomicBool::new(true);
+        for q in [
+            serde_json::to_string(&WireMsg::Ok { msg: "x".into() }).unwrap(),
+            serde_json::to_string(&WireMsg::Err { msg: "x".into() }).unwrap(),
+            r#"{"type":"status","body":{}}"#.to_string(),
+            r#"{"type":"health","body":{}}"#.to_string(),
+        ] {
+            assert!(is_query_reply_line(q.as_bytes()), "{q}");
+            let t = tokio::time::Instant::now();
+            pace_line_with(&sess, &global, &obs, q.as_bytes()).await;
+            assert!(t.elapsed() < Duration::from_millis(100), "{q} waited {:?}", t.elapsed());
+        }
+        let bulk = serde_json::to_string(&WireMsg::NeedSnapshot {}).unwrap();
+        assert!(!is_query_reply_line(bulk.as_bytes()));
+        assert!(!is_query_reply_line(br#"{"type":"ledgers_batch","ledgers":[]}"#));
+        assert!(!is_query_reply_line(br#"{"type":"piece","pid":1}"#));
+        let t = tokio::time::Instant::now();
+        pace_line_with(&sess, &global, &obs, br#"{"type":"ledgers_batch","ledgers":[]}"#).await;
+        assert!(t.elapsed() >= Duration::from_millis(1500), "bulk still waits on the shared budget: {:?}", t.elapsed());
+        // A seat (or loopback client) is never paced.
+        let seat = AtomicBool::new(false);
+        let t = tokio::time::Instant::now();
+        pace_line_with(&sess, &global, &seat, br#"{"type":"ledgers_batch","ledgers":[]}"#).await;
+        assert!(t.elapsed() < Duration::from_millis(50));
     }
 }
