@@ -5692,6 +5692,10 @@ impl Node {
         if !empty && !hole && !hub_more {
             return false;
         }
+        // 2.11.13: a walk with something in it never holds past the cap.
+        if !empty && self.hold_window_spent() {
+            return false;
+        }
         let h = self.tip_height.saturating_add(1);
         if self.need_txs_for_height != h || self.need_txs_open_ms == 0 {
             return true;
@@ -5733,6 +5737,10 @@ impl Node {
         if self.need_txs_for_height != h || self.need_txs_open_ms == 0 {
             return false;
         }
+        // 2.11.13: hold capped at half the round-0 silence timeout.
+        if self.has_applicable_tx() && self.hold_window_spent() {
+            return false;
+        }
         // Heads have stopped arriving and the skip is close. Seal the walk
         // that is here. A skip seals nothing. A thin walk does not seal at
         // the 4s pack budget.
@@ -5753,13 +5761,34 @@ impl Node {
     /// in waiting_need_txs_grace and never uses this hold.
     fn thin_walk_hold_ms(&self) -> u64 {
         let limit = self.cfg.progress_timeout_ms;
-        if limit >= 2_000 {
+        let raw = if limit >= 2_000 {
             limit.saturating_sub(2_000)
         } else if self.cfg.pack_budget_ms > 0 {
             self.cfg.pack_budget_ms
         } else {
             Self::NEED_TXS_PRE_PACK_GRACE_MS
-        }
+        };
+        raw.min(self.hold_cap_ms())
+    }
+
+    /// 2.11.13: the most a round-0 builder may hold a thin walk open,
+    /// counted from when the height (or round) opened: half of peers'
+    /// round-0 silence timeout (`2 × live pack window`). Hold + pack budget
+    /// + slack then always fits inside that timeout, so a builder that is
+    /// still collecting txs is never view-changed away mid-pack. Before,
+    /// the hold was `progress_timeout - 2 s` from the first NeedTxs pull
+    /// (7 s at `--progress-timeout-ms 9000`), which with a 4 s pack and
+    /// gossip overran the 12.6 s timeout and cost a whole extra round.
+    pub fn hold_cap_ms(&self) -> u64 {
+        // Peers that see this builder alive time round 0 out at
+        // `round_silence_timeout_ms(0)` = 2 x live pack window.
+        self.live_pack_timeout_ms()
+    }
+
+    /// 2.11.13: the round-0 hold window is spent; seal what is packed now.
+    pub fn hold_window_spent(&self) -> bool {
+        let start = self.height_open_ms.max(self.round_open_ms);
+        self.now_ms.saturating_sub(start) >= self.hold_cap_ms()
     }
 
     /// Track whether new account heads are still landing on this height.
@@ -15019,6 +15048,9 @@ impl Node {
         if self.height_view_round > 0 {
             return false;
         }
+        if self.hold_window_spent() {
+            return false;
+        }
         self.now_ms.saturating_sub(self.tip_advanced_ms) < self.pace_effective_ms()
     }
 
@@ -17139,6 +17171,8 @@ mod pack_catchup_tests;
 mod pack_fix_21112_tests;
 #[cfg(test)]
 mod prepack_tests;
+#[cfg(test)]
+mod hold_cap_tests;
 mod merkle_batch_tests;
 #[cfg(test)]
 mod lean_body_tests;
