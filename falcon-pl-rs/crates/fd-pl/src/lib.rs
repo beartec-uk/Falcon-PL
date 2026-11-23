@@ -319,7 +319,7 @@
 //!
 //! See `docs/IDENTITY.md` and `docs/POC.md`.
 
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 pub mod accounts;
 pub mod pieces;
@@ -3632,6 +3632,57 @@ pub struct Bitvm2AttestPrepare {
     pub mimc_leaves: Vec<String>,
 }
 
+/// 2.11.13: N+1 pre-pack work picked under the node lock; [`Self::verify`]
+/// runs without it (public-only key ring, owned txs).
+pub struct PrepackPlan {
+    pending_hash: String,
+    mempool_len: usize,
+    walk_len: usize,
+    fresh: bool,
+    todo: Vec<Tx>,
+    onchain: BTreeMap<String, String>,
+    keys: crate::crypto::KeyRing,
+}
+
+/// Result of [`PrepackPlan::verify`], stored by [`Node::apply_prepack`].
+pub struct PrepackDone {
+    pending_hash: String,
+    mempool_len: usize,
+    walk_len: usize,
+    fresh: bool,
+    ok: Vec<(String, Option<String>)>,
+}
+
+impl PrepackPlan {
+    /// Txs left to check (0 = only bookkeeping).
+    pub fn todo_len(&self) -> usize {
+        self.todo.len()
+    }
+
+    /// Falcon checks, in parallel, without the node lock.
+    pub fn verify(self) -> PrepackDone {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let refs: Vec<&Tx> = self.todo.iter().collect();
+        let (ok, _) = Node::preverify_pack_sigs(&self.keys, &self.onchain, &refs, workers);
+        let ok = self
+            .todo
+            .iter()
+            .filter(|t| ok.contains(&t.tx_id))
+            .map(|t| (t.tx_id.clone(), self.onchain.get(&t.account).cloned()))
+            .collect();
+        PrepackDone {
+            pending_hash: self.pending_hash,
+            mempool_len: self.mempool_len,
+            walk_len: self.walk_len,
+            fresh: self.fresh,
+            ok,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Node {
     pub id: String,
@@ -3665,10 +3716,21 @@ pub struct Node {
     /// Live proposal at tip+1 awaiting soft QC before tip advance (None = none).
     pub pending_proposal: Option<Ledger>,
     /// Transaction ids whose signatures were checked while the previous
-    /// quorum was still assembling. `pack_or_skip` does not check them again.
-    pub sig_warm: BTreeSet<String>,
-    /// Pending ledger hash `sig_warm` was built against.
+    /// quorum was still assembling, with the on-chain key each was checked
+    /// against (`None` = ring / carried key). `pack_or_skip` skips the check
+    /// again only while that key is still the one it would use (2.11.13).
+    pub sig_warm: BTreeMap<String, Option<String>>,
+    /// Anchor (pending ledger hash, or `tip:<h>:<hash>`) of the last pre-pack.
     pipeline_for: String,
+    /// Mempool size at the last pre-pack of `pipeline_for` (refresh trigger).
+    pipeline_mempool: usize,
+    /// 2.11.13 pre-pack: txs in the next block's verified candidate walk
+    /// (accounts continued past the pending block's sequences).
+    pub prepack_txs: usize,
+    /// Pre-pack passes run (status).
+    pub prepack_runs: u64,
+    /// Pre-verified txs the last pack used without a second signature check.
+    pub prepack_warm_used: usize,
     /// Local clock when the current tip opened (or last standby skip). Used for
     /// progress-timeout: if #1 seals nothing, #2 gets a turn after timeout + skip QC.
     pub height_open_ms: u64,
@@ -4117,8 +4179,12 @@ impl Node {
             soft_ok: BTreeSet::new(),
             hard_ok: BTreeSet::new(),
             pending_proposal: None,
-            sig_warm: BTreeSet::new(),
+            sig_warm: BTreeMap::new(),
             pipeline_for: String::new(),
+            pipeline_mempool: 0,
+            prepack_txs: 0,
+            prepack_runs: 0,
+            prepack_warm_used: 0,
             height_open_ms: now_ms,
             genesis_ms: now_ms,
             treasury: TREASURY_GENESIS,
@@ -11370,53 +11436,153 @@ impl Node {
     /// that would form the next block. The next packer is not known until this
     /// quorum lands, so every seat does the work and the winner proposes
     /// without spending the pack budget on those checks again.
+    ///
+    /// 2.11.13 next-builder pre-pack: the walk is the whole next block, not
+    /// one head per account. Each account continues from the pending block's
+    /// last sequence (`covered + 1`) or its tip sequence, through consecutive
+    /// pool sequences, up to the pack cap. Every tx id is stored with the
+    /// on-chain key it was checked against; [`Self::pack_as`] trusts the
+    /// check only while that key is still the key it would use, so a pending
+    /// block that loses (rival, view-change) or rotates a key can never let an
+    /// unchecked signature through. Nothing here touches state, the selection
+    /// rule, the ledger format or any signature: the pack still applies every
+    /// tx in order against the real post-commit draft. Refreshes when the
+    /// pool grows while the same proposal is still waiting for votes.
+    ///
+    /// With no pending block the walk is the open height's own candidate set
+    /// (anchored on the tip), so a builder that is holding, pacing or inside
+    /// `min_block_interval` checks the signatures before it packs, and a
+    /// follower has them ready if it becomes the builder.
     pub fn warm_pipeline(&mut self) {
-        let Some(pending) = self.pending_proposal.clone() else {
-            return;
-        };
-        if self.pipeline_for == pending.ledger_hash {
-            return;
+        if let Some(plan) = self.prepack_plan() {
+            let done = plan.verify();
+            self.apply_prepack(done);
+        }
+    }
+
+    /// 2.11.13: the cheap, locked half of [`Node::warm_pipeline`]: pick the
+    /// next candidate walk and the txs not yet checked. `None` = nothing to
+    /// do (same anchor and the pool has not grown).
+    pub fn prepack_plan(&self) -> Option<PrepackPlan> {
+        let pending_hash = self.prepack_anchor();
+        let empty: Vec<Tx> = Vec::new();
+        let pending_txs = self
+            .pending_proposal
+            .as_ref()
+            .filter(|p| p.height == self.tip_height.saturating_add(1))
+            .map(|p| &p.txs)
+            .unwrap_or(&empty);
+        let mp = self.mempool.len();
+        if self.pipeline_for == pending_hash
+            && mp < self.pipeline_mempool.saturating_add(Self::PREPACK_REFRESH_TXS)
+        {
+            return None;
         }
         let mut covered: HashMap<String, u64> = HashMap::new();
         let mut in_block = std::collections::HashSet::new();
-        for tx in &pending.txs {
+        for tx in pending_txs {
             in_block.insert(tx.tx_id.clone());
             let e = covered.entry(tx.account.clone()).or_insert(tx.sequence);
             if tx.sequence > *e {
                 *e = tx.sequence;
             }
         }
-        let mut seen = std::collections::HashSet::new();
-        let mut head_txs: Vec<Tx> = Vec::new();
+        let cap = self.pack_cap_txs().max(1);
+        let mut by_acct: BTreeMap<String, BTreeMap<u64, Tx>> = BTreeMap::new();
         for tx in self.mempool.iter_candidates() {
-            if in_block.contains(&tx.tx_id) || seen.contains(&tx.account) {
+            if in_block.contains(&tx.tx_id) || tx.signature_is_empty() {
                 continue;
             }
+            by_acct
+                .entry(tx.account.clone())
+                .or_default()
+                .entry(tx.sequence)
+                .or_insert_with(|| tx.to_tx());
+        }
+        // Same account order as the pack (BTreeMap by id); one wave per
+        // sequence depth so the walk matches what the pack reaches first.
+        let mut next: BTreeMap<String, u64> = BTreeMap::new();
+        for acct in by_acct.keys() {
             let need = covered
-                .get(&tx.account)
+                .get(acct)
                 .map(|s| s.saturating_add(1))
-                .unwrap_or_else(|| self.state.get(&tx.account).sequence);
-            if tx.sequence != need || tx.signature_is_empty() {
-                continue;
-            }
-            seen.insert(tx.account.clone());
-            if !self.keys.has_public(&tx.account) && tx.public_key_is_empty() {
-                continue;
-            }
-            head_txs.push(tx.to_tx());
-            if head_txs.len() >= Self::PACK_DEFAULT_MAX_TXS {
-                break;
+                .unwrap_or_else(|| self.state.get(acct).sequence);
+            next.insert(acct.clone(), need);
+        }
+        let mut walk: Vec<Tx> = Vec::new();
+        let mut progressed = true;
+        while progressed && walk.len() < cap {
+            progressed = false;
+            for (acct, seqs) in &by_acct {
+                if walk.len() >= cap {
+                    break;
+                }
+                let need = next[acct];
+                let Some(tx) = seqs.get(&need) else { continue };
+                if !self.keys.has_public(&tx.account) && tx.public_key.is_empty() {
+                    continue;
+                }
+                walk.push(tx.clone());
+                next.insert(acct.clone(), need.saturating_add(1));
+                progressed = true;
             }
         }
-        let heads: Vec<&Tx> = head_txs.iter().collect();
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, 16);
-        let onchain = self.onchain_sig_keys(&heads);
-        let (ok, _) = Self::preverify_pack_sigs(&self.keys, &onchain, &heads, workers);
-        self.sig_warm = ok;
-        self.pipeline_for = pending.ledger_hash;
+        // Keep still-valid entries from the previous pass on this proposal;
+        // only new txs pay a check.
+        // Entries stay valid across anchors (key-tagged, tx ids are content
+        // hashes); only bound the memory.
+        let fresh = self.sig_warm.len() > cap.saturating_mul(4);
+        let walk_len = walk.len();
+        let todo: Vec<Tx> = walk
+            .into_iter()
+            .filter(|t| fresh || !self.sig_warm.contains_key(&t.tx_id))
+            .collect();
+        let refs: Vec<&Tx> = todo.iter().collect();
+        let onchain = self.onchain_sig_keys(&refs);
+        let keys = self.keys.publics_only(todo.iter().map(|t| t.account.as_str()));
+        Some(PrepackPlan { pending_hash, mempool_len: mp, walk_len, fresh, todo, onchain, keys })
+    }
+
+    /// What the walk is built on: the pending block at tip+1, else the tip.
+    fn prepack_anchor(&self) -> String {
+        match self.pending_proposal.as_ref() {
+            Some(p) if p.height == self.tip_height.saturating_add(1) => p.ledger_hash.clone(),
+            _ => format!("tip:{}:{}", self.tip_height, self.tip_hash),
+        }
+    }
+
+    /// 2.11.13: the locked half that stores a [`PrepackPlan::verify`]
+    /// result. Dropped (false) if the pending block changed meanwhile;
+    /// entries are key-tagged, so the pack still rejects one whose on-chain
+    /// key moved after the check (`sig_warm_valid`).
+    pub fn apply_prepack(&mut self, done: PrepackDone) -> bool {
+        if self.prepack_anchor() != done.pending_hash {
+            return false;
+        }
+        if done.fresh {
+            self.sig_warm.clear();
+        }
+        for (id, key) in done.ok {
+            self.sig_warm.insert(id, key);
+        }
+        self.prepack_txs = done.walk_len;
+        self.prepack_runs = self.prepack_runs.saturating_add(1);
+        self.pipeline_for = done.pending_hash;
+        self.pipeline_mempool = done.mempool_len;
+        true
+    }
+
+    /// 2.11.13: re-run the pre-pack while the same proposal waits once the
+    /// pool has grown by this many txs.
+    pub const PREPACK_REFRESH_TXS: usize = 32;
+
+    /// A pre-checked signature is reused only if the key the pack would
+    /// verify against now is the key it was checked with.
+    fn sig_warm_valid(&self, tx: &Tx) -> bool {
+        match self.sig_warm.get(&tx.tx_id) {
+            Some(k) => *k == self.onchain_sig_key(&tx.account),
+            None => false,
+        }
     }
 
     pub fn pack_or_skip(&mut self, packer: &str) -> Result<Option<Ledger>, String> {
@@ -13418,6 +13584,7 @@ impl Node {
             Self::PACK_DEFAULT_MAX_TXS
         };
         let t_start = std::time::Instant::now();
+        let mut warm_used = 0usize;
         let mut progressed = true;
         // Size budget, not a count. A fixed cap of 8 new keys made a mempool
         // of first-seen accounts drain at 8 txs a block.
@@ -13459,7 +13626,8 @@ impl Node {
                 }
                 let (warm, cold): (Vec<&Tx>, Vec<&Tx>) = heads
                     .into_iter()
-                    .partition(|tx| self.sig_warm.contains(&tx.tx_id));
+                    .partition(|tx| self.sig_warm_valid(tx));
+                warm_used = warm_used.saturating_add(warm.len());
                 let onchain = self.onchain_sig_keys(&cold);
                 let (mut sig_ok, sig_bad) =
                     Self::preverify_pack_sigs(&self.keys, &onchain, &cold, verify_workers);
@@ -13562,6 +13730,7 @@ impl Node {
             }
         }
         self.now_ms = saved_now;
+        self.prepack_warm_used = warm_used;
         if !drop_ids.is_empty() {
             self.mempool.remove_many(&drop_ids);
             self.evicted_since_last_seal = true;
@@ -15808,6 +15977,9 @@ impl Node {
                 .unwrap_or(0),
             "pending_proposal_height": self.pending_proposal.as_ref().map(|p| p.height),
             "pending_proposal_hash": self.pending_proposal.as_ref().map(|p| p.ledger_hash.clone()),
+            "prepack_txs": self.prepack_txs,
+            "prepack_runs": self.prepack_runs,
+            "prepack_warm_used": self.prepack_warm_used,
             "schedule_height": self.schedule_height,
             "schedule_online_hash": self.schedule_online_hash,
             "height_view_round": self.height_view_round,
@@ -16965,6 +17137,8 @@ impl WireMsg {
 mod pack_catchup_tests;
 #[cfg(test)]
 mod pack_fix_21112_tests;
+#[cfg(test)]
+mod prepack_tests;
 mod merkle_batch_tests;
 #[cfg(test)]
 mod lean_body_tests;

@@ -1306,6 +1306,11 @@ struct HubSnap {
 
 struct Shared {
     node: Mutex<Node>,
+    /// 2.11.13: woken when the tip advances so the next builder packs
+    /// straight away instead of on the next seal tick.
+    seal_wake: tokio::sync::Notify,
+    /// 2.11.13: an off-lock N+1 signature pre-check is running.
+    prepack_busy: std::sync::atomic::AtomicBool,
     /// Write sinks for *inbound* sessions (joiners that dialed us).
     inbound: Mutex<Vec<InboundSink>>,
     /// Indices into fanout that are hub peers (for NeedTxs / preferential tx fan).
@@ -2300,6 +2305,8 @@ impl Shared {
             return;
         }
         *seen = h;
+        // 2.11.13: the next builder's pre-checked walk is ready now.
+        self.seal_wake.notify_one();
         let winner = n.lottery_packer().unwrap_or_else(|| "-".into());
         info!(
             "round-gap packer-known h={h} winner={winner} parent={}",
@@ -3110,6 +3117,8 @@ async fn main() -> Result<()> {
 
     let shared = Arc::new(Shared {
         node: Mutex::new(node),
+        seal_wake: tokio::sync::Notify::new(),
+        prepack_busy: std::sync::atomic::AtomicBool::new(false),
         inbound: Mutex::new(Vec::new()),
         hub_peer_idxs,
         is_hub: args.hub,
@@ -3495,7 +3504,10 @@ async fn main() -> Result<()> {
             // contains a seat id, is the only seat allowed to seal.
 
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = shared_c.seal_wake.notified() => {}
+                }
                 ntick += 1;
                 // Dish the missing suffix before ordinary SubmitTx, and hold
                 // those seats until this height's walk is queued.
@@ -4018,15 +4030,32 @@ async fn main() -> Result<()> {
                             shared_c.note_walk_ready(open, packable, hold);
                         }
                     }
+                    // 2.11.13 pre-pack: check the next walk's signatures every
+                    // tick (while N's votes arrive, and while the builder
+                    // holds / paces / waits out min_block_interval). The
+                    // Falcon checks run off `node.lock`; pick + store are the
+                    // only locked steps.
+                    use std::sync::atomic::Ordering as AOrd;
+                    if !shared_c.prepack_busy.load(AOrd::Acquire) {
+                        if let Some(plan) = n.prepack_plan() {
+                            if plan.todo_len() == 0 {
+                                n.apply_prepack(plan.verify());
+                            } else {
+                                shared_c.prepack_busy.store(true, AOrd::Release);
+                                let sh = shared_c.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let done = plan.verify();
+                                    sh.node.lock().apply_prepack(done);
+                                    sh.prepack_busy.store(false, AOrd::Release);
+                                });
+                            }
+                        }
+                    }
                     if n.in_skip_grace() {
                         // wait
                     } else if !n.tip_is_soft() {
                         // wait for soft QC before packing next height
                     } else if n.pending_proposal.is_some() {
-                        // Votes for this height are still arriving. Check the
-                        // next block's signatures now so the following proposal
-                        // can go out when this quorum lands.
-                        n.warm_pipeline();
                         // Proposal in flight — wait for soft QC. Do **not** clone
                         // the full Falcon body every 200ms tick (was ~100KB × 5/s).
                         let elapsed = n.now_ms.saturating_sub(n.height_open_ms);
@@ -7823,6 +7852,8 @@ mod inbound_ack_tests {
         }
         Arc::new(Shared {
             node: parking_lot::Mutex::new(node),
+            seal_wake: tokio::sync::Notify::new(),
+            prepack_busy: std::sync::atomic::AtomicBool::new(false),
             inbound: parking_lot::Mutex::new(Vec::new()),
             hub_peer_idxs: Vec::new(),
             is_hub: true,
