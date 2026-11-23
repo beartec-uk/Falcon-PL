@@ -2627,8 +2627,31 @@ const ACCOUNT_HISTORY_LIMIT: usize = 8;
 const ACCOUNT_HISTORY_DISK_HEIGHTS: u64 = 20_000;
 const ACCOUNT_HISTORY_DISK_MS: u64 = 300;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// 2.11.13 (c): tokio worker floor. A 2-vCPU seat got 2 workers, and one
+/// long `node.lock` holder (snapshot capture, pack root) froze the whole
+/// node for 20-300 s. `TOKIO_WORKER_THREADS` (as set by the live drop-in)
+/// still wins when it is a valid number; otherwise at least 4 workers.
+const MIN_TOKIO_WORKERS: usize = 4;
+
+fn tokio_workers(env: Option<&str>, cpus: usize) -> usize {
+    if let Some(n) = env.and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0) {
+        return n;
+    }
+    cpus.max(MIN_TOKIO_WORKERS)
+}
+
+fn main() -> Result<()> {
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let env = std::env::var("TOKIO_WORKER_THREADS").ok();
+    let workers = tokio_workers(env.as_deref(), cpus);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?
+        .block_on(node_main(workers))
+}
+
+async fn node_main(tokio_workers: usize) -> Result<()> {
     {
         // Same fmt output as before, plus WARN/ERROR copied into the health
         // ring (`falcon.health.v1` `warnings`).
@@ -2643,6 +2666,7 @@ async fn main() -> Result<()> {
             .with(fd_pl::health::WarnCapture)
             .init();
     }
+    info!("tokio worker threads={tokio_workers}");
 
     let mut args = Args::parse();
     let role = NodeRole::parse(&args.role)
@@ -9496,5 +9520,27 @@ mod timing_default_tests {
         let round0 = n.live_pack_timeout_ms() * 2;
         assert!(n.hold_cap_ms() + DEFAULT_PACK_BUDGET_MS + fd_pl::Node::LIVE_PACK_SLACK_MS <= round0);
         assert_eq!(n.proposal_timeout_ms(), 16_000);
+    }
+}
+
+#[cfg(test)]
+mod tokio_worker_tests {
+    //! 2.11.13 (c): worker floor of 4; TOKIO_WORKER_THREADS still overrides.
+    use super::*;
+
+    #[test]
+    fn floor_of_four_on_small_boxes() {
+        assert_eq!(tokio_workers(None, 1), 4);
+        assert_eq!(tokio_workers(None, 2), 4);
+        assert_eq!(tokio_workers(None, 4), 4);
+        assert_eq!(tokio_workers(None, 32), 32);
+    }
+
+    #[test]
+    fn env_override_wins_when_valid() {
+        assert_eq!(tokio_workers(Some("6"), 2), 6);
+        assert_eq!(tokio_workers(Some(" 2 "), 32), 2);
+        assert_eq!(tokio_workers(Some("0"), 2), 4, "0 is not a valid count");
+        assert_eq!(tokio_workers(Some("lots"), 2), 4);
     }
 }
