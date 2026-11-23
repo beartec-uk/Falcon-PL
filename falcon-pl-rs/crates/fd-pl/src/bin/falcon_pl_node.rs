@@ -1130,6 +1130,11 @@ fn seat_payout_sync(shared: &Arc<Shared>, id: &str, want: &str) {
     }
 }
 
+/// 2.11.13 seat timing defaults (match `scripts/network-2300.env`).
+const DEFAULT_PACK_BUDGET_MS: u64 = 5_000;
+const DEFAULT_PROGRESS_TIMEOUT_MS: u64 = 4_000;
+const DEFAULT_MAX_TXS: usize = 200;
+
 #[derive(Parser, Debug)]
 #[command(version = fd_pl::PRODUCT_VERSION)]
 struct Args {
@@ -1145,16 +1150,22 @@ struct Args {
     bond: u64,
     #[arg(long, default_value = "")]
     keys_dir: String,
-    /// Optional hard cap (0 = unlimited — pack only limited by --pack-budget-ms).
-    #[arg(long, default_value_t = 0)]
+    /// Hard cap on txs per block (0 = unlimited — pack only limited by
+    /// --pack-budget-ms). 2.11.13: default 200 (was 0), the live value: a
+    /// 2-vCPU builder holds `node.lock` for the whole pack (11-16 s for
+    /// 250-336 txs), which must stay well under the 14.6 s round-0 timeout.
+    #[arg(long, default_value_t = DEFAULT_MAX_TXS)]
     max_txs: usize,
     /// Pack as many as possible within this many ms (the real limit).
-    #[arg(long, default_value_t = 1000)]
+    /// 2.11.13: default 5000 (was 1000), the value tested live on 2300 on
+    /// 23 Nov 2026, so seats need no per-seat flag.
+    #[arg(long, default_value_t = DEFAULT_PACK_BUDGET_MS)]
     pack_budget_ms: u64,
     /// If #1 produces no tip advance within this many ms (mempool non-empty),
     /// skip them and let the next ranked ponger pack. 0 = disable.
-    /// Default 2500 ≥ pack_budget + multi-host RTT (GROWTH_AND_MEMPOOL).
-    #[arg(long, default_value_t = 2500)]
+    /// 2.11.13: default 4000 (was 2500): 2 s thin-walk hold, 16 s proposal
+    /// timeout, round-0 silence timeout 2 x (pack budget + 2.3 s).
+    #[arg(long, default_value_t = DEFAULT_PROGRESS_TIMEOUT_MS)]
     progress_timeout_ms: u64,
     /// v2.9.59 packer pacing (local; 0 = off): the round-0 winner waits until
     /// this many ms after the height opened before sealing, unless the mempool
@@ -9437,5 +9448,53 @@ mod local_rpc_tests {
         let t = tokio::time::Instant::now();
         pace_line_with(&sess, &global, &seat, br#"{"type":"ledgers_batch","ledgers":[]}"#).await;
         assert!(t.elapsed() < Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod timing_default_tests {
+    //! 2.11.13 (b): seat timing defaults need no per-seat flags.
+    use super::*;
+
+    fn profile(key: &str) -> u64 {
+        let env = include_str!("../../scripts/network-2300.env");
+        env.lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{key} in network-2300.env"))
+    }
+
+    #[test]
+    fn cli_defaults_are_the_tested_live_values() {
+        let a = Args::try_parse_from(["falcon-pl-node", "--id", "v1"]).unwrap();
+        assert_eq!(a.pack_budget_ms, 5_000);
+        assert_eq!(a.progress_timeout_ms, 4_000);
+        assert_eq!(a.max_txs, 200);
+    }
+
+    #[test]
+    fn network_profile_matches_cli_defaults() {
+        assert_eq!(profile("PACK_BUDGET_MS"), DEFAULT_PACK_BUDGET_MS);
+        assert_eq!(profile("PROGRESS_TIMEOUT_MS"), DEFAULT_PROGRESS_TIMEOUT_MS);
+        assert_eq!(profile("MAX_TXS") as usize, DEFAULT_MAX_TXS);
+    }
+
+    #[test]
+    fn defaults_fit_round0_timeouts() {
+        let n = fd_pl::Node::new(
+            "v1",
+            fd_pl::ChainConfig {
+                pack_budget_ms: DEFAULT_PACK_BUDGET_MS,
+                progress_timeout_ms: DEFAULT_PROGRESS_TIMEOUT_MS,
+                ..Default::default()
+            },
+            fd_pl::crypto::KeyRing::new(fd_pl::crypto::CryptoScheme::HmacDev),
+            &[],
+        );
+        // Hold + pack + slack inside the round-0 silence timeout peers
+        // apply to a live builder.
+        let round0 = n.live_pack_timeout_ms() * 2;
+        assert!(n.hold_cap_ms() + DEFAULT_PACK_BUDGET_MS + fd_pl::Node::LIVE_PACK_SLACK_MS <= round0);
+        assert_eq!(n.proposal_timeout_ms(), 16_000);
     }
 }
