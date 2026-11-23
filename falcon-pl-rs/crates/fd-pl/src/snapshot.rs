@@ -551,6 +551,7 @@ impl Node {
         let seat_payout_from_height = crate::params_v2::seat_payout_from_height(cfg.network_id);
         let external_addrs_from_height = crate::params_v2::external_addrs_from_height(cfg.network_id);
         let empty_block_from_height = crate::params_v2::empty_block_from_height(cfg.network_id);
+        let redraw_from_height = crate::params_v2::redraw_from_height(cfg.network_id);
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
         let btc4_most_work_from_height = crate::params_v2::btc4_most_work_from_height(cfg.network_id);
@@ -714,6 +715,8 @@ impl Node {
             seat_payout_from_height,
             external_addrs_from_height,
             empty_block_from_height,
+            redraw_from_height,
+            redraw_vc_cast_at: 0,
             btc4_fork_fix_from_height,
             btc4_fork_slot_from_height,
             btc4_most_work_from_height,

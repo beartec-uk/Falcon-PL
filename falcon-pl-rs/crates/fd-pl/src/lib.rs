@@ -3999,6 +3999,13 @@ pub struct Node {
     pub external_addrs_from_height: u64,
     /// v2.10.0: [`crate::params_v2::empty_block_from_height`]; runtime only.
     pub empty_block_from_height: u64,
+    /// 2.11.13 (f): [`crate::params_v2::redraw_from_height`]; runtime only
+    /// (tests may lower it). From this open height a stalled committee can be
+    /// replaced (see [`Node::redraw_committee`]).
+    pub redraw_from_height: u64,
+    /// 2.11.13 (f): open height at which this seat cast its committee-redraw
+    /// ViewChange; it then signs no OK in a pre-redraw round at that height.
+    pub redraw_vc_cast_at: u64,
     /// v2.10.1: [`crate::params_v2::btc4_fork_fix_from_height`]; runtime only.
     pub btc4_fork_fix_from_height: u64,
     /// Later-height BTC4 fork-slot replacement; runtime only.
@@ -4143,6 +4150,7 @@ impl Node {
         let seat_payout_from_height = crate::params_v2::seat_payout_from_height(cfg.network_id);
         let external_addrs_from_height = crate::params_v2::external_addrs_from_height(cfg.network_id);
         let empty_block_from_height = crate::params_v2::empty_block_from_height(cfg.network_id);
+        let redraw_from_height = crate::params_v2::redraw_from_height(cfg.network_id);
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
         let btc4_most_work_from_height = crate::params_v2::btc4_most_work_from_height(cfg.network_id);
@@ -4297,6 +4305,8 @@ impl Node {
             seat_payout_from_height,
             external_addrs_from_height,
             empty_block_from_height,
+            redraw_from_height,
+            redraw_vc_cast_at: 0,
             btc4_fork_fix_from_height,
             btc4_fork_slot_from_height,
             btc4_most_work_from_height,
@@ -5179,7 +5189,8 @@ impl Node {
         if !self.rv2_at(height) {
             return None;
         }
-        self.lottery_order().into_iter().next()
+        // Round-0 seat of the base committee (a redraw never moves it).
+        self.base_lottery_order().into_iter().next()
     }
 
     /// v2.9.61 (#34): true for an `EthV3Deposit` that cannot apply in the open
@@ -9438,7 +9449,13 @@ impl Node {
         if voter.is_empty() || round == 0 {
             return (false, false);
         }
-        if !self.in_committee(voter) {
+        // 2.11.13 (f): the ViewChange that enters the redraw is open to every
+        // bonded seat (bonded-set quorum, see `vote_round_change`).
+        if self.is_redraw_entry(height, round) {
+            if !self.bonded_ids().contains(voter) {
+                return (false, false);
+            }
+        } else if !self.in_committee(voter) {
             return (false, false);
         }
         let payload = Self::vote_vc_payload(self.cfg.network_id, height, tip_hash, round, voter);
@@ -10824,6 +10841,18 @@ impl Node {
     /// Frozen seats that have since unbonded are filtered out. If the whole
     /// freeze is gone, redraw from current bonded seats.
     pub fn lottery_order(&self) -> Vec<String> {
+        // 2.11.13 (f): from the redraw height, a round entered by the
+        // bonded-set redraw QC uses the redrawn committee.
+        let open = self.tip_height.saturating_add(1);
+        if self.in_redraw_round(open, self.height_view_round) {
+            return self.redraw_committee(self.height_view_round);
+        }
+        self.base_lottery_order()
+    }
+
+    /// The tip-fixed committee for the open height (before 2.11.13 this was
+    /// `lottery_order`; still is below the redraw height / round).
+    pub fn base_lottery_order(&self) -> Vec<String> {
         let open = self.tip_height.saturating_add(1);
         if self.schedule_height == open && !self.schedule_committee.is_empty() {
             let seats = self.bonded_ids();
@@ -10942,6 +10971,9 @@ impl Node {
 
     pub fn sealed_committee(&self) -> Vec<String> {
         let open = self.tip_height.saturating_add(1);
+        if self.in_redraw_round(open, self.height_view_round) {
+            return self.redraw_committee(self.height_view_round);
+        }
         if self.schedule_height == open && !self.schedule_committee.is_empty() {
             return self.schedule_committee.clone();
         }
@@ -15074,7 +15106,7 @@ impl Node {
             return Err("v4 claim_root mismatch".into());
         }
         let sealed = self.sealed_committee();
-        if ledger.current_committee != sealed {
+        if ledger.current_committee != sealed && !self.redraw_committee_claim_ok(ledger) {
             return Err("v4 current_committee mismatch".into());
         }
         let want_cur = self.current_committee_root_at(&ledger.current_committee, ledger.height)?;
@@ -17170,11 +17202,13 @@ mod pack_catchup_tests;
 #[cfg(test)]
 mod pack_fix_21112_tests;
 #[cfg(test)]
-mod snapshot_chunk_tests;
-#[cfg(test)]
 mod prepack_tests;
 #[cfg(test)]
 mod hold_cap_tests;
+#[cfg(test)]
+mod snapshot_chunk_tests;
+#[cfg(test)]
+mod redraw_tests;
 mod merkle_batch_tests;
 #[cfg(test)]
 mod lean_body_tests;
