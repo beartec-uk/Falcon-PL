@@ -32,7 +32,7 @@ use std::path::Path;
 /// v1 = tip state only (chain wiped on load). v2 = tip state + chain tail.
 pub const SNAPSHOT_VERSION: u32 = 2;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSnapshot {
     pub version: u32,
     pub id: String,
@@ -321,6 +321,76 @@ impl Node {
             let drop_n = chain.len() - max;
             chain.drain(0..drop_n);
         }
+        self.to_snapshot_with_chain(chain)
+    }
+
+    /// 2.11.13 (e): ledgers copied per short `node.lock` hold when the
+    /// periodic saver copies the chain tail outside the main capture.
+    pub const SNAPSHOT_CHAIN_CHUNK: usize = 256;
+
+    /// 2.11.13 (e): everything [`Self::to_snapshot`] captures except the
+    /// chain tail (the bulk: up to `max_chain_ledgers` Falcon bodies), plus
+    /// the height after which the tail starts. The saver copies the tail in
+    /// [`Self::SNAPSHOT_CHAIN_CHUNK`] pieces with [`Self::chain_after`], one
+    /// short lock each, then [`Self::finish_chunked_snapshot`] checks it.
+    pub fn to_snapshot_head(&self) -> (NodeSnapshot, u64) {
+        let max = self.cfg.max_chain_ledgers;
+        let keep_from = if max > 0 && self.chain.len() > max {
+            self.chain.len() - max
+        } else {
+            0
+        };
+        let after = self
+            .chain
+            .get(keep_from)
+            .map(|l| l.height.saturating_sub(1))
+            .unwrap_or(self.tip_height);
+        (self.to_snapshot_with_chain(Vec::new()), after)
+    }
+
+    /// Up to `max` committed ledgers with height `> after`, in chain order.
+    pub fn chain_after(&self, after: u64, max: usize) -> Vec<Ledger> {
+        let start = self.chain.partition_point(|l| l.height <= after);
+        self.chain[start..].iter().take(max.max(1)).cloned().collect()
+    }
+
+    /// Attach a chunk-copied tail to a head capture. The tail must end at the
+    /// head's tip (same hash), be contiguous and hash-linked; anything else
+    /// (a catch-up adopt or fork switch between chunks) returns `Err` and
+    /// the caller falls back to a one-lock [`Self::to_snapshot`]. Ledgers
+    /// committed after the head capture are dropped. Same bytes as a
+    /// one-lock capture taken at the head's tip.
+    pub fn finish_chunked_snapshot(
+        mut head: NodeSnapshot,
+        mut chain: Vec<Ledger>,
+        max_chain_ledgers: usize,
+    ) -> Result<NodeSnapshot, String> {
+        chain.retain(|l| l.height <= head.tip_height);
+        if max_chain_ledgers > 0 && chain.len() > max_chain_ledgers {
+            let drop_n = chain.len() - max_chain_ledgers;
+            chain.drain(0..drop_n);
+        }
+        for w in chain.windows(2) {
+            if w[1].height != w[0].height.saturating_add(1) || w[1].parent_hash != w[0].ledger_hash {
+                return Err(format!("chain tail not linked at h={}", w[1].height));
+            }
+        }
+        match chain.last() {
+            Some(l) if l.height == head.tip_height && l.ledger_hash == head.tip_hash => {}
+            None if head.tip_height == 0 => {}
+            Some(l) => {
+                return Err(format!(
+                    "chain tail ends h={} but head tip h={}",
+                    l.height, head.tip_height
+                ))
+            }
+            None => return Err("empty chain tail".into()),
+        }
+        head.chain = chain;
+        Ok(head)
+    }
+
+    fn to_snapshot_with_chain(&self, chain: Vec<Ledger>) -> NodeSnapshot {
         NodeSnapshot {
             version: SNAPSHOT_VERSION,
             id: self.id.clone(),

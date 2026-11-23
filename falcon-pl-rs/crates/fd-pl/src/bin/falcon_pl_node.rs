@@ -3363,16 +3363,45 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                 // `node.lock` every minute (seconds on a 2-vCPU seat).
                 // One capture only; the join copy is trimmed from it after the
                 // full file is written (no second deep clone held alongside).
-                let (snap, tip, tip_hash, ring, scheme) = {
+                // 2.11.13 (e): the chain tail (the bulk of the capture) is
+                // copied in short lock holds after the head, then checked
+                // to end at the head's tip and be hash-linked; on any
+                // mismatch fall back to the old one-lock capture.
+                let (head, after, max_chain, tip, tip_hash, ring, scheme) = {
                     let n = shared_c.node.lock();
+                    let (head, after) = n.to_snapshot_head();
                     (
-                        n.to_snapshot(),
+                        head,
+                        after,
+                        n.cfg.max_chain_ledgers,
                         n.tip_height,
                         n.tip_hash.clone(),
                         n.keys.export_publics(),
                         n.keys.scheme,
                     )
                 };
+                let mut tail: Vec<fd_pl::Ledger> = Vec::new();
+                let mut cursor = after;
+                while cursor < tip {
+                    let part = {
+                        let n = shared_c.node.lock();
+                        n.chain_after(cursor, fd_pl::Node::SNAPSHOT_CHAIN_CHUNK)
+                    };
+                    let Some(last) = part.last() else { break };
+                    cursor = last.height;
+                    tail.extend(part);
+                    tokio::task::yield_now().await;
+                }
+                let snap = match fd_pl::Node::finish_chunked_snapshot(head, tail, max_chain) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("snapshot chunked capture fell back to one lock: {e}");
+                        shared_c.node.lock().to_snapshot()
+                    }
+                };
+                // The fallback may have captured a newer tip.
+                let _ = tip_hash;
+                let (tip, tip_hash) = (snap.tip_height, snap.tip_hash.clone());
                 let saved = tokio::task::block_in_place(|| {
                     fd_pl::Node::write_snapshot_checked(&path, &snap, &essential)
                 });

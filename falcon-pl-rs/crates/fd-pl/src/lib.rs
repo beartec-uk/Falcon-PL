@@ -17170,6 +17170,8 @@ mod pack_catchup_tests;
 #[cfg(test)]
 mod pack_fix_21112_tests;
 #[cfg(test)]
+mod snapshot_chunk_tests;
+#[cfg(test)]
 mod prepack_tests;
 #[cfg(test)]
 mod hold_cap_tests;
