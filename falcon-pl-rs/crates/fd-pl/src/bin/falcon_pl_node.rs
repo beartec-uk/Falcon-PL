@@ -2627,6 +2627,16 @@ const ACCOUNT_HISTORY_LIMIT: usize = 8;
 const ACCOUNT_HISTORY_DISK_HEIGHTS: u64 = 20_000;
 const ACCOUNT_HISTORY_DISK_MS: u64 = 300;
 
+/// 2.11.13 (d): the periodic snapshot timer skips missed runs. Tokio's
+/// default (`Burst`) fired every missed tick back-to-back after a stall
+/// (a frozen or swapping seat), so one slow capture became several full
+/// snapshot captures and writes in a row, each taking `node.lock`.
+fn snapshot_ticker(interval_ms: u64) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick
+}
+
 /// 2.11.13 (c): tokio worker floor. A 2-vCPU seat got 2 workers, and one
 /// long `node.lock` holder (snapshot capture, pack root) froze the whole
 /// node for 20-300 s. `TOKIO_WORKER_THREADS` (as set by the live drop-in)
@@ -3332,7 +3342,7 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
         let path = args.snapshot_out.clone();
         let interval = args.snapshot_interval_ms.max(5_000);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval));
+            let mut tick = snapshot_ticker(interval);
             // v2.9.53: the seat's own snapshot is essential (only refused if it
             // would leave < hard reserve); the join + serve copies are optional
             // dumps (skipped under the low-water mark).
@@ -9542,5 +9552,27 @@ mod tokio_worker_tests {
         assert_eq!(tokio_workers(Some(" 2 "), 32), 2);
         assert_eq!(tokio_workers(Some("0"), 2), 4, "0 is not a valid count");
         assert_eq!(tokio_workers(Some("lots"), 2), 4);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_timer_tests {
+    //! 2.11.13 (d): a stalled snapshot loop runs once, not once per missed tick.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missed_snapshot_ticks_are_skipped_not_burst() {
+        let mut tick = snapshot_ticker(40);
+        tick.tick().await; // first tick is immediate
+        std::thread::sleep(Duration::from_millis(300)); // ~7 missed ticks
+        tick.tick().await; // the one catch-up run
+        let t = Instant::now();
+        tick.tick().await;
+        assert!(
+            t.elapsed() >= Duration::from_millis(15),
+            "next run waits for the schedule (burst would fire immediately): {:?}",
+            t.elapsed()
+        );
     }
 }
