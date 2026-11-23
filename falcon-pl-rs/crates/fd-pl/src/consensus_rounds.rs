@@ -913,15 +913,23 @@ impl Node {
             .as_ref()
             .map(|p| p.height == height)
             .unwrap_or(false);
+        let self_pass = self.packer_should_self_pass(height);
+        let r = self.height_view_round;
+        // Follow is work: the packer already signed that this round cannot
+        // pack. Followers often have an empty local pool (the missing heads
+        // sit on other entry seats) and must still vote the existing VC path
+        // without waiting the silence timeout.
+        let follow = self.following_packer_self_pass(height, r.saturating_add(1));
         let work = pending_here
             || self.network_has_pack_work()
             || self.mempool_poisoned()
-            || !self.open_bodies.is_empty();
+            || !self.open_bodies.is_empty()
+            || self_pass
+            || follow;
         if !work {
             // Load-driven chain: no txs ⇒ no round clock, no cursor walk.
             return None;
         }
-        let r = self.height_view_round;
         let split = self.round_split_dead(height, r);
         if split && self.stall.is_none() {
             self.stall = Some(ConsensusStall::SplitVote { height, round: r });
@@ -933,7 +941,10 @@ impl Node {
         } else {
             self.round_silence_timeout_ms(r)
         };
-        if !split && elapsed < timeout {
+        // 2.11.12: packer self-pass (or a follower seeing that signed VC)
+        // skips the silence timeout. 4-of-6 is unchanged. A 2.11.11 peer
+        // never sets `follow` and still waits the full silence window.
+        if !split && !self_pass && !follow && elapsed < timeout {
             return None;
         }
         let target = r.saturating_add(1);

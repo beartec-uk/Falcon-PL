@@ -2571,6 +2571,15 @@ impl Shared {
             return;
         };
         let line = s + "\n";
+        // 2.11.12: a named gap-fill must reach non-hub entry seats too.
+        // Ordinary NeedTxs (empty missing) stays hub-only, same as 2.11.11.
+        let gap = matches!(m, WireMsg::NeedTxs { missing, .. } if !missing.is_empty());
+        if gap {
+            for p in fanout.iter() {
+                let _ = p.txq.try_send(line.clone(), ConsClass::Other);
+            }
+            return;
+        }
         if self.hub_peer_idxs.is_empty() {
             let hubs: Vec<String> = {
                 let n = self.node.lock();
@@ -3667,12 +3676,20 @@ async fn main() -> Result<()> {
                         } else {
                             n.note_need_txs_sent();
                         }
+                        let missing = n.gap_needs();
+                        let h = n.tip_height.saturating_add(1);
+                        let n_miss = missing.len();
+                        let log = n.should_log_need_txs();
                         drop(n);
+                        if log {
+                            info!(
+                                "NeedTxs pull h={h} max={} missing={n_miss}",
+                                fd_pl::Node::NEED_TXS_BATCH
+                            );
+                        }
                         shared_c.fan_need_txs(
                             &fanout,
-                            &WireMsg::NeedTxs {
-                                max_count: fd_pl::Node::NEED_TXS_BATCH as u64,
-                            },
+                            &WireMsg::need_txs(fd_pl::Node::NEED_TXS_BATCH as u64, missing),
                         );
                     }
                 }
@@ -4122,12 +4139,20 @@ async fn main() -> Result<()> {
                                 && n.should_pre_pack_need_txs()
                             {
                                 n.mark_pre_pack_need_txs();
+                                let missing = n.gap_needs();
+                                let h = n.tip_height.saturating_add(1);
+                                let n_miss = missing.len();
+                                let log = n.should_log_need_txs();
                                 drop(n);
+                                if log {
+                                    info!(
+                                        "NeedTxs pull h={h} max={} missing={n_miss}",
+                                        fd_pl::Node::NEED_TXS_BATCH
+                                    );
+                                }
                                 shared_c.fan_need_txs(
                                     &fanout,
-                                    &WireMsg::NeedTxs {
-                                        max_count: fd_pl::Node::NEED_TXS_BATCH as u64,
-                                    },
+                                    &WireMsg::need_txs(fd_pl::Node::NEED_TXS_BATCH as u64, missing),
                                 );
                             } else if !n.can_seal_empty()
                                 && !(n.mempool.len() > 0 && !n.has_applicable_tx())
@@ -4156,6 +4181,8 @@ async fn main() -> Result<()> {
                                 "pack-walk h={open_height} winner={winner} pool={pool} applicable={applicable} packable={packable} accounts={accounts} min_depth={min_depth} walk_ready={walk_ready}"
                             );
                             shared_c.note_walk_ready(open_height, packable, "propose-call");
+                            let pack_started = std::time::Instant::now();
+                            let pack_budget = n.cfg.pack_budget_ms;
                             if force_full {
                                 // Checker rule is sealed <= max(local+5s, parent+1s).
                                 // A hot snap clock stamps ~20s ahead and the live
@@ -4165,6 +4192,7 @@ async fn main() -> Result<()> {
                             }
                             match n.pack_or_skip(&my_id) {
                                 Ok(Some(mut ledger)) => {
+                                    n.pack_over_budget = false;
                                     if let Err(e) = ledger.attach_merkle_batch_known(&n.keys, &|id| {
                                         n.account_public_key(id)
                                     }) {
@@ -4226,6 +4254,16 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 Ok(None) => {
+                                    if pack_budget > 0
+                                        && pack_started.elapsed().as_millis() as u64 >= pack_budget
+                                    {
+                                        n.pack_over_budget = true;
+                                        warn!(
+                                            "pack over budget {}ms (budget {pack_budget}ms) h={}",
+                                            pack_started.elapsed().as_millis(),
+                                            n.tip_height.saturating_add(1)
+                                        );
+                                    }
                                     let h = n.tip_height + 1;
                                     let skipped = n.skip_set_for(h).contains(&my_id);
                                     let tip = n.tip_hash.clone();
@@ -4265,10 +4303,20 @@ async fn main() -> Result<()> {
                                         || e.contains("soft")
                                         || e.contains("pending") =>
                                 {
+                                    if pack_budget > 0
+                                        && pack_started.elapsed().as_millis() as u64 >= pack_budget
+                                    {
+                                        n.pack_over_budget = true;
+                                    }
                                     let h = n.tip_height.saturating_add(1);
                                     shared_c.note_walk_ready(h, n.packable_tx_count(), &e);
                                 }
                                 Err(e) => {
+                                    if pack_budget > 0
+                                        && pack_started.elapsed().as_millis() as u64 >= pack_budget
+                                    {
+                                        n.pack_over_budget = true;
+                                    }
                                     let h = n.tip_height.saturating_add(1);
                                     shared_c.note_walk_ready(h, n.packable_tx_count(), &e);
                                     warn!("pack: {e}");
@@ -5855,28 +5903,36 @@ fn process_msg(
             }
             if want_txs {
                 if let Some(f) = fanout {
+                    let missing = shared.node.lock().gap_needs();
                     shared.fan_need_txs(
                         f,
-                        &WireMsg::NeedTxs {
-                            max_count: fd_pl::Node::NEED_TXS_BATCH as u64,
-                        },
+                        &WireMsg::need_txs(fd_pl::Node::NEED_TXS_BATCH as u64, missing),
                     );
                 }
             }
             None
         }
-        WireMsg::NeedTxs { max_count } => {
+        WireMsg::NeedTxs { max_count, missing } => {
             let mut n = shared.node.lock();
             // While lagging, prefer catch-up replies over TxsBatch on the wire.
             if n.still_lagging() {
                 return None;
             }
-            let batch = n.serve_need_txs(max_count as usize);
+            let asked = missing.len();
+            let (batch, filled) = n.serve_need_txs_for(max_count as usize, &missing);
+            let log = n.should_log_need_txs();
             drop(n);
+            if log {
+                info!(
+                    "NeedTxs serve n={} gap_filled={} missing_asked={}",
+                    batch.len(),
+                    filled,
+                    asked
+                );
+            }
             if batch.is_empty() {
                 None
             } else {
-                debug!("NeedTxs serve n={}", batch.len());
                 Some(WireMsg::TxsBatch { txs: batch })
             }
         }
