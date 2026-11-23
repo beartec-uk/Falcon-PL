@@ -388,7 +388,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.11";
+pub const PRODUCT_VERSION: &str = "2.11.12";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -3840,6 +3840,17 @@ pub struct Node {
     pub mempool_absorbed: u64,
     /// Pack attempts that found mempool non-empty but no next-seq match (seq poison / holes).
     pub pack_no_applicable: u64,
+    /// Last pack/verify on this height ran past `pack_budget_ms` without a ledger.
+    /// Local only. Triggers packer self-pass (2.11.12).
+    pub pack_over_budget: bool,
+    /// A signed ViewChange from the current round proposer was accepted for
+    /// this open height / target round. Local follow flag; not consensus.
+    pub follow_self_pass_height: u64,
+    pub follow_self_pass_round: u64,
+    /// Rate-limit NeedTxs / gap-fill info logs (ms).
+    pub last_need_txs_log_ms: u64,
+    /// Test/ops hook: treat this seat as under memory pressure (self-pass).
+    pub force_memory_pressure: bool,
     /// After all-skip clear, refuse new SkipPacker until this time (stops thrash).
     pub skip_reopen_cooldown_until_ms: u64,
 
@@ -4177,6 +4188,11 @@ impl Node {
             mempool_served: 0,
             mempool_absorbed: 0,
             pack_no_applicable: 0,
+            pack_over_budget: false,
+            follow_self_pass_height: 0,
+            follow_self_pass_round: 0,
+            last_need_txs_log_ms: 0,
+            force_memory_pressure: false,
             skip_reopen_cooldown_until_ms: 0,
             online_epoch_id: 0,
             online_members: BTreeSet::new(),
@@ -5301,6 +5317,10 @@ impl Node {
     /// Hub → packer working set. Same size as a full ledger (`PACK_DEFAULT_MAX_TXS`).
     /// 128 left packers sealing a short dish while the hub still held the pool.
     pub const NEED_TXS_BATCH: usize = 400;
+    /// Max named (account, seq) heads in one gap-fill NeedTxs.
+    pub const NEED_TXS_GAP_MAX: usize = 64;
+    /// Rate-limit NeedTxs / gap-fill info lines (ms).
+    pub const NEED_TXS_LOG_INTERVAL_MS: u64 = 1_000;
     /// Pull if local mempool is below this and we may pack (or are a light val lagging work).
     pub const NEED_TXS_LOW_WATER: usize = 8;
     /// After pre-pack NeedTxs, wait this long for TxsBatch before sealing empty (P1).
@@ -5543,17 +5563,56 @@ impl Node {
         n
     }
 
-    /// The walk is well under a full block while a hub is holding a larger
-    /// pool. Twenty-eight heads with only one or two behind each still make
-    /// a short block. The raw pool size does not.
+    /// The walk is well under a full block while later sequences sit behind
+    /// a hole, locally or on a hub. A 290-tx pool with a 239 walk must wait
+    /// and pull. The raw pool size alone is not enough when it equals the walk.
+    ///
+    /// 2.11.12: a local pool deeper than the consecutive walk is a hole, not
+    /// only a hub advertisement ≥ `pace_mempool_txs` (400).
     pub fn short_pack_hole(&self) -> bool {
         let cap = self.pack_cap_txs();
         let walk = self.packable_tx_count();
         if walk >= cap.saturating_mul(3) / 4 {
             return false;
         }
+        let local = self.mempool.len() as u64;
+        if local > walk as u64 {
+            return true;
+        }
         let hub = self.fresh_hub_pool();
         hub > walk as u64 && hub >= self.pace_mempool_txs.max(1) as u64
+    }
+
+    /// Named missing heads: the first sequence not in the local walk while a
+    /// later sequence for that account is in the pool. Bounded, packer-local.
+    pub fn gap_needs(&self) -> Vec<MissingSeq> {
+        let mut by: std::collections::HashMap<String, std::collections::BTreeSet<u64>> =
+            std::collections::HashMap::new();
+        for tx in self.mempool.iter_candidates() {
+            by.entry(tx.account.clone())
+                .or_default()
+                .insert(tx.sequence);
+        }
+        let mut out = Vec::new();
+        for (account, seqs) in &by {
+            let mut need = self.state.get(account).sequence;
+            if !seqs.iter().any(|&s| s >= need) {
+                continue;
+            }
+            while seqs.contains(&need) {
+                need = need.saturating_add(1);
+            }
+            if seqs.iter().any(|&s| s > need) {
+                out.push(MissingSeq {
+                    account: account.clone(),
+                    sequence: need,
+                });
+            }
+            if out.len() >= Self::NEED_TXS_GAP_MAX {
+                break;
+            }
+        }
+        out
     }
 
     /// P1: lottery winner pulls hub inventory while it has no next-seq head,
@@ -5712,11 +5771,63 @@ impl Node {
     /// Serve a NeedTxs request (hub or any peer with inventory).
     /// Applicable heads first so a remote packer can seal this height.
     pub fn serve_need_txs(&mut self, max_count: usize) -> Vec<Tx> {
-        let batch = self.export_packer_batch(max_count);
-        if !batch.is_empty() {
+        self.serve_need_txs_for(max_count, &[]).0
+    }
+
+    /// Walk-shaped export plus any named missing heads the requester asked for.
+    /// A gap-fill head is included even when it is not part of this seat's walk
+    /// (the packer has later seqs and needs this one). Returns (batch, gap_filled).
+    pub fn serve_need_txs_for(
+        &mut self,
+        max_count: usize,
+        missing: &[MissingSeq],
+    ) -> (Vec<Tx>, usize) {
+        let max = max_count.clamp(1, Self::NEED_TXS_BATCH.max(1));
+        let mut out = Vec::new();
+        let mut have = std::collections::HashSet::new();
+        let mut filled = 0usize;
+        for m in missing.iter().take(Self::NEED_TXS_GAP_MAX) {
+            if out.len() >= max {
+                break;
+            }
+            let Some(tx) = self.mempool_tx_at(&m.account, m.sequence) else {
+                continue;
+            };
+            if have.insert(tx.tx_id.clone()) {
+                out.push(tx);
+                filled = filled.saturating_add(1);
+            }
+        }
+        for tx in self.export_packer_batch(max) {
+            if out.len() >= max {
+                break;
+            }
+            if have.insert(tx.tx_id.clone()) {
+                out.push(tx);
+            }
+        }
+        if !out.is_empty() {
             self.mempool_served = self.mempool_served.saturating_add(1);
         }
-        batch
+        (out, filled)
+    }
+
+    /// The mempool transaction at exactly `(account, sequence)`, if present.
+    pub fn mempool_tx_at(&self, account: &str, sequence: u64) -> Option<Tx> {
+        self.mempool
+            .iter_candidates()
+            .find(|tx| tx.account == account && tx.sequence == sequence)
+            .map(|tx| tx.to_tx())
+    }
+
+    /// True when this seat should emit a NeedTxs / gap-fill info line.
+    pub fn should_log_need_txs(&mut self) -> bool {
+        if self.now_ms.saturating_sub(self.last_need_txs_log_ms) < Self::NEED_TXS_LOG_INTERVAL_MS
+        {
+            return false;
+        }
+        self.last_need_txs_log_ms = self.now_ms.max(1);
+        true
     }
 
     /// Packer working set, one layer of every account then the next layer.
@@ -6077,6 +6188,9 @@ impl Node {
         self.hard_ok.clear();
         self.need_txs_for_height = 0;
         self.need_txs_open_ms = 0;
+        self.pack_over_budget = false;
+        self.follow_self_pass_height = 0;
+        self.follow_self_pass_round = 0;
         self.tip_height = 0;
         self.tip_hash = sha256_hex(b"pl-genesis-v1");
         // Critical: rewind wall clock to genesis so sealed_at_ms advance during
@@ -9236,6 +9350,10 @@ impl Node {
         if !self.accept_vote_sig(voter, &payload, signature) {
             return (false, false);
         }
+        // 2.11.12: a signed ViewChange from the current proposer is a self-pass
+        // hint. Followers vote immediately; 4-of-6 is unchanged. 2.11.11 peers
+        // ignore the hint and wait for the silence timeout.
+        self.note_incoming_packer_self_pass(height, voter, round);
         if self.vote_rounds_at(height) {
             // 2.11.4: keep the verified signature so an applied QC can be
             // re-gossiped to seats that missed it (h=891419 round split).
@@ -9354,6 +9472,97 @@ impl Node {
     /// or height is open with applicable txs and no progress for the same window.
     ///
     /// Returns `(height, tip_hash, target_round)` when the node loop should gossip.
+    /// Record a pack/verify attempt that ran past the pack budget without a ledger.
+    pub fn note_pack_attempt_result(&mut self, started_ms: u64, sealed: bool) {
+        if sealed {
+            self.pack_over_budget = false;
+            return;
+        }
+        let budget = self.cfg.pack_budget_ms;
+        if budget > 0 && self.now_ms.saturating_sub(started_ms) >= budget {
+            self.pack_over_budget = true;
+        }
+    }
+
+    /// Local memory-pressure hook. Production sets this only via the explicit
+    /// field; swap-bound slowness is also observed as `pack_over_budget`.
+    pub fn memory_pressure(&self) -> bool {
+        self.force_memory_pressure
+    }
+
+    /// A verified ViewChange from the current round proposer: follow it.
+    pub fn note_incoming_packer_self_pass(&mut self, height: u64, voter: &str, round: u64) {
+        if !self.vote_rounds_at(height) {
+            return;
+        }
+        if height != self.tip_height.saturating_add(1) {
+            return;
+        }
+        let want = self.height_view_round.saturating_add(1);
+        if round != want {
+            return;
+        }
+        let Some(proposer) = self.round_proposer(self.height_view_round) else {
+            return;
+        };
+        if proposer == voter {
+            self.follow_self_pass_height = height;
+            self.follow_self_pass_round = round;
+        }
+    }
+
+    pub fn following_packer_self_pass(&self, height: u64, target_round: u64) -> bool {
+        self.follow_self_pass_height == height && self.follow_self_pass_round == target_round
+    }
+
+    /// Lottery / round winner that cannot pack in budget should sign the
+    /// existing ViewChange path instead of waiting out the silence timeout.
+    /// Does not change 4-of-6 or the lottery. Attributable: the next ledger
+    /// still charges `missed_turns` to the skipped round-0 seat.
+    pub fn packer_should_self_pass(&self, height: u64) -> bool {
+        if !self.vote_rounds_at(height) {
+            return false;
+        }
+        if height != self.tip_height.saturating_add(1) {
+            return false;
+        }
+        if self.still_lagging() {
+            return false;
+        }
+        let Some(proposer) = self.round_proposer(self.height_view_round) else {
+            return false;
+        };
+        if proposer != self.id {
+            return false;
+        }
+        if self.pending_proposal.is_some() {
+            return false;
+        }
+        // Still inside the bounded gap-fill grace: let heads land first.
+        // A pending first NeedTxs must not block self-pass after the live
+        // pack window; otherwise a hole that never fills sits out the silence.
+        if self.waiting_need_txs_grace() {
+            return false;
+        }
+        if self.memory_pressure() || self.pack_over_budget {
+            return true;
+        }
+        // No consecutive walk after the live pack window (pack budget + NeedTxs
+        // grace + slack), not the longer silence timeout.
+        if self.packable_tx_count() > 0 {
+            return false;
+        }
+        // Use the height/round open clock, not `work_seen_since_ms` (that
+        // stamp moves forward while txs sit in the pool, and would keep a
+        // silent packer from ever reaching the live-pack window).
+        let start = self.height_open_ms.max(self.round_open_ms);
+        let elapsed = self.now_ms.saturating_sub(start);
+        if elapsed < self.live_pack_timeout_ms() {
+            return false;
+        }
+        self.mempool.len() > 0 || self.network_has_pack_work()
+    }
+
     pub fn maybe_view_change_vote(&mut self) -> Option<(u64, String, u64)> {
         // Lagging nodes recover via catch-up, not view-change. VC while behind
         // floods the mesh and delays NeedLedgers/LedgersBatch (tip=0 freeze class).
@@ -15004,6 +15213,9 @@ impl Node {
         // Fresh open height → allow a new pre-pack NeedTxs cycle (P1).
         self.need_txs_for_height = 0;
         self.need_txs_open_ms = 0;
+        self.pack_over_budget = false;
+        self.follow_self_pass_height = 0;
+        self.follow_self_pass_round = 0;
         if let Some(c) = &ledger.parent_cert {
             self.certs.entry(c.height).or_insert_with(|| c.clone());
         }
@@ -16136,6 +16348,13 @@ fn pack_force_full_clone() -> bool {
 // Wire protocol (multi-process)
 // ---------------------------------------------------------------------------
 
+/// One missing mempool head named by a 2.11.12 NeedTxs gap-fill pull.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingSeq {
+    pub account: String,
+    pub sequence: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WireMsg {
@@ -16243,9 +16462,16 @@ pub enum WireMsg {
         reason: String,
     },
     /// Pull pending txs from a hub / peer (packer path before progress-timeout).
+    /// `missing` is a 2.11.12 gap-fill hint: specific (account, seq) heads the
+    /// packer cannot walk. Empty is omitted on the wire, so a 2.11.11 peer
+    /// sees the same bytes as today. A 2.11.11 peer that receives a non-empty
+    /// `missing` ignores the unknown field (no `deny_unknown_fields`) and
+    /// still serves the walk-shaped export. No activation height.
     NeedTxs {
         #[serde(default = "default_need_txs_batch")]
         max_count: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        missing: Vec<MissingSeq>,
     },
     /// Directed mempool batch response (reply on requesting connection).
     TxsBatch {
@@ -16727,8 +16953,18 @@ fn default_need_txs_batch() -> u64 {
     Node::NEED_TXS_BATCH as u64
 }
 
+impl WireMsg {
+    /// NeedTxs with an optional gap-fill list. Empty `missing` serializes
+    /// identically to a 2.11.11 NeedTxs (field skipped).
+    pub fn need_txs(max_count: u64, missing: Vec<MissingSeq>) -> Self {
+        WireMsg::NeedTxs { max_count, missing }
+    }
+}
+
 #[cfg(test)]
 mod pack_catchup_tests;
+#[cfg(test)]
+mod pack_fix_21112_tests;
 mod merkle_batch_tests;
 #[cfg(test)]
 mod lean_body_tests;
@@ -17174,6 +17410,7 @@ mod tests {
         assert!(hello_version_compatible("2.11.9"));
         assert!(hello_version_compatible("2.11.10"));
         assert!(hello_version_compatible("2.11.11"));
+        assert!(hello_version_compatible("2.11.12"));
         assert!(!hello_version_compatible("2.11.07"));
         assert!(!hello_version_compatible("2.10.0"));
         assert!(!hello_version_compatible("3.9.60"));
@@ -17190,8 +17427,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.11");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.11");
+        assert_eq!(PRODUCT_VERSION, "2.11.12");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.12");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
