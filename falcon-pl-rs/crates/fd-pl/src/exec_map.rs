@@ -1,5 +1,6 @@
 // Copyright (c) 2025-2026 BEARTEC. All rights reserved. See LICENSE.
-//! v2.9.58 "lean node": the ETH execution-header map with a cached canonical
+//! v2.9.58 "lean node": the ETH execution-header map (2.11.13: generic
+//! [`CachedMap`], also used for the rail header chains) with a cached canonical
 //! JSON encoding, plus a commitment-root hasher that reuses it.
 //!
 //! Until v2.9.60 the map was never pruned (~126k headers, ~199 MB of the
@@ -40,47 +41,70 @@ fn next_gen() -> u64 {
     NEXT_GEN.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Copy-on-write ETH execution header map (number → header).
+/// Copy-on-write `u64 → V` map with a content generation and a cached
+/// canonical JSON encoding (v2.9.58 for ETH exec headers; 2.11.13 also the
+/// rail header chains, [`RailHeaderMap`]).
 ///
 /// Clones share the map, its generation id and its JSON cache. The only way
-/// to mutate is [`ExecHeaderMap::make_mut`], which assigns a fresh generation
+/// to mutate is [`CachedMap::make_mut`], which assigns a fresh generation
 /// and drops the cache for this handle; other clones keep theirs. So equal
 /// generation ⇒ identical contents.
-#[derive(Clone)]
-pub struct ExecHeaderMap {
-    map: Arc<BTreeMap<u64, EthExecHeader>>,
+pub struct CachedMap<V> {
+    map: Arc<BTreeMap<u64, V>>,
     gen: u64,
     json: Arc<OnceLock<Arc<Vec<u8>>>>,
     bounds: Arc<OnceLock<(u64, u64)>>,
 }
 
-impl Default for ExecHeaderMap {
+/// ETH execution header map (number → header).
+pub type ExecHeaderMap = CachedMap<EthExecHeader>;
+/// 2.11.13: a rail's header chain (height → header). Clone = refcount bump.
+pub type RailHeaderMap = CachedMap<crate::bridge::RailHeader>;
+
+impl<V> Clone for CachedMap<V> {
+    fn clone(&self) -> Self {
+        Self {
+            map: self.map.clone(),
+            gen: self.gen,
+            json: self.json.clone(),
+            bounds: self.bounds.clone(),
+        }
+    }
+}
+
+impl<V> Default for CachedMap<V> {
     fn default() -> Self {
         Self::new(BTreeMap::new())
     }
 }
 
-impl std::fmt::Debug for ExecHeaderMap {
+impl<V: std::fmt::Debug> std::fmt::Debug for CachedMap<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.map.fmt(f)
     }
 }
 
-impl std::ops::Deref for ExecHeaderMap {
-    type Target = BTreeMap<u64, EthExecHeader>;
+impl<V> std::ops::Deref for CachedMap<V> {
+    type Target = BTreeMap<u64, V>;
     fn deref(&self) -> &Self::Target {
         &self.map
     }
 }
 
-impl From<BTreeMap<u64, EthExecHeader>> for ExecHeaderMap {
-    fn from(m: BTreeMap<u64, EthExecHeader>) -> Self {
+impl<V> From<BTreeMap<u64, V>> for CachedMap<V> {
+    fn from(m: BTreeMap<u64, V>) -> Self {
         Self::new(m)
     }
 }
 
-impl ExecHeaderMap {
-    pub fn new(map: BTreeMap<u64, EthExecHeader>) -> Self {
+impl<V: PartialEq> PartialEq for CachedMap<V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.gen == other.gen || *self.map == *other.map
+    }
+}
+
+impl<V> CachedMap<V> {
+    pub fn new(map: BTreeMap<u64, V>) -> Self {
         Self {
             map: Arc::new(map),
             gen: next_gen(),
@@ -94,29 +118,14 @@ impl ExecHeaderMap {
         self.gen
     }
 
-    /// Mutable access (copies the map if shared). New generation, empty cache.
-    pub fn make_mut(&mut self) -> &mut BTreeMap<u64, EthExecHeader> {
-        self.gen = next_gen();
-        self.json = Arc::new(OnceLock::new());
-        self.bounds = Arc::new(OnceLock::new());
-        Arc::make_mut(&mut self.map)
-    }
-
     /// Same underlying allocation (clone was a refcount bump).
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         Arc::ptr_eq(&a.map, &b.map)
     }
 
-    /// `serde_json::to_vec(&map)`, computed once per generation.
-    pub fn canonical_json(&self) -> Arc<Vec<u8>> {
-        self.json
-            .get_or_init(|| Arc::new(serde_json::to_vec(&*self.map).unwrap_or_default()))
-            .clone()
-    }
-
     /// `compute(map)` once per generation (e.g. the connected exec range,
     /// which walks ~126k keys and is shown in every status).
-    pub fn cached_bounds(&self, compute: impl FnOnce(&BTreeMap<u64, EthExecHeader>) -> (u64, u64)) -> (u64, u64) {
+    pub fn cached_bounds(&self, compute: impl FnOnce(&BTreeMap<u64, V>) -> (u64, u64)) -> (u64, u64) {
         *self.bounds.get_or_init(|| compute(&self.map))
     }
 
@@ -124,7 +133,28 @@ impl ExecHeaderMap {
     pub fn json_cached(&self) -> bool {
         self.json.get().is_some()
     }
+}
 
+impl<V: Clone> CachedMap<V> {
+    /// Mutable access (copies the map if shared). New generation, empty cache.
+    pub fn make_mut(&mut self) -> &mut BTreeMap<u64, V> {
+        self.gen = next_gen();
+        self.json = Arc::new(OnceLock::new());
+        self.bounds = Arc::new(OnceLock::new());
+        Arc::make_mut(&mut self.map)
+    }
+}
+
+impl<V: Serialize> CachedMap<V> {
+    /// `serde_json::to_vec(&map)`, computed once per generation.
+    pub fn canonical_json(&self) -> Arc<Vec<u8>> {
+        self.json
+            .get_or_init(|| Arc::new(serde_json::to_vec(&*self.map).unwrap_or_default()))
+            .clone()
+    }
+}
+
+impl ExecHeaderMap {
     /// Headers with `number < floor` removed.
     ///
     /// `None` when nothing would be removed (empty map, or every key is
@@ -175,11 +205,27 @@ fn prune_memo() -> &'static Mutex<VecDeque<(u64, u64, ExecHeaderMap)>> {
     M.get_or_init(|| Mutex::new(VecDeque::with_capacity(PRUNE_MEMO_CAP)))
 }
 
+/// A map serialized as a placeholder during a split.
+trait Captured {
+    fn generation(&self) -> u64;
+    fn json(&self) -> Arc<Vec<u8>>;
+}
+
+impl<V: Serialize> Captured for CachedMap<V> {
+    fn generation(&self) -> u64 {
+        self.gen
+    }
+    fn json(&self) -> Arc<Vec<u8>> {
+        self.canonical_json()
+    }
+}
+
 thread_local! {
     static PLACEHOLDER_MODE: Cell<u32> = const { Cell::new(0) };
     /// Maps serialized as the placeholder during the current split (cheap
-    /// clones), so the splice always uses the map that was actually embedded.
-    static CAPTURED: std::cell::RefCell<Vec<ExecHeaderMap>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// clones), in serialization order, so the splice always uses the map
+    /// that was actually embedded at each position.
+    static CAPTURED: std::cell::RefCell<Vec<Box<dyn Captured>>> = std::cell::RefCell::new(Vec::new());
 }
 
 /// Random per-process placeholder. Contains control characters, which
@@ -211,17 +257,17 @@ impl Drop for PlaceholderGuard {
     }
 }
 
-impl Serialize for ExecHeaderMap {
+impl<V: Serialize + Clone + 'static> Serialize for CachedMap<V> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if PLACEHOLDER_MODE.with(|m| m.get()) > 0 {
-            CAPTURED.with(|c| c.borrow_mut().push(self.clone()));
+            CAPTURED.with(|c| c.borrow_mut().push(Box::new(self.clone())));
             return s.serialize_str(placeholder());
         }
         self.map.serialize(s)
     }
 }
 
-impl<'de> Deserialize<'de> for ExecHeaderMap {
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for CachedMap<V> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(Self::new(BTreeMap::deserialize(d)?))
     }
@@ -248,14 +294,14 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     None
 }
 
-/// Result of serializing with the map replaced by the placeholder.
+/// Result of serializing with each cached map replaced by the placeholder.
 enum Split {
     /// Placeholder absent: `bytes` is already the exact plain serialization
-    /// (the map was empty and skipped, or not part of the value).
+    /// (maps empty and skipped, or not part of the value).
     Plain(Vec<u8>),
-    /// Exactly one placeholder at `at`, standing for `map`.
-    One { bytes: Vec<u8>, at: usize, map: ExecHeaderMap },
-    /// Ambiguous (more than one) — caller must fall back.
+    /// One placeholder per captured map, at `ats` (in order).
+    Many { bytes: Vec<u8>, ats: Vec<usize>, maps: Vec<Box<dyn Captured>> },
+    /// Placeholder count does not match the captured maps — fall back.
     Ambiguous,
 }
 
@@ -270,25 +316,40 @@ fn split<T: Serialize + ?Sized>(value: &T) -> Split {
         let _g = PlaceholderGuard::enter();
         serde_json::to_vec(value)
     };
-    let mut captured = CAPTURED.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let maps = CAPTURED.with(|c| std::mem::take(&mut *c.borrow_mut()));
     let Ok(bytes) = res else {
         return Split::Ambiguous;
     };
     let pat = placeholder_json();
-    match find(&bytes, pat) {
-        None if captured.is_empty() => Split::Plain(bytes),
-        None => Split::Ambiguous,
-        Some(at) => {
-            if captured.len() != 1 || find(&bytes[at + 1..], pat).is_some() {
-                Split::Ambiguous
-            } else {
-                Split::One { bytes, at, map: captured.pop().unwrap() }
-            }
-        }
+    let mut ats = Vec::new();
+    let mut from = 0usize;
+    while let Some(off) = find(&bytes[from..], pat) {
+        ats.push(from + off);
+        from += off + pat.len();
     }
+    if ats.is_empty() && maps.is_empty() {
+        return Split::Plain(bytes);
+    }
+    if ats.len() != maps.len() {
+        return Split::Ambiguous;
+    }
+    Split::Many { bytes, ats, maps }
 }
 
-type MemoKey = ([u8; 32], u64, [u8; 32]);
+/// Non-map segments of a split (between placeholders), in order.
+fn segments<'a>(bytes: &'a [u8], ats: &[usize]) -> Vec<&'a [u8]> {
+    let pl = placeholder_json().len();
+    let mut out = Vec::with_capacity(ats.len() + 1);
+    let mut prev = 0usize;
+    for &at in ats {
+        out.push(&bytes[prev..at]);
+        prev = at + pl;
+    }
+    out.push(&bytes[prev..]);
+    out
+}
+
+type MemoKey = ([u8; 32], Vec<u64>);
 
 fn memo() -> &'static Mutex<VecDeque<(MemoKey, String)>> {
     static M: OnceLock<Mutex<VecDeque<(MemoKey, String)>>> = OnceLock::new();
@@ -320,30 +381,35 @@ pub fn root_stats() -> (u64, u64) {
     )
 }
 
-/// `sha256_hex(serde_json::to_vec(value))`, reusing the embedded map's cached
-/// JSON and a memo of recent roots. If `value` embeds more than one
-/// [`ExecHeaderMap`], this falls back to the plain path.
+/// `sha256(serde_json::to_vec(value))`, byte-for-byte, with every embedded
+/// [`CachedMap`] spliced in from its per-generation JSON cache and the root
+/// memoized on (sha256 of the non-map segments, map generations).
 pub fn sha256_hex_split<T: Serialize + ?Sized>(value: &T) -> String {
     match split(value) {
         Split::Plain(bytes) => crate::crypto::sha256_hex(&bytes),
         Split::Ambiguous => {
             crate::crypto::sha256_hex(&serde_json::to_vec(value).unwrap_or_default())
         }
-        Split::One { bytes, at, map } => {
-            let pre = &bytes[..at];
-            let suf = &bytes[at + placeholder_json().len()..];
-            let mut h = crate::crypto::FastSha256::new();
-            h.update(pre);
-            let pre_digest: [u8; 32] = h.clone().finalize();
-            let suf_digest: [u8; 32] = crate::crypto::sha256_raw(suf);
-            let key = (pre_digest, map.generation(), suf_digest);
+        Split::Many { bytes, ats, maps } => {
+            let segs = segments(&bytes, &ats);
+            let mut d = crate::crypto::FastSha256::new();
+            for seg in &segs {
+                d.update(&(seg.len() as u64).to_be_bytes());
+                d.update(seg);
+            }
+            let seg_digest: [u8; 32] = d.finalize();
+            let key = (seg_digest, maps.iter().map(|m| m.generation()).collect::<Vec<_>>());
             if let Some(r) = memo().lock().iter().find(|(k, _)| *k == key).map(|(_, r)| r.clone()) {
                 MEMO_HITS.fetch_add(1, Ordering::Relaxed);
                 return r;
             }
-            let json = map.canonical_json();
-            h.update(&json[..]);
-            h.update(suf);
+            let mut h = crate::crypto::FastSha256::new();
+            for (i, seg) in segs.iter().enumerate() {
+                h.update(seg);
+                if let Some(m) = maps.get(i) {
+                    h.update(&m.json()[..]);
+                }
+            }
             let root = hex::encode(h.finalize());
             FULL_HASHES.fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
@@ -360,19 +426,24 @@ pub fn sha256_hex_split<T: Serialize + ?Sized>(value: &T) -> String {
     }
 }
 
-/// `serde_json::to_vec(value)` with the embedded map's cached JSON spliced
-/// in (same bytes; saves re-encoding ~200 MB for every snapshot write).
+/// `serde_json::to_vec(value)` with every embedded map's cached JSON spliced
+/// in (same bytes; saves re-encoding the header maps for every snapshot).
 pub fn to_vec_split<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Vec<u8>> {
     match split(value) {
         Split::Plain(bytes) => Ok(bytes),
         Split::Ambiguous => serde_json::to_vec(value),
-        Split::One { bytes, at, map } => {
-            let json = map.canonical_json();
-            let tail = &bytes[at + placeholder_json().len()..];
-            let mut out = Vec::with_capacity(at + json.len() + tail.len());
-            out.extend_from_slice(&bytes[..at]);
-            out.extend_from_slice(&json);
-            out.extend_from_slice(tail);
+        Split::Many { bytes, ats, maps } => {
+            let segs = segments(&bytes, &ats);
+            let jsons: Vec<Arc<Vec<u8>>> = maps.iter().map(|m| m.json()).collect();
+            let total = segs.iter().map(|s| s.len()).sum::<usize>()
+                + jsons.iter().map(|j| j.len()).sum::<usize>();
+            let mut out = Vec::with_capacity(total);
+            for (i, seg) in segs.iter().enumerate() {
+                out.extend_from_slice(seg);
+                if let Some(j) = jsons.get(i) {
+                    out.extend_from_slice(j);
+                }
+            }
             Ok(out)
         }
     }
@@ -389,6 +460,7 @@ mod tests {
             parent_hash: format!("{:064x}", i),
             receipts_root: "00".repeat(32),
             rlp_hex: "f9".repeat(40),
+            timestamp: 0,
         }
     }
 
@@ -468,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn two_embedded_maps_fall_back_to_plain() {
+    fn two_embedded_maps_splice_both() {
         let mut a = ExecHeaderMap::default();
         a.make_mut().insert(1, hdr(1));
         let mut b = ExecHeaderMap::default();
@@ -476,6 +548,13 @@ mod tests {
         let v = Two { a: &a, b: &b };
         let want = serde_json::to_vec(&v).unwrap();
         assert_eq!(sha256_hex_split(&v), crate::crypto::sha256_hex(&want));
+        assert_eq!(sha256_hex_split(&v), crate::crypto::sha256_hex(&want), "memo hit");
+        // Changing one map changes the root (its generation is in the key).
+        b.make_mut().insert(3, hdr(3));
+        let v2 = Two { a: &a, b: &b };
+        assert_eq!(sha256_hex_split(&v2), crate::crypto::sha256_hex(&serde_json::to_vec(&v2).unwrap()));
+        let v = Two { a: &a, b: &b };
+        let want = serde_json::to_vec(&v).unwrap();
         assert_eq!(to_vec_split(&v).unwrap(), want);
         // Normal serialization after a split is unaffected (mode reset).
         assert_eq!(serde_json::to_vec(&a).unwrap(), serde_json::to_vec(&*a).unwrap());

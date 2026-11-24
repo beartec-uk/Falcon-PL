@@ -1017,8 +1017,24 @@ fn unix_ms() -> u64 {
 fn peek_snap_header(path: &std::path::Path) -> Option<(u64, String)> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    let zstd = f.read_exact(&mut magic).is_ok() && magic == fd_pl::snapshot::ZSTD_MAGIC;
+    let f = std::fs::File::open(path).ok()?;
+    // 2.11.13: snapshot files may be zstd (past the bridge-slim activation).
+    let mut r: Box<dyn Read> = if zstd {
+        Box::new(zstd::stream::read::Decoder::new(f).ok()?)
+    } else {
+        Box::new(f)
+    };
     let mut buf = vec![0u8; 16_384];
-    let n = f.read(&mut buf).ok()?;
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(_) => break,
+        }
+    }
     let s = String::from_utf8_lossy(&buf[..n]);
     let tip = s
         .split("\"tip_height\":")
@@ -1130,6 +1146,14 @@ fn seat_payout_sync(shared: &Arc<Shared>, id: &str, want: &str) {
     }
 }
 
+/// 2.11.13 seat timing defaults (match `scripts/network-2300.env`).
+/// 2.11.13: seat snapshot interval default (`--snapshot-interval-ms`,
+/// `SNAPSHOT_INTERVAL_MS` in scripts/network-2300.env).
+const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 300_000;
+const DEFAULT_PACK_BUDGET_MS: u64 = 5_000;
+const DEFAULT_PROGRESS_TIMEOUT_MS: u64 = 4_000;
+const DEFAULT_MAX_TXS: usize = 200;
+
 #[derive(Parser, Debug)]
 #[command(version = fd_pl::PRODUCT_VERSION)]
 struct Args {
@@ -1145,16 +1169,22 @@ struct Args {
     bond: u64,
     #[arg(long, default_value = "")]
     keys_dir: String,
-    /// Optional hard cap (0 = unlimited — pack only limited by --pack-budget-ms).
-    #[arg(long, default_value_t = 0)]
+    /// Hard cap on txs per block (0 = unlimited — pack only limited by
+    /// --pack-budget-ms). 2.11.13: default 200 (was 0), the live value: a
+    /// 2-vCPU builder holds `node.lock` for the whole pack (11-16 s for
+    /// 250-336 txs), which must stay well under the 14.6 s round-0 timeout.
+    #[arg(long, default_value_t = DEFAULT_MAX_TXS)]
     max_txs: usize,
     /// Pack as many as possible within this many ms (the real limit).
-    #[arg(long, default_value_t = 1000)]
+    /// 2.11.13: default 5000 (was 1000), the value tested live on 2300 on
+    /// 23 Nov 2026, so seats need no per-seat flag.
+    #[arg(long, default_value_t = DEFAULT_PACK_BUDGET_MS)]
     pack_budget_ms: u64,
     /// If #1 produces no tip advance within this many ms (mempool non-empty),
     /// skip them and let the next ranked ponger pack. 0 = disable.
-    /// Default 2500 ≥ pack_budget + multi-host RTT (GROWTH_AND_MEMPOOL).
-    #[arg(long, default_value_t = 2500)]
+    /// 2.11.13: default 4000 (was 2500): 2 s thin-walk hold, 16 s proposal
+    /// timeout, round-0 silence timeout 2 x (pack budget + 2.3 s).
+    #[arg(long, default_value_t = DEFAULT_PROGRESS_TIMEOUT_MS)]
     progress_timeout_ms: u64,
     /// v2.9.59 packer pacing (local; 0 = off): the round-0 winner waits until
     /// this many ms after the height opened before sealing, unless the mempool
@@ -1183,8 +1213,10 @@ struct Args {
     /// Periodically save snapshot to this path (empty = disabled).
     #[arg(long, default_value = "")]
     snapshot_out: String,
-    /// Snapshot save interval ms (default 60s).
-    #[arg(long, default_value_t = 60_000)]
+    /// Snapshot save interval ms. 2.11.13: default 300 s (was 60 s); each
+    /// write competes with packing on a 2 vCPU seat and a restart catches up
+    /// the remaining blocks from peers. Minimum 5 s.
+    #[arg(long, default_value_t = DEFAULT_SNAPSHOT_INTERVAL_MS)]
     snapshot_interval_ms: u64,
     /// Base min fee when mempool idle (escalates by util tier).
     #[arg(long, default_value_t = 1)]
@@ -1306,6 +1338,11 @@ struct HubSnap {
 
 struct Shared {
     node: Mutex<Node>,
+    /// 2.11.13: woken when the tip advances so the next builder packs
+    /// straight away instead of on the next seal tick.
+    seal_wake: tokio::sync::Notify,
+    /// 2.11.13: an off-lock N+1 signature pre-check is running.
+    prepack_busy: std::sync::atomic::AtomicBool,
     /// Write sinks for *inbound* sessions (joiners that dialed us).
     inbound: Mutex<Vec<InboundSink>>,
     /// Indices into fanout that are hub peers (for NeedTxs / preferential tx fan).
@@ -1832,6 +1869,19 @@ impl Shared {
             }
         }
         let mut full = 0usize;
+        // 2.11.13: a live inbound session from a peer means our own dial to
+        // it has yielded (lower seat id dials) or is refused ("we dial
+        // them"). That outbound lane is not drained while it waits out
+        // YIELD_DIAL_SECS, so a NeedLedgers queued there was never sent. A
+        // restarted top-id seat (every peer dials it) queued every pull into
+        // dead lanes and never caught up. Send on the live inbound session.
+        let live_in: Vec<InboundSink> = self
+            .inbound
+            .lock()
+            .iter()
+            .filter(|s| !s.id.is_empty() && !s.close.load(std::sync::atomic::Ordering::Relaxed))
+            .cloned()
+            .collect();
         for k in route.iter().copied() {
             let i = plan.order[k];
             let Some(p) = fanout.get(i) else {
@@ -1844,6 +1894,16 @@ impl Shared {
                 i,
             );
             if slow.contains(&pid) {
+                continue;
+            }
+            let lane_id = peers.get(i).map(|(_, id)| id.as_str()).unwrap_or("");
+            if let Some(s) = live_in.iter().find(|s| !lane_id.is_empty() && s.id == lane_id) {
+                if s.tx.try_send(line.clone(), ConsClass::Other) {
+                    note(&pid);
+                    info!("NeedLedgers → inbound {} (our dial yielded)", s.id);
+                    return;
+                }
+                full += 1;
                 continue;
             }
             if p.catchq.try_send(line.clone(), ConsClass::Other) {
@@ -2300,6 +2360,8 @@ impl Shared {
             return;
         }
         *seen = h;
+        // 2.11.13: the next builder's pre-checked walk is ready now.
+        self.seal_wake.notify_one();
         let winner = n.lottery_packer().unwrap_or_else(|| "-".into());
         info!(
             "round-gap packer-known h={h} winner={winner} parent={}",
@@ -2609,8 +2671,41 @@ const ACCOUNT_HISTORY_LIMIT: usize = 8;
 const ACCOUNT_HISTORY_DISK_HEIGHTS: u64 = 20_000;
 const ACCOUNT_HISTORY_DISK_MS: u64 = 300;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// 2.11.13 (d): the periodic snapshot timer skips missed runs. Tokio's
+/// default (`Burst`) fired every missed tick back-to-back after a stall
+/// (a frozen or swapping seat), so one slow capture became several full
+/// snapshot captures and writes in a row, each taking `node.lock`.
+fn snapshot_ticker(interval_ms: u64) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick
+}
+
+/// 2.11.13 (c): tokio worker floor. A 2-vCPU seat got 2 workers, and one
+/// long `node.lock` holder (snapshot capture, pack root) froze the whole
+/// node for 20-300 s. `TOKIO_WORKER_THREADS` (as set by the live drop-in)
+/// still wins when it is a valid number; otherwise at least 4 workers.
+const MIN_TOKIO_WORKERS: usize = 4;
+
+fn tokio_workers(env: Option<&str>, cpus: usize) -> usize {
+    if let Some(n) = env.and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0) {
+        return n;
+    }
+    cpus.max(MIN_TOKIO_WORKERS)
+}
+
+fn main() -> Result<()> {
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let env = std::env::var("TOKIO_WORKER_THREADS").ok();
+    let workers = tokio_workers(env.as_deref(), cpus);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?
+        .block_on(node_main(workers))
+}
+
+async fn node_main(tokio_workers: usize) -> Result<()> {
     {
         // Same fmt output as before, plus WARN/ERROR copied into the health
         // ring (`falcon.health.v1` `warnings`).
@@ -2625,6 +2720,7 @@ async fn main() -> Result<()> {
             .with(fd_pl::health::WarnCapture)
             .init();
     }
+    info!("tokio worker threads={tokio_workers}");
 
     let mut args = Args::parse();
     let role = NodeRole::parse(&args.role)
@@ -3110,6 +3206,8 @@ async fn main() -> Result<()> {
 
     let shared = Arc::new(Shared {
         node: Mutex::new(node),
+        seal_wake: tokio::sync::Notify::new(),
+        prepack_busy: std::sync::atomic::AtomicBool::new(false),
         inbound: Mutex::new(Vec::new()),
         hub_peer_idxs,
         is_hub: args.hub,
@@ -3288,7 +3386,7 @@ async fn main() -> Result<()> {
         let path = args.snapshot_out.clone();
         let interval = args.snapshot_interval_ms.max(5_000);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval));
+            let mut tick = snapshot_ticker(interval);
             // v2.9.53: the seat's own snapshot is essential (only refused if it
             // would leave < hard reserve); the join + serve copies are optional
             // dumps (skipped under the low-water mark).
@@ -3309,16 +3407,45 @@ async fn main() -> Result<()> {
                 // `node.lock` every minute (seconds on a 2-vCPU seat).
                 // One capture only; the join copy is trimmed from it after the
                 // full file is written (no second deep clone held alongside).
-                let (snap, tip, tip_hash, ring, scheme) = {
+                // 2.11.13 (e): the chain tail (the bulk of the capture) is
+                // copied in short lock holds after the head, then checked
+                // to end at the head's tip and be hash-linked; on any
+                // mismatch fall back to the old one-lock capture.
+                let (head, after, max_chain, tip, tip_hash, ring, scheme) = {
                     let n = shared_c.node.lock();
+                    let (head, after) = n.to_snapshot_head();
                     (
-                        n.to_snapshot(),
+                        head,
+                        after,
+                        n.cfg.max_chain_ledgers,
                         n.tip_height,
                         n.tip_hash.clone(),
                         n.keys.export_publics(),
                         n.keys.scheme,
                     )
                 };
+                let mut tail: Vec<fd_pl::Ledger> = Vec::new();
+                let mut cursor = after;
+                while cursor < tip {
+                    let part = {
+                        let n = shared_c.node.lock();
+                        n.chain_after(cursor, fd_pl::Node::SNAPSHOT_CHAIN_CHUNK)
+                    };
+                    let Some(last) = part.last() else { break };
+                    cursor = last.height;
+                    tail.extend(part);
+                    tokio::task::yield_now().await;
+                }
+                let snap = match fd_pl::Node::finish_chunked_snapshot(head, tail, max_chain) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("snapshot chunked capture fell back to one lock: {e}");
+                        shared_c.node.lock().to_snapshot()
+                    }
+                };
+                // The fallback may have captured a newer tip.
+                let _ = tip_hash;
+                let (tip, tip_hash) = (snap.tip_height, snap.tip_hash.clone());
                 let saved = tokio::task::block_in_place(|| {
                     fd_pl::Node::write_snapshot_checked(&path, &snap, &essential)
                 });
@@ -3495,7 +3622,10 @@ async fn main() -> Result<()> {
             // contains a seat id, is the only seat allowed to seal.
 
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = shared_c.seal_wake.notified() => {}
+                }
                 ntick += 1;
                 // Dish the missing suffix before ordinary SubmitTx, and hold
                 // those seats until this height's walk is queued.
@@ -4018,15 +4148,32 @@ async fn main() -> Result<()> {
                             shared_c.note_walk_ready(open, packable, hold);
                         }
                     }
+                    // 2.11.13 pre-pack: check the next walk's signatures every
+                    // tick (while N's votes arrive, and while the builder
+                    // holds / paces / waits out min_block_interval). The
+                    // Falcon checks run off `node.lock`; pick + store are the
+                    // only locked steps.
+                    use std::sync::atomic::Ordering as AOrd;
+                    if !shared_c.prepack_busy.load(AOrd::Acquire) {
+                        if let Some(plan) = n.prepack_plan() {
+                            if plan.todo_len() == 0 {
+                                n.apply_prepack(plan.verify());
+                            } else {
+                                shared_c.prepack_busy.store(true, AOrd::Release);
+                                let sh = shared_c.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let done = plan.verify();
+                                    sh.node.lock().apply_prepack(done);
+                                    sh.prepack_busy.store(false, AOrd::Release);
+                                });
+                            }
+                        }
+                    }
                     if n.in_skip_grace() {
                         // wait
                     } else if !n.tip_is_soft() {
                         // wait for soft QC before packing next height
                     } else if n.pending_proposal.is_some() {
-                        // Votes for this height are still arriving. Check the
-                        // next block's signatures now so the following proposal
-                        // can go out when this quorum lands.
-                        n.warm_pipeline();
                         // Proposal in flight — wait for soft QC. Do **not** clone
                         // the full Falcon body every 200ms tick (was ~100KB × 5/s).
                         let elapsed = n.now_ms.saturating_sub(n.height_open_ms);
@@ -4190,15 +4337,39 @@ async fn main() -> Result<()> {
                                 let parent = n.chain.last().map(|l| l.sealed_at_ms).unwrap_or(0);
                                 n.now_ms = parent.saturating_add(1_000);
                             }
+                            let t_pack = std::time::Instant::now();
                             match n.pack_or_skip(&my_id) {
                                 Ok(Some(mut ledger)) => {
+                                    let pack_ms = t_pack.elapsed().as_millis();
                                     n.pack_over_budget = false;
+                                    let t_merkle = std::time::Instant::now();
                                     if let Err(e) = ledger.attach_merkle_batch_known(&n.keys, &|id| {
                                         n.account_public_key(id)
                                     }) {
                                         warn!("merkle batch: {e}");
                                     }
-                                    match n.accept_ledger(&ledger) {
+                                    let merkle_ms = t_merkle.elapsed().as_millis();
+                                    let t_accept = std::time::Instant::now();
+                                    let accepted = n.accept_ledger(&ledger);
+                                    let accept_ms = t_accept.elapsed().as_millis();
+                                    {
+                                        // 2.11.13: where the time under node.lock goes.
+                                        let p = n.pack_phases;
+                                        let (full, hits) = fd_pl::exec_map::root_stats();
+                                        info!(
+                                            "pack-phases h={} txs={} pack_ms={pack_ms} sanitize_ms={} clone_ms={} hook_ms={} apply_ms={} root_ms={} merkle_ms={merkle_ms} accept_ms={accept_ms} stage_ms={} stage_root_ms={} root_full={full} root_hits={hits}",
+                                            ledger.height,
+                                            ledger.txs.len(),
+                                            p.sanitize_us / 1000,
+                                            p.clone_us / 1000,
+                                            p.hook_us / 1000,
+                                            p.apply_us / 1000,
+                                            p.root_us / 1000,
+                                            p.stage_us / 1000,
+                                            p.stage_root_us / 1000,
+                                        );
+                                    }
+                                    match accepted {
                                         Ok(r) => {
                                             let committed = n.tip_height >= r.height
                                                 && n.tip_hash == ledger.ledger_hash;
@@ -7823,6 +7994,8 @@ mod inbound_ack_tests {
         }
         Arc::new(Shared {
             node: parking_lot::Mutex::new(node),
+            seal_wake: tokio::sync::Notify::new(),
+            prepack_busy: std::sync::atomic::AtomicBool::new(false),
             inbound: parking_lot::Mutex::new(Vec::new()),
             hub_peer_idxs: Vec::new(),
             is_hub: true,
@@ -7857,6 +8030,56 @@ mod inbound_ack_tests {
             gap_dish: parking_lot::Mutex::new(0),
             gap_walk: parking_lot::Mutex::new((0, String::new())),
         })
+    }
+
+    /// 2.11.13 regression: restarted v6 (every peer dials it) queued every
+    /// NeedLedgers into yielded outbound lanes and never caught up.
+    #[test]
+    fn catchup_pull_goes_to_live_inbound_when_our_dial_yielded() {
+        let sh = test_shared("v6");
+        sh.node.lock().validators.get_mut("v9").unwrap().last_advertised_tip = Some(50);
+        let mk_out = || {
+            let (cons, _a) = byte_tx(64, 1 << 20);
+            let (txq, _b) = byte_tx(64, 1 << 20);
+            let (bodyq, _c) = byte_tx(64, 1 << 20);
+            let (catchq, rx) = byte_tx(64, 1 << 20);
+            let p = PeerOut {
+                cons,
+                txq,
+                bodyq,
+                catchq,
+                peer_id: Arc::new(parking_lot::Mutex::new("v9".into())),
+                large_out: Arc::new(LargeGate::new()),
+            };
+            (p, rx, _a, _b, _c)
+        };
+        let pull = WireMsg::NeedLedgers { from_height: 1, max_count: 64 };
+        // No inbound session: the outbound lane is the route (unchanged).
+        let (p, mut out_rx, _a, _b, _c) = mk_out();
+        let fanout = Arc::new(vec![p]);
+        sh.fan_catchup(&fanout, &pull);
+        assert!(out_rx.try_recv().is_ok(), "outbound lane used without inbound");
+        // v9 dials us (live inbound): the pull must use that session, not
+        // the yielded outbound lane nobody drains.
+        let (p, mut out_rx, _a2, _b2, _c2) = mk_out();
+        let fanout = Arc::new(vec![p]);
+        let (in_tx, mut in_rx) = byte_tx(64, 1 << 20);
+        sh.inbound.lock().push(InboundSink {
+            id: "v9".into(),
+            tx: in_tx,
+            close: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            large_out: Arc::new(LargeGate::new()),
+        });
+        *sh.ledger_slow.lock() = fd_pl::catchup_slow::LedgerSlowList::default();
+        sh.fan_catchup(&fanout, &pull);
+        let got = in_rx.try_recv().expect("pull sent on the live inbound session");
+        assert_eq!(serde_json::to_value(serde_json::from_str::<WireMsg>(got.trim()).unwrap()).unwrap(), serde_json::to_value(&pull).unwrap());
+        assert!(out_rx.try_recv().is_err(), "nothing queued on the yielded lane");
+        // A closed inbound session falls back to the outbound lane.
+        sh.inbound.lock()[0].close.store(true, std::sync::atomic::Ordering::Relaxed);
+        *sh.ledger_slow.lock() = fd_pl::catchup_slow::LedgerSlowList::default();
+        sh.fan_catchup(&fanout, &pull);
+        assert!(out_rx.try_recv().is_ok());
     }
 
     fn big_line() -> String {
@@ -9406,5 +9629,99 @@ mod local_rpc_tests {
         let t = tokio::time::Instant::now();
         pace_line_with(&sess, &global, &seat, br#"{"type":"ledgers_batch","ledgers":[]}"#).await;
         assert!(t.elapsed() < Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod timing_default_tests {
+    //! 2.11.13 (b): seat timing defaults need no per-seat flags.
+    use super::*;
+
+    fn profile(key: &str) -> u64 {
+        let env = include_str!("../../scripts/network-2300.env");
+        env.lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{key} in network-2300.env"))
+    }
+
+    #[test]
+    fn cli_defaults_are_the_tested_live_values() {
+        let a = Args::try_parse_from(["falcon-pl-node", "--id", "v1"]).unwrap();
+        assert_eq!(a.pack_budget_ms, 5_000);
+        assert_eq!(a.progress_timeout_ms, 4_000);
+        assert_eq!(a.max_txs, 200);
+        assert_eq!(a.snapshot_interval_ms, 300_000);
+    }
+
+    #[test]
+    fn network_profile_matches_cli_defaults() {
+        assert_eq!(profile("PACK_BUDGET_MS"), DEFAULT_PACK_BUDGET_MS);
+        assert_eq!(profile("PROGRESS_TIMEOUT_MS"), DEFAULT_PROGRESS_TIMEOUT_MS);
+        assert_eq!(profile("MAX_TXS") as usize, DEFAULT_MAX_TXS);
+        assert_eq!(profile("SNAPSHOT_INTERVAL_MS"), DEFAULT_SNAPSHOT_INTERVAL_MS);
+    }
+
+    #[test]
+    fn defaults_fit_round0_timeouts() {
+        let n = fd_pl::Node::new(
+            "v1",
+            fd_pl::ChainConfig {
+                pack_budget_ms: DEFAULT_PACK_BUDGET_MS,
+                progress_timeout_ms: DEFAULT_PROGRESS_TIMEOUT_MS,
+                ..Default::default()
+            },
+            fd_pl::crypto::KeyRing::new(fd_pl::crypto::CryptoScheme::HmacDev),
+            &[],
+        );
+        // Hold + pack + slack inside the round-0 silence timeout peers
+        // apply to a live builder.
+        let round0 = n.live_pack_timeout_ms() * 2;
+        assert!(n.hold_cap_ms() + DEFAULT_PACK_BUDGET_MS + fd_pl::Node::LIVE_PACK_SLACK_MS <= round0);
+        assert_eq!(n.proposal_timeout_ms(), 16_000);
+    }
+}
+
+#[cfg(test)]
+mod tokio_worker_tests {
+    //! 2.11.13 (c): worker floor of 4; TOKIO_WORKER_THREADS still overrides.
+    use super::*;
+
+    #[test]
+    fn floor_of_four_on_small_boxes() {
+        assert_eq!(tokio_workers(None, 1), 4);
+        assert_eq!(tokio_workers(None, 2), 4);
+        assert_eq!(tokio_workers(None, 4), 4);
+        assert_eq!(tokio_workers(None, 32), 32);
+    }
+
+    #[test]
+    fn env_override_wins_when_valid() {
+        assert_eq!(tokio_workers(Some("6"), 2), 6);
+        assert_eq!(tokio_workers(Some(" 2 "), 32), 2);
+        assert_eq!(tokio_workers(Some("0"), 2), 4, "0 is not a valid count");
+        assert_eq!(tokio_workers(Some("lots"), 2), 4);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_timer_tests {
+    //! 2.11.13 (d): a stalled snapshot loop runs once, not once per missed tick.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missed_snapshot_ticks_are_skipped_not_burst() {
+        let mut tick = snapshot_ticker(40);
+        tick.tick().await; // first tick is immediate
+        std::thread::sleep(Duration::from_millis(300)); // ~7 missed ticks
+        tick.tick().await; // the one catch-up run
+        let t = Instant::now();
+        tick.tick().await;
+        assert!(
+            t.elapsed() >= Duration::from_millis(15),
+            "next run waits for the schedule (burst would fire immediately): {:?}",
+            t.elapsed()
+        );
     }
 }

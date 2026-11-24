@@ -69,6 +69,7 @@ fn rlp_exec(number: u64, parent: [u8; 32], receipts: [u8; 32]) -> EthExecHeader 
         parent_hash: hex::encode(parent),
         receipts_root: hex::encode(receipts),
         rlp_hex: hex::encode(&rlp),
+        timestamp: 0,
     }
 }
 
@@ -90,6 +91,7 @@ fn fake(n: u64) -> EthExecHeader {
         parent_hash: format!("{:064x}", n),
         receipts_root: "00".repeat(32),
         rlp_hex: "aa".into(),
+        timestamp: 0,
     }
 }
 

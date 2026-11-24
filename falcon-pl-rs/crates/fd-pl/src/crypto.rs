@@ -643,6 +643,18 @@ impl KeyRing {
         }
     }
 
+    /// 2.11.13: a public-only ring for `ids` (no secrets), for signature
+    /// checks done off the node lock.
+    pub fn publics_only<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut out = Self::new(self.scheme);
+        for id in ids {
+            if let Some(pk) = self.publics.get(id) {
+                let _ = out.insert_public(id, &pk.to_hex());
+            }
+        }
+        out
+    }
+
     pub fn export_publics(&self) -> BTreeMap<String, String> {
         self.publics
             .iter()

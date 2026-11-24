@@ -29,6 +29,22 @@ fn users() -> Vec<(String, u64)> {
     vec![("alice".into(), 1_000_000), ("bob".into(), 1_000_000)]
 }
 
+/// Serializes the tests that set or read `FPL_UTC_HELLO_ENFORCE_FROM_HEIGHT`
+/// (process-wide env; the test harness runs tests in parallel threads). The
+/// guard also clears the var on drop, so a failing test cannot leak it.
+static UTC_ENFORCE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+struct EnforceEnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+impl Drop for EnforceEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(utc_header::ENV_UTC_HELLO_ENFORCE_FROM_HEIGHT);
+    }
+}
+fn enforce_env_lock() -> EnforceEnvGuard {
+    let g = UTC_ENFORCE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var(utc_header::ENV_UTC_HELLO_ENFORCE_FROM_HEIGHT);
+    EnforceEnvGuard(g)
+}
+
 struct UtcOverrides;
 impl Drop for UtcOverrides {
     fn drop(&mut self) {
@@ -174,6 +190,7 @@ fn rehearsal_serde_restart_roundtrip_preserves_utc_commitment() {
 
 #[test]
 fn rehearsal_old_peer_capability_soft_gap_vs_hard_enforce() {
+    let _env = enforce_env_lock();
     let _g = arm_rehearsal();
     // Soft gap when tip past H_utc and peer has no cap
     let gap = utc_peer_capability_gap(H_UTC, H_UTC, &[]);
@@ -204,6 +221,7 @@ fn rehearsal_old_peer_capability_soft_gap_vs_hard_enforce() {
 
 #[test]
 fn rehearsal_production_defaults_stay_unarmed() {
+    let _env = enforce_env_lock();
     // Clear any leftover override for 2300
     set_utc_from_height_override(NETWORK_ID_PUBLIC_TESTNET_2300, None);
     assert_eq!(
@@ -347,6 +365,7 @@ fn rehearsal_multinode_unarmed_stays_zero_utc_across_seats() {
 
 #[test]
 fn rehearsal_hello_enforce_env_ignored_on_2300() {
+    let _env = enforce_env_lock();
     // Safety: even if env is set, 2300 stays disabled.
     std::env::set_var(utc_header::ENV_UTC_HELLO_ENFORCE_FROM_HEIGHT, "1");
     assert_eq!(
@@ -558,6 +577,7 @@ fn rehearsal_node_pack_clock_skewed_peer_rejected_by_live_admission() {
 
 #[test]
 fn rehearsal_hello_lead_window_matrix() {
+    let _env = enforce_env_lock();
     let _g = UtcOverrides;
     use utc_header::{utc_hello_hard_close_from as f, PROPOSED_UTC_HELLO_LEAD_BLOCKS as LEAD};
     const H: u64 = 5_000;
@@ -602,6 +622,7 @@ fn rehearsal_hello_lead_window_matrix() {
 
 #[test]
 fn rehearsal_hello_lead_window_inert_on_2300_defaults() {
+    let _env = enforce_env_lock();
     let _g = UtcOverrides;
     struct Clear2300;
     impl Drop for Clear2300 {

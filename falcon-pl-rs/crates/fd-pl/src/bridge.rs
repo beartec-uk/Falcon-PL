@@ -38,6 +38,15 @@ pub const HEADER_RETAIN_SECS: u64 = 14 * 24 * 60 * 60;
 /// Safety cap if a difficulty-1 sprint runs the whole retention window.
 /// 500k headers is about six days at one block per second.
 pub const HEADER_HARD_CAP: usize = 500_000;
+/// 2.11.13 bridge slim: BTC rail header cap from the activation height on
+/// (replaces [`HEADER_HARD_CAP`] for that rail; vault-pinned heights extra).
+/// 32,768 headers is ~14 MB of state, and at least ~227 days at 10 min blocks
+/// (~9 h in a one-block-per-second difficulty-1 sprint).
+pub const SLIM_HEADER_CAP: usize = 32_768;
+/// 2.11.13 bridge slim: headers the superseded testnet3 rail (`btc`) keeps at
+/// the activation (two retarget periods: tip/parent continuity, last real
+/// bits, reorg depth), plus every height pinned by a vault UTXO.
+pub const SLIM_LEGACY_BTC_KEEP: usize = 4_032;
 
 /// Rolling window of ETH execution headers kept behind the light-client head
 /// (~7 days at a 12s slot). Headers with `number < eth_exec_prune_floor` are dropped.
@@ -309,8 +318,9 @@ pub struct RailState {
     pub tip_merkle_root: String,
     pub total_minted: u64,
     pub total_burned: u64,
-    /// height -> header
-    pub headers: BTreeMap<u64, RailHeader>,
+    /// height -> header. 2.11.13: copy-on-write with a cached JSON encoding
+    /// (same bytes as the `BTreeMap`; mutate via `make_mut()`).
+    pub headers: crate::exec_map::RailHeaderMap,
     /// spent external txids (deposits)
     pub spent_deposits: BTreeSet<String>,
     /// open withdraw notes: note_id -> (amount, external_to, from)
@@ -394,6 +404,11 @@ pub struct RailState {
     /// serialized) before activation, so the commitment is unchanged until then.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub btc_side: BTreeMap<String, RailHeader>,
+    /// 2.11.13 bridge slim: header cap set at the activation
+    /// ([`SLIM_HEADER_CAP`]); `0` = [`HEADER_HARD_CAP`]. Omitted while zero,
+    /// so the commitment is unchanged before the activation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub header_cap: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -439,7 +454,7 @@ impl RailState {
             tip_merkle_root: String::new(),
             total_minted: 0,
             total_burned: 0,
-            headers: BTreeMap::new(),
+            headers: Default::default(),
             spent_deposits: BTreeSet::new(),
             withdrawals: BTreeMap::new(),
             vault_utxos: Vec::new(),
@@ -463,6 +478,7 @@ impl RailState {
             btc_fork: Vec::new(),
             btc_fork_alt: Vec::new(),
             btc_side: BTreeMap::new(),
+            header_cap: 0,
         }
     }
 
@@ -852,7 +868,7 @@ impl RailState {
         // Old main suffix becomes a side branch (it may win back later).
         let old: Vec<u64> = self.headers.range(fork_h + 1..).map(|(k, _)| *k).collect();
         for k in old {
-            if let Some(o) = self.headers.remove(&k) {
+            if let Some(o) = self.headers.make_mut().remove(&k) {
                 self.btc_side.insert(Self::btc_side_key(&o.hash), o);
             }
         }
@@ -861,7 +877,7 @@ impl RailState {
             self.tip_height = b.height;
             self.tip_hash = b.hash.clone();
             self.tip_merkle_root = b.merkle_root.clone();
-            self.headers.insert(b.height, b);
+            self.headers.make_mut().insert(b.height, b);
         }
         let lrb = self.btc_last_real_bits(self.tip_height, 0);
         if lrb != 0 {
@@ -1242,7 +1258,7 @@ impl RailState {
             self.tip_merkle_root.clone(),
             self.last_real_bits,
         );
-        self.headers.retain(|k, _| *k < start);
+        self.headers.make_mut().retain(|k, _| *k < start);
         self.tip_height = ancestor.height;
         self.tip_hash = ancestor.hash.clone();
         self.tip_merkle_root = ancestor.merkle_root.clone();
@@ -1292,7 +1308,7 @@ impl RailState {
                     return Err("BTC header does not match frozen checkpoint".into());
                 }
             }
-            self.headers.clear();
+            self.headers.make_mut().clear();
             return self.commit_header(h, true);
         }
 
@@ -1322,7 +1338,7 @@ impl RailState {
                 return Err("BTC bits do not follow parent / testnet min-diff".into());
             }
             let cut = h.height;
-            self.headers.retain(|k, _| *k < cut);
+            self.headers.make_mut().retain(|k, _| *k < cut);
             self.tip_height = ancestor.height;
             self.tip_hash = ancestor.hash;
             self.tip_merkle_root = ancestor.merkle_root;
@@ -1420,7 +1436,7 @@ impl RailState {
         self.tip_height = h.height;
         self.tip_hash = h.hash.clone();
         self.tip_merkle_root = h.merkle_root.clone();
-        self.headers.insert(h.height, h);
+        self.headers.make_mut().insert(h.height, h);
         self.prune_btc_headers();
         Ok(())
     }
@@ -1453,11 +1469,16 @@ impl RailState {
             .unwrap_or(0);
         let cutoff = tip_ts.saturating_sub(HEADER_RETAIN_SECS);
         // Sprint cap first: drop the oldest non-vault header.
-        while self.headers.len() > HEADER_HARD_CAP {
+        let hard_cap = if self.header_cap > 0 {
+            self.header_cap as usize
+        } else {
+            HEADER_HARD_CAP
+        };
+        while self.headers.len() > hard_cap {
             let Some(k) = self.headers.keys().copied().find(|hgt| !keep.contains(hgt)) else {
                 break;
             };
-            self.headers.remove(&k);
+            self.headers.make_mut().remove(&k);
         }
         // Then drop only headers older than the claim window, and never below
         // HEADER_HISTORY. A deposit from a few days ago stays claimable.
@@ -1471,7 +1492,31 @@ impl RailState {
             }) else {
                 break;
             };
-            self.headers.remove(&k);
+            self.headers.make_mut().remove(&k);
+        }
+    }
+
+    /// 2.11.13 bridge slim (activation, once): set the post-activation cap,
+    /// keep the newest `keep` headers and, below them, only heights pinned by
+    /// a vault UTXO, the checkpoint or the tip. Deterministic (key order).
+    pub fn slim_btc_headers(&mut self, keep: usize) {
+        self.header_cap = SLIM_HEADER_CAP as u64;
+        let mut pinned = vault::vault_header_heights(&self.vault_utxos);
+        if let Some((h, _)) = &self.btc_checkpoint {
+            pinned.insert(*h);
+        }
+        pinned.insert(self.tip_height);
+        if keep == 0 || self.headers.len() <= keep {
+            return;
+        }
+        // Newest `keep` keys stay; below them only pinned heights stay.
+        let Some(floor) = self.headers.keys().rev().nth(keep - 1).copied() else {
+            return;
+        };
+        if self.headers.range(..floor).any(|(k, _)| !pinned.contains(k)) {
+            self.headers
+                .make_mut()
+                .retain(|k, _| *k >= floor || pinned.contains(k));
         }
     }
 
@@ -1543,7 +1588,7 @@ impl RailState {
             if self.headers.contains_key(ht) {
                 return Err(format!("backfill height {ht} already stored"));
             }
-            self.headers.insert(
+            self.headers.make_mut().insert(
                 *ht,
                 RailHeader {
                     height: *ht,
@@ -2682,6 +2727,16 @@ pub struct BridgeState {
     /// refused before the bridge height). Part of the state root once used.
     #[serde(default, skip_serializing_if = "crate::operator_registry::OperatorRegistry::is_empty")]
     pub operators: crate::operator_registry::OperatorRegistry,
+    /// 2.11.13 bridge slim: set by [`Self::bridge_slim_convert`] at the
+    /// activation height. From then on stored ETH exec headers are compact
+    /// and BTC rails carry [`RailState::header_cap`]. Omitted while false, so
+    /// the commitment is unchanged before the activation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bridge_slim: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// One resolved V3 deposit. Mint credits an FPL account and writes no claim
@@ -2882,6 +2937,41 @@ impl BridgeState {
         }
     }
 
+    /// 2.11.13 bridge slim (D+E). CONSENSUS, called from the per-ledger hook
+    /// (pack, verify, commit) from the activation height on; a no-op once
+    /// [`Self::bridge_slim`] is set, so it runs exactly once per chain:
+    /// * E: every stored ETH exec header is compacted to (number, hash,
+    ///   parent, receipts_root, timestamp); later inserts compact after
+    ///   their RLP is verified.
+    /// * D: the superseded testnet3 rail (`btc`) keeps its newest
+    ///   [`SLIM_LEGACY_BTC_KEEP`] headers plus vault-pinned heights; every BTC
+    ///   rail gets the [`SLIM_HEADER_CAP`] cap.
+    ///
+    /// Returns whether it converted.
+    pub fn bridge_slim_convert(&mut self) -> bool {
+        if self.bridge_slim {
+            return false;
+        }
+        self.bridge_slim = true;
+        if self.eth_exec_headers.values().any(|h| !h.rlp_hex.is_empty()) {
+            for h in self.eth_exec_headers.make_mut().values_mut() {
+                crate::eth_exec::compact_exec_header(h);
+            }
+        }
+        for (name, r) in self.rails.iter_mut() {
+            if !r.is_btc() {
+                continue;
+            }
+            let keep = if name == RAIL_BTC {
+                SLIM_LEGACY_BTC_KEEP
+            } else {
+                SLIM_HEADER_CAP
+            };
+            r.slim_btc_headers(keep);
+        }
+        true
+    }
+
     /// One-off V1 close. `active` is `Node::eth_v3_at(height)`.
     ///
     /// Called from the same per-ledger hook as [`Self::prune_eth_exec_headers`]
@@ -3013,6 +3103,12 @@ impl BridgeState {
         if headers.is_empty() {
             return Err("no headers".into());
         }
+        // 2.11.13: the timestamp is derived from the verified RLP when a
+        // stored header is compacted. A submitted value is ignored, exactly
+        // as older nodes' parsers drop the unknown field.
+        for h in headers.iter_mut() {
+            h.timestamp = 0;
+        }
         for h in &headers {
             crate::eth_exec::verify_exec_header_rlp(h)?;
         }
@@ -3065,8 +3161,12 @@ impl BridgeState {
         if !ends_at_lc && !connects_up && !connects_down {
             return Err("headers neither reach LC head nor connect to stored chain".into());
         }
+        let slim = self.bridge_slim;
         let map = self.eth_exec_headers.make_mut();
-        for h in headers {
+        for mut h in headers {
+            if slim {
+                crate::eth_exec::compact_exec_header(&mut h);
+            }
             map.insert(h.number, h);
         }
         Ok(())
@@ -3116,7 +3216,10 @@ impl BridgeState {
                 "no execution header at {dep_n} — submit EthExecHeaders first"
             ));
         }
-        let dep_hdr = crate::eth_exec::verify_ancestry(&chain, &lc.execution_block_hash, dep_n)?;
+        // 2.11.13: compacted headers (RLP verified on insert) are checked by
+        // their stored links; identical to `verify_ancestry` before slim.
+        let dep_hdr =
+            crate::eth_exec::verify_ancestry_stored(&chain, &lc.execution_block_hash, dep_n)?;
         if !proof.block_hash.is_empty() && !crate::btc_spv::hex_eq(&proof.block_hash, &dep_hdr.hash)
         {
             return Err("block_hash mismatch".into());
@@ -3130,11 +3233,12 @@ impl BridgeState {
             &proof.merkle_path,
             &receipt,
         )?;
-        let head_rlp = chain
-            .last()
-            .map(|h| h.rlp_hex.as_str())
-            .unwrap_or("");
-        let lc_head_time = Self::eth_lc_head_unix_time(lc, head_rlp);
+        let lc_head_time = match chain.last() {
+            // 2.11.13 compact head: timestamp decoded from the verified RLP.
+            Some(h) if h.rlp_hex.is_empty() && h.timestamp != 0 => h.timestamp,
+            Some(h) => Self::eth_lc_head_unix_time(lc, &h.rlp_hex),
+            None => Self::eth_lc_head_unix_time(lc, ""),
+        };
         Ok((receipt, dep_number, lc_head_time))
     }
 
@@ -3511,6 +3615,7 @@ mod tests {
             parent_hash: hex::encode(parent),
             receipts_root: hex::encode(receipts),
             rlp_hex: hex::encode(&rlp),
+            timestamp: 0,
         }
     }
 
@@ -3614,7 +3719,7 @@ mod tests {
         });
         // commit many headers; height 1 must remain because of the UTXO
         for i in 1..300u64 {
-            r.headers.insert(
+            r.headers.make_mut().insert(
                 i,
                 RailHeader {
                     height: i,
@@ -3973,7 +4078,7 @@ mod tests {
         for h in 200..=205u64 {
             let mut hdr = RailHeader::fixture(h, format!("{h:064x}"), format!("{:064x}", h - 1), if h == 200 { root_display.clone() } else { "00".repeat(32) });
             hdr.raw = "00".repeat(80);
-            rail.headers.insert(h, hdr);
+            rail.headers.make_mut().insert(h, hdr);
         }
         rail.tip_height = 205;
         let ckpt_h = 127u64;
@@ -4188,5 +4293,173 @@ mod tests {
         }, &vkb, 200).is_err());
         // Claim not awaiting attest.
         assert!(run(&|f| f.rail.bitvm2_claims.get_mut(&f.note).unwrap().status = crate::bitvm2_exit::Bitvm2Status::Disproved, &vkb, 200).is_err());
+    }
+}
+
+#[cfg(test)]
+mod slim_tests {
+    //! 2.11.13 bridge slim (D: BTC rails) and the bounded-growth simulations.
+    use super::*;
+
+    /// 80-byte header hex with `time` at bytes 68..72 (all other bytes zero).
+    fn raw_at(time: u32) -> String {
+        let mut b = [0u8; 80];
+        b[68..72].copy_from_slice(&time.to_le_bytes());
+        hex::encode(b)
+    }
+
+    fn hdr(h: u64, time: u32) -> RailHeader {
+        let mut x = RailHeader::fixture(h, format!("{h:064x}"), format!("{:064x}", h.saturating_sub(1)), "00".repeat(32));
+        x.raw = raw_at(time);
+        x
+    }
+
+    fn rail_with(asset: &str, from: u64, to: u64) -> RailState {
+        let mut r = RailState::new(asset);
+        {
+            let m = r.headers.make_mut();
+            for h in from..=to {
+                m.insert(h, hdr(h, 1_000_000_000 + (h % 1_000_000) as u32 * 600));
+            }
+        }
+        r.tip_height = to;
+        r.tip_hash = format!("{to:064x}");
+        r
+    }
+
+    #[test]
+    fn legacy_rail_keeps_newest_plus_vault_pins_and_pending_withdrawals_survive() {
+        let mut b = BridgeState::with_genesis_rails();
+        let mut r = rail_with(RAIL_BTC, 5_127_316, 5_140_000);
+        // The live audit: three vault UTXOs pinned to old heights, one open
+        // dest-locked claim and two refunded BitVM2 claims (no header refs).
+        for (h, sats) in [(5_127_316u64, 100_000u64), (5_127_613, 180_385), (5_127_675, 88_985)] {
+            r.vault_utxos.push(crate::vault::VaultUtxo { txid: format!("{h:064x}"), vout: 0, sats, height: h });
+        }
+        r.withdrawals.insert("bac114a2e2edc941".into(), (50_000, "tb1qdest".into(), "dave".into()));
+        b.rails.insert(RAIL_BTC.into(), r);
+        let mut r4 = rail_with(RAIL_BTC4, 100_000, 107_852);
+        r4.btc_checkpoint = Some((100_000, format!("{:064x}", 100_000)));
+        b.rails.insert(RAIL_BTC4.into(), r4);
+        let before4 = serde_json::to_vec(&b.rails[RAIL_BTC4].headers).unwrap();
+        let mut c = b.clone();
+        assert!(b.bridge_slim_convert());
+        assert!(c.bridge_slim_convert());
+        assert_eq!(serde_json::to_vec(&b).unwrap(), serde_json::to_vec(&c).unwrap());
+        let r = &b.rails[RAIL_BTC];
+        assert_eq!(r.headers.len(), SLIM_LEGACY_BTC_KEEP + 3);
+        for h in [5_127_316u64, 5_127_613, 5_127_675, 5_140_000] {
+            assert!(r.headers.contains_key(&h), "{h} kept");
+        }
+        assert_eq!(*r.headers.keys().nth(3).unwrap(), 5_140_000 - SLIM_LEGACY_BTC_KEEP as u64 + 1);
+        assert_eq!(r.header_cap, SLIM_HEADER_CAP as u64);
+        assert_eq!(r.withdrawals.len(), 1, "withdrawals untouched");
+        assert_eq!(r.btc_header_floor(), 5_140_000 - SLIM_LEGACY_BTC_KEEP as u64 + 1);
+        // BTC4 (7,853 headers) is below the cap: unchanged headers, cap set.
+        assert_eq!(serde_json::to_vec(&b.rails[RAIL_BTC4].headers).unwrap(), before4);
+        assert_eq!(b.rails[RAIL_BTC4].header_cap, SLIM_HEADER_CAP as u64);
+        // Idempotent.
+        let once = serde_json::to_vec(&b).unwrap();
+        assert!(!b.bridge_slim_convert());
+        assert_eq!(serde_json::to_vec(&b).unwrap(), once);
+    }
+
+    #[test]
+    fn pre_activation_rail_bytes_unchanged() {
+        let r = rail_with(RAIL_BTC4, 1, 50);
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("header_cap").is_none());
+        let b = BridgeState::with_genesis_rails();
+        let v = serde_json::to_value(&b).unwrap();
+        assert!(v.get("bridge_slim").is_none());
+    }
+
+    /// Bounded growth, BTC: a difficulty-1 sprint (one header per second,
+    /// every header inside the 14-day window) used to stop only at
+    /// HEADER_HARD_CAP (500k, ~217 MB JSON). After slim it stops at
+    /// SLIM_HEADER_CAP plus vault pins.
+    #[test]
+    fn btc4_sprint_is_capped_after_slim() {
+        let mut r = RailState::new(RAIL_BTC4);
+        r.header_cap = SLIM_HEADER_CAP as u64;
+        r.vault_utxos.push(crate::vault::VaultUtxo { txid: "aa".repeat(32), vout: 0, sats: 1, height: 1 });
+        let mut max_len = 0;
+        // Prune every 512 inserts (the scan per prune is O(n) in debug).
+        for h in 1..=(SLIM_HEADER_CAP as u64 + 8_000) {
+            r.headers.make_mut().insert(h, hdr(h, 1_800_000_000 + h as u32));
+            r.tip_height = h;
+            if h % 512 == 0 {
+                r.prune_btc_headers();
+                max_len = max_len.max(r.headers.len());
+            }
+        }
+        r.prune_btc_headers();
+        assert_eq!(max_len, SLIM_HEADER_CAP);
+        assert_eq!(r.headers.len(), SLIM_HEADER_CAP);
+        assert!(r.headers.contains_key(&1), "vault pin survives");
+        let bytes = serde_json::to_vec(&r.headers).unwrap().len();
+        eprintln!("SIM btc4 sprint steady headers={} json_bytes={bytes}", r.headers.len());
+        // Normal 10-minute blocks: the 14-day window (~2,016) is under the
+        // HEADER_HISTORY floor, so the steady state is 16,384 headers.
+        let mut r = RailState::new(RAIL_BTC4);
+        r.header_cap = SLIM_HEADER_CAP as u64;
+        for h in 1..=(HEADER_HISTORY as u64 + 5_000) {
+            r.headers.make_mut().insert(h, hdr(h, 1_800_000_000 + h as u32 * 600));
+            r.tip_height = h;
+            if h % 512 == 0 {
+                r.prune_btc_headers();
+            }
+        }
+        r.prune_btc_headers();
+        assert_eq!(r.headers.len(), HEADER_HISTORY);
+        let bytes = serde_json::to_vec(&r.headers).unwrap().len();
+        eprintln!("SIM btc4 10min steady headers={} json_bytes={bytes}", r.headers.len());
+    }
+
+    /// Bounded growth, ETH: the LC head moves one block at a time for 1.5
+    /// windows; the compact map stays at WINDOW + 1 headers.
+    #[test]
+    fn eth_compact_window_is_bounded() {
+        let mut b = BridgeState::with_genesis_rails();
+        b.bridge_slim = true;
+        b.eth_lc = Some(crate::eth_lc::EthLcState {
+            genesis_validators_root: String::new(),
+            finalized_slot: 0,
+            finalized_beacon_root: String::new(),
+            execution_block_hash: String::new(),
+            execution_number: 0,
+            receipts_root: String::new(),
+            period: 0,
+            current_agg_pk: String::new(),
+            current_pks: vec![],
+            next_agg_pk: String::new(),
+            next_pks: vec![],
+        });
+        let total = ETH_EXEC_HEADER_WINDOW + ETH_EXEC_HEADER_WINDOW / 2;
+        let start = 12_000_000u64;
+        let mut max_len = 0usize;
+        for i in 0..total {
+            let n = start + i;
+            b.eth_exec_headers.make_mut().insert(
+                n,
+                crate::eth_exec::EthExecHeader {
+                    number: n,
+                    hash: format!("{:064x}", n + 1),
+                    parent_hash: format!("{n:064x}"),
+                    receipts_root: format!("{:064x}", n * 7),
+                    rlp_hex: String::new(),
+                    timestamp: 1_790_000_000 + i * 12,
+                },
+            );
+            b.eth_lc.as_mut().unwrap().execution_number = n;
+            if i % 64 == 0 || i + 1 == total {
+                b.prune_eth_exec_headers(true);
+                max_len = max_len.max(b.eth_exec_headers.len());
+            }
+        }
+        assert_eq!(b.eth_exec_headers.len() as u64, ETH_EXEC_HEADER_WINDOW + 1);
+        assert!(max_len as u64 <= ETH_EXEC_HEADER_WINDOW + 65);
+        let bytes = serde_json::to_vec(&b.eth_exec_headers).unwrap().len();
+        eprintln!("SIM eth compact steady headers={} json_bytes={bytes}", b.eth_exec_headers.len());
     }
 }

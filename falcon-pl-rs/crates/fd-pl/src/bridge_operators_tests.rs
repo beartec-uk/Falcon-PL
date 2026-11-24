@@ -75,7 +75,7 @@ fn mine(n: &mut Node, raw: &[u8], h: u64, tip: u64) -> String {
         let root = if x == h { tx.txid_display.clone() } else { "00".repeat(32) };
         let mut hdr = RailHeader::fixture(x, format!("{x:064x}"), format!("{:064x}", x - 1), root);
         hdr.raw = "00".repeat(80);
-        r.headers.insert(x, hdr);
+        r.headers.make_mut().insert(x, hdr);
     }
     r.tip_height = r.tip_height.max(tip);
     tx.txid_display
@@ -323,11 +323,11 @@ fn install_real_header(n: &mut Node, hdr: &serde_json::Value, extra: u64) {
     mr.reverse();
     assert_eq!(hex::encode(mr), rh.merkle_root);
     assert_eq!(crate::btc_spv::display_hex(&crate::btc_spv::hash256(&raw)), rh.hash);
-    r.headers.insert(h, rh);
+    r.headers.make_mut().insert(h, rh);
     for x in h + 1..=h + extra {
         let mut f = RailHeader::fixture(x, format!("{x:064x}"), format!("{:064x}", x - 1), "00".repeat(32));
         f.raw = "00".repeat(80);
-        r.headers.insert(x, f);
+        r.headers.make_mut().insert(x, f);
     }
     r.tip_height = r.tip_height.max(h + extra);
 }

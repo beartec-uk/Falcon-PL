@@ -64,7 +64,7 @@ fn mine4(n: &mut Node, raw: &[u8], h: u64, tip: u64) -> String {
         let root = if x == h { tx.txid_display.clone() } else { "00".repeat(32) };
         let mut hdr = RailHeader::fixture(x, format!("{x:064x}"), format!("{:064x}", x - 1), root);
         hdr.raw = "00".repeat(80);
-        r.headers.insert(x, hdr);
+        r.headers.make_mut().insert(x, hdr);
     }
     r.tip_height = r.tip_height.max(tip);
     tx.txid_display
@@ -137,7 +137,7 @@ fn btc4_rail_created_at_height_and_anchors_only_at_checkpoint() {
     assert_eq!(r.tip_height, 155_233);
     // (state-reset sanity: the checkpoint header still anchors a cleared rail)
     let mut r2 = r.clone();
-    r2.headers.clear();
+    r2.headers.make_mut().clear();
     r2.tip_height = 0;
     r2.submit_header_ex(hdr(155_232, H155232), true).unwrap();
     // legacy BTC rail keeps its frozen-checkpoint rule

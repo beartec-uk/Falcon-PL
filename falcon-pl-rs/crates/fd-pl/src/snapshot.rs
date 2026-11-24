@@ -32,7 +32,7 @@ use std::path::Path;
 /// v1 = tip state only (chain wiped on load). v2 = tip state + chain tail.
 pub const SNAPSHOT_VERSION: u32 = 2;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSnapshot {
     pub version: u32,
     pub id: String,
@@ -321,6 +321,76 @@ impl Node {
             let drop_n = chain.len() - max;
             chain.drain(0..drop_n);
         }
+        self.to_snapshot_with_chain(chain)
+    }
+
+    /// 2.11.13 (e): ledgers copied per short `node.lock` hold when the
+    /// periodic saver copies the chain tail outside the main capture.
+    pub const SNAPSHOT_CHAIN_CHUNK: usize = 256;
+
+    /// 2.11.13 (e): everything [`Self::to_snapshot`] captures except the
+    /// chain tail (the bulk: up to `max_chain_ledgers` Falcon bodies), plus
+    /// the height after which the tail starts. The saver copies the tail in
+    /// [`Self::SNAPSHOT_CHAIN_CHUNK`] pieces with [`Self::chain_after`], one
+    /// short lock each, then [`Self::finish_chunked_snapshot`] checks it.
+    pub fn to_snapshot_head(&self) -> (NodeSnapshot, u64) {
+        let max = self.cfg.max_chain_ledgers;
+        let keep_from = if max > 0 && self.chain.len() > max {
+            self.chain.len() - max
+        } else {
+            0
+        };
+        let after = self
+            .chain
+            .get(keep_from)
+            .map(|l| l.height.saturating_sub(1))
+            .unwrap_or(self.tip_height);
+        (self.to_snapshot_with_chain(Vec::new()), after)
+    }
+
+    /// Up to `max` committed ledgers with height `> after`, in chain order.
+    pub fn chain_after(&self, after: u64, max: usize) -> Vec<Ledger> {
+        let start = self.chain.partition_point(|l| l.height <= after);
+        self.chain[start..].iter().take(max.max(1)).cloned().collect()
+    }
+
+    /// Attach a chunk-copied tail to a head capture. The tail must end at the
+    /// head's tip (same hash), be contiguous and hash-linked; anything else
+    /// (a catch-up adopt or fork switch between chunks) returns `Err` and
+    /// the caller falls back to a one-lock [`Self::to_snapshot`]. Ledgers
+    /// committed after the head capture are dropped. Same bytes as a
+    /// one-lock capture taken at the head's tip.
+    pub fn finish_chunked_snapshot(
+        mut head: NodeSnapshot,
+        mut chain: Vec<Ledger>,
+        max_chain_ledgers: usize,
+    ) -> Result<NodeSnapshot, String> {
+        chain.retain(|l| l.height <= head.tip_height);
+        if max_chain_ledgers > 0 && chain.len() > max_chain_ledgers {
+            let drop_n = chain.len() - max_chain_ledgers;
+            chain.drain(0..drop_n);
+        }
+        for w in chain.windows(2) {
+            if w[1].height != w[0].height.saturating_add(1) || w[1].parent_hash != w[0].ledger_hash {
+                return Err(format!("chain tail not linked at h={}", w[1].height));
+            }
+        }
+        match chain.last() {
+            Some(l) if l.height == head.tip_height && l.ledger_hash == head.tip_hash => {}
+            None if head.tip_height == 0 => {}
+            Some(l) => {
+                return Err(format!(
+                    "chain tail ends h={} but head tip h={}",
+                    l.height, head.tip_height
+                ))
+            }
+            None => return Err("empty chain tail".into()),
+        }
+        head.chain = chain;
+        Ok(head)
+    }
+
+    fn to_snapshot_with_chain(&self, chain: Vec<Ledger>) -> NodeSnapshot {
         NodeSnapshot {
             version: SNAPSHOT_VERSION,
             id: self.id.clone(),
@@ -433,7 +503,16 @@ impl Node {
     ) -> Result<u64> {
         // v2.9.58: same bytes as `serde_json::to_vec(snap)`; the ~200 MB exec
         // header map JSON is reused from its per-generation cache.
-        let bytes = crate::exec_map::to_vec_split(snap).context("serialize snapshot")?;
+        let json = crate::exec_map::to_vec_split(snap).context("serialize snapshot")?;
+        // 2.11.13: zstd on disk once the chain is past the bridge-slim
+        // activation (older binaries cannot read it, and none can follow the
+        // chain past that height anyway). The JSON inside is unchanged; the
+        // state root never covers file bytes. Readers accept both forms.
+        let bytes = if snapshot_zstd_wanted(snap) {
+            encode_snapshot_zstd(&json)?
+        } else {
+            json
+        };
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -462,8 +541,8 @@ impl Node {
 
     /// Load snapshot over existing keyring (keys stay on disk separately).
     pub fn load_snapshot(path: impl AsRef<Path>, keys: KeyRing) -> Result<Self> {
-        let s = std::fs::read_to_string(path.as_ref()).context("read snapshot")?;
-        let snap: NodeSnapshot = serde_json::from_str(&s).context("parse snapshot")?;
+        let raw = std::fs::read(path.as_ref()).context("read snapshot")?;
+        let snap: NodeSnapshot = parse_snapshot_bytes(&raw)?;
         let cfg = snap.cfg.into_config()?;
         // CRITICAL: never treat tip-state balances as genesis. Doing so made
         // hard_resync rebuild from wrong balances → perpetual state-root fails
@@ -481,6 +560,8 @@ impl Node {
         let seat_payout_from_height = crate::params_v2::seat_payout_from_height(cfg.network_id);
         let external_addrs_from_height = crate::params_v2::external_addrs_from_height(cfg.network_id);
         let empty_block_from_height = crate::params_v2::empty_block_from_height(cfg.network_id);
+        let redraw_from_height = crate::params_v2::redraw_from_height(cfg.network_id);
+        let bridge_slim_from_height = crate::params_v2::bridge_slim_from_height(cfg.network_id);
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
         let btc4_most_work_from_height = crate::params_v2::btc4_most_work_from_height(cfg.network_id);
@@ -520,8 +601,13 @@ impl Node {
             soft_ok: BTreeSet::new(),
             hard_ok: BTreeSet::new(),
             pending_proposal: None,
-            sig_warm: std::collections::BTreeSet::new(),
+            sig_warm: std::collections::BTreeMap::new(),
             pipeline_for: String::new(),
+            pipeline_mempool: 0,
+            prepack_txs: 0,
+            prepack_runs: 0,
+            prepack_warm_used: 0,
+            pack_phases: crate::PackPhases::default(),
             height_open_ms: snap.height_open_ms,
             genesis_ms: snap.genesis_ms,
             treasury: snap.treasury,
@@ -640,6 +726,9 @@ impl Node {
             seat_payout_from_height,
             external_addrs_from_height,
             empty_block_from_height,
+            redraw_from_height,
+            bridge_slim_from_height,
+            redraw_vc_cast_at: 0,
             btc4_fork_fix_from_height,
             btc4_fork_slot_from_height,
             btc4_most_work_from_height,
@@ -1181,5 +1270,48 @@ mod snap_assembler_tests {
         }
         // 50/100 in 60 s -> 120 s projected
         assert!(!a.too_slow(60_000, 45_000, 480_000));
+    }
+}
+
+/// zstd frame magic (`28 B5 2F FD`).
+pub const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+/// 2.11.13: zstd level for snapshot files (fast; ~6-10x on snapshot JSON).
+pub const SNAPSHOT_ZSTD_LEVEL: i32 = 3;
+
+/// Whether `raw` is a zstd-compressed snapshot file.
+pub fn is_zstd_snapshot(raw: &[u8]) -> bool {
+    raw.len() >= 4 && raw[..4] == ZSTD_MAGIC
+}
+
+/// Snapshot file bytes (zstd or plain JSON, both accepted) → JSON bytes.
+pub fn snapshot_json_bytes(raw: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    if is_zstd_snapshot(raw) {
+        let out = zstd::stream::decode_all(raw).context("zstd-decode snapshot")?;
+        Ok(std::borrow::Cow::Owned(out))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(raw))
+    }
+}
+
+/// Parse a snapshot file's bytes (zstd or plain JSON).
+pub fn parse_snapshot_bytes(raw: &[u8]) -> Result<NodeSnapshot> {
+    let json = snapshot_json_bytes(raw)?;
+    serde_json::from_slice(&json).context("parse snapshot")
+}
+
+/// zstd-encode snapshot JSON for disk.
+pub fn encode_snapshot_zstd(json: &[u8]) -> Result<Vec<u8>> {
+    zstd::stream::encode_all(json, SNAPSHOT_ZSTD_LEVEL).context("zstd-encode snapshot")
+}
+
+/// 2.11.13: compress a snapshot file iff the bridge-slim activation is in
+/// the snapshot's state (`bridge.bridge_slim`). `FPL_SNAPSHOT_ZSTD=0|1`
+/// forces it off / on (devnets, benches); off by default before activation
+/// so a pre-activation rollback to an older binary can still read it.
+pub fn snapshot_zstd_wanted(snap: &NodeSnapshot) -> bool {
+    match std::env::var("FPL_SNAPSHOT_ZSTD").ok().as_deref().map(str::trim) {
+        Some("0") | Some("false") | Some("off") => false,
+        Some("1") | Some("true") | Some("on") => true,
+        _ => snap.bridge.bridge_slim,
     }
 }
