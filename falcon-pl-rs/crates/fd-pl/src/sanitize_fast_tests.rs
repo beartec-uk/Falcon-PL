@@ -220,3 +220,41 @@ fn sanitize_bench_200_400() {
         }
     }
 }
+
+/// 2.11.15: a 400-tx block of bound (known-key) wallets fits the pack body
+/// budget, the catch-up batch and the wire frame.
+/// `cargo test -p fd-pl --release --lib body_400 -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn body_400_bound_txs_fits_budgets() {
+    let heads = 400usize;
+    let mut net = six(heads, heads);
+    let pks: Vec<(String, String)> = (0..heads)
+        .map(|i| { let id = format!("w{i}"); let pk = net.user_keys.public_hex(&id).unwrap(); (id, pk) })
+        .collect();
+    for n in net.nodes.values_mut() {
+        for (id, pk) in &pks {
+            let mut a = n.state.get(id);
+            a.meta.public_key = pk.clone();
+            n.state.accounts.insert(id.clone(), a);
+        }
+    }
+    for i in 0..heads {
+        net.payment(&format!("w{i}"), &format!("w{}", (i + 1) % heads), 1, 1).unwrap();
+    }
+    net.pong_all();
+    let packer = net.nodes["v1"].lottery_packer().unwrap();
+    let n = net.nodes.get_mut(&packer).unwrap();
+    let mut led = n.pack_as(&packer).unwrap();
+    let json = serde_json::to_vec(&led).unwrap().len();
+    let txs_json = serde_json::to_vec(&led.txs).unwrap().len();
+    let _ = led.attach_merkle_batch_known(&n.keys, &|id| n.account_public_key(id));
+    let json_m = serde_json::to_vec(&led).unwrap().len();
+    println!(
+        "BODY txs={} ledger_json={json} txs_json={txs_json} per_tx={} with_merkle={json_m} est={} budget={} catchup={} frame={}",
+        led.txs.len(), txs_json / led.txs.len().max(1), led.txs.len() * Node::KNOWN_KEY_TX_EST_BYTES,
+        Node::PACK_BODY_BUDGET_BYTES, Node::CATCHUP_BATCH_MAX_BYTES, crate::wire_zstd::MAX_FRAME_BYTES
+    );
+    assert_eq!(led.txs.len(), 400, "400 bound txs fit the body budget");
+    assert!(json_m < Node::CATCHUP_BATCH_MAX_BYTES, "one full block fits a catch-up batch");
+}
