@@ -17274,6 +17274,8 @@ mod hold_cap_tests;
 mod snapshot_chunk_tests;
 #[cfg(test)]
 mod redraw_tests;
+#[cfg(test)]
+mod snapshot_zstd_tests;
 mod merkle_batch_tests;
 #[cfg(test)]
 mod lean_body_tests;

@@ -1017,8 +1017,24 @@ fn unix_ms() -> u64 {
 fn peek_snap_header(path: &std::path::Path) -> Option<(u64, String)> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    let zstd = f.read_exact(&mut magic).is_ok() && magic == fd_pl::snapshot::ZSTD_MAGIC;
+    let f = std::fs::File::open(path).ok()?;
+    // 2.11.13: snapshot files may be zstd (past the bridge-slim activation).
+    let mut r: Box<dyn Read> = if zstd {
+        Box::new(zstd::stream::read::Decoder::new(f).ok()?)
+    } else {
+        Box::new(f)
+    };
     let mut buf = vec![0u8; 16_384];
-    let n = f.read(&mut buf).ok()?;
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(_) => break,
+        }
+    }
     let s = String::from_utf8_lossy(&buf[..n]);
     let tip = s
         .split("\"tip_height\":")

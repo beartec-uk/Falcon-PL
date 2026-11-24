@@ -503,7 +503,16 @@ impl Node {
     ) -> Result<u64> {
         // v2.9.58: same bytes as `serde_json::to_vec(snap)`; the ~200 MB exec
         // header map JSON is reused from its per-generation cache.
-        let bytes = crate::exec_map::to_vec_split(snap).context("serialize snapshot")?;
+        let json = crate::exec_map::to_vec_split(snap).context("serialize snapshot")?;
+        // 2.11.13: zstd on disk once the chain is past the bridge-slim
+        // activation (older binaries cannot read it, and none can follow the
+        // chain past that height anyway). The JSON inside is unchanged; the
+        // state root never covers file bytes. Readers accept both forms.
+        let bytes = if snapshot_zstd_wanted(snap) {
+            encode_snapshot_zstd(&json)?
+        } else {
+            json
+        };
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -532,8 +541,8 @@ impl Node {
 
     /// Load snapshot over existing keyring (keys stay on disk separately).
     pub fn load_snapshot(path: impl AsRef<Path>, keys: KeyRing) -> Result<Self> {
-        let s = std::fs::read_to_string(path.as_ref()).context("read snapshot")?;
-        let snap: NodeSnapshot = serde_json::from_str(&s).context("parse snapshot")?;
+        let raw = std::fs::read(path.as_ref()).context("read snapshot")?;
+        let snap: NodeSnapshot = parse_snapshot_bytes(&raw)?;
         let cfg = snap.cfg.into_config()?;
         // CRITICAL: never treat tip-state balances as genesis. Doing so made
         // hard_resync rebuild from wrong balances → perpetual state-root fails
@@ -1261,5 +1270,48 @@ mod snap_assembler_tests {
         }
         // 50/100 in 60 s -> 120 s projected
         assert!(!a.too_slow(60_000, 45_000, 480_000));
+    }
+}
+
+/// zstd frame magic (`28 B5 2F FD`).
+pub const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+/// 2.11.13: zstd level for snapshot files (fast; ~6-10x on snapshot JSON).
+pub const SNAPSHOT_ZSTD_LEVEL: i32 = 3;
+
+/// Whether `raw` is a zstd-compressed snapshot file.
+pub fn is_zstd_snapshot(raw: &[u8]) -> bool {
+    raw.len() >= 4 && raw[..4] == ZSTD_MAGIC
+}
+
+/// Snapshot file bytes (zstd or plain JSON, both accepted) → JSON bytes.
+pub fn snapshot_json_bytes(raw: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    if is_zstd_snapshot(raw) {
+        let out = zstd::stream::decode_all(raw).context("zstd-decode snapshot")?;
+        Ok(std::borrow::Cow::Owned(out))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(raw))
+    }
+}
+
+/// Parse a snapshot file's bytes (zstd or plain JSON).
+pub fn parse_snapshot_bytes(raw: &[u8]) -> Result<NodeSnapshot> {
+    let json = snapshot_json_bytes(raw)?;
+    serde_json::from_slice(&json).context("parse snapshot")
+}
+
+/// zstd-encode snapshot JSON for disk.
+pub fn encode_snapshot_zstd(json: &[u8]) -> Result<Vec<u8>> {
+    zstd::stream::encode_all(json, SNAPSHOT_ZSTD_LEVEL).context("zstd-encode snapshot")
+}
+
+/// 2.11.13: compress a snapshot file iff the bridge-slim activation is in
+/// the snapshot's state (`bridge.bridge_slim`). `FPL_SNAPSHOT_ZSTD=0|1`
+/// forces it off / on (devnets, benches); off by default before activation
+/// so a pre-activation rollback to an older binary can still read it.
+pub fn snapshot_zstd_wanted(snap: &NodeSnapshot) -> bool {
+    match std::env::var("FPL_SNAPSHOT_ZSTD").ok().as_deref().map(str::trim) {
+        Some("0") | Some("false") | Some("off") => false,
+        Some("1") | Some("true") | Some("on") => true,
+        _ => snap.bridge.bridge_slim,
     }
 }
