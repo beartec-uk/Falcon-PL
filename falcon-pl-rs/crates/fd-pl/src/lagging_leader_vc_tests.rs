@@ -206,6 +206,8 @@ fn votes_to_qc(knob: u64) -> (usize, u64) {
     for s in &voters {
         net.nodes.get_mut(*s).unwrap().tick(10);
         ad(&mut net, s, "v1", t - 2);
+        // Seed the legacy work clock (`work_seen_since_ms`) like the seal loop does.
+        assert!(net.nodes.get_mut(*s).unwrap().maybe_view_change_vote().is_none());
     }
     let wait = if knob > 0 {
         knob + 10
@@ -217,7 +219,18 @@ fn votes_to_qc(knob: u64) -> (usize, u64) {
     for s in &voters {
         let n = net.nodes.get_mut(*s).unwrap();
         n.tick(wait);
-        let (h, tip, round) = n.maybe_view_change_vote().expect("each follower votes");
+        let h0 = n.tip_height + 1;
+        let diag = format!(
+            "seat={s} knob={knob} fast={} cert={} committee={} lagging={} work={} r={} proposer={:?}",
+            n.lagging_leader_fast_vc(h0),
+            n.certs.contains_key(&n.tip_height),
+            n.in_committee(s),
+            n.still_lagging(),
+            n.network_has_pack_work(),
+            n.height_view_round,
+            n.round_proposer(n.height_view_round)
+        );
+        let (h, tip, round) = n.maybe_view_change_vote().unwrap_or_else(|| panic!("follower did not vote: {diag}"));
         let sig = n.sign_vc_vote(h, &tip, round);
         cast.push((s.to_string(), h, tip, round, sig));
     }
@@ -249,6 +262,9 @@ fn quorum_is_unchanged_by_the_fast_path() {
 #[test]
 fn forged_or_unsigned_votes_still_rejected() {
     let mut net = net_with_leader("v1", G);
+    for n in net.nodes.values_mut() {
+        n.cfg.require_vote_sigs = true;
+    }
     let t = tip(&net);
     net.nodes.get_mut("v2").unwrap().tick(10);
     ad(&mut net, "v2", "v1", t - 2);
@@ -260,4 +276,53 @@ fn forged_or_unsigned_votes_still_rejected() {
     let n = net.nodes.get_mut("v4").unwrap();
     let (_, new) = n.vote_view_change_ex(h, &tip_hash, round, "v3", &bad);
     assert!(!new, "signature must match the voter");
+    let (_, new) = n.vote_view_change_ex(h, &tip_hash, round, "v2", &bad);
+    assert!(new, "the genuine fast vote verifies like any ViewChange");
+    let (_, again) = n.vote_view_change_ex(h, &tip_hash, round, "v2", &bad);
+    assert!(!again, "a repeat of the same vote is not counted twice");
+}
+
+/// Simulated time from round open to the ViewChange QC with a lagging leader,
+/// seat timings as deployed (pack budget 5000, progress timeout 4000, 200 ms
+/// seal tick). Deterministic, simulated clock (not wall time).
+/// `cargo test -p fd-pl --release --lib lagging_leader_bench -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn lagging_leader_bench() {
+    for knob in [0u64, 200, 400, 800] {
+        let mut net = net_with_leader("v1", knob);
+        for n in net.nodes.values_mut() {
+            n.cfg.pack_budget_ms = 5_000;
+            n.cfg.progress_timeout_ms = 4_000;
+        }
+        let t = tip(&net);
+        let voters: Vec<String> = IDS.iter().filter(|s| **s != "v1").map(|s| s.to_string()).collect();
+        let mut voted: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut qc_at = None;
+        let mut ms = 0u64;
+        while ms <= 20_000 && qc_at.is_none() {
+            ms += 200;
+            let mut cast = Vec::new();
+            for s in &voters {
+                let n = net.nodes.get_mut(s).unwrap();
+                n.tick(200);
+                n.pong_with_role("v1", t - 2, 0, false, false, 0);
+                if let Some((h, tip_h, r)) = n.maybe_view_change_vote() {
+                    voted.entry(s.clone()).or_insert(ms);
+                    let sig = n.sign_vc_vote(h, &tip_h, r);
+                    cast.push((s.clone(), h, tip_h, r, sig));
+                }
+            }
+            let recv = net.nodes.get_mut("v6").unwrap();
+            let r0 = 0;
+            let _ = r0;
+            for (v, h, tip_h, r, sig) in cast {
+                if v == "v6" { continue; }
+                let (qc, _) = recv.vote_view_change_ex(h, &tip_h, r, &v, &sig);
+                if qc && qc_at.is_none() { qc_at = Some(ms); }
+            }
+        }
+        let first = voted.values().min().copied().unwrap_or(0);
+        println!("BENCH knob={knob} first_vote_ms={first} qc_ms={:?} voters={}", qc_at, voted.len());
+    }
 }
