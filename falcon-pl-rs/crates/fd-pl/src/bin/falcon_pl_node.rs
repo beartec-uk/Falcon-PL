@@ -1152,7 +1152,7 @@ fn seat_payout_sync(shared: &Arc<Shared>, id: &str, want: &str) {
 const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 300_000;
 const DEFAULT_PACK_BUDGET_MS: u64 = 5_000;
 const DEFAULT_PROGRESS_TIMEOUT_MS: u64 = 4_000;
-const DEFAULT_MAX_TXS: usize = 200;
+const DEFAULT_MAX_TXS: usize = 400;
 
 #[derive(Parser, Debug)]
 #[command(version = fd_pl::PRODUCT_VERSION)]
@@ -1173,6 +1173,9 @@ struct Args {
     /// --pack-budget-ms). 2.11.13: default 200 (was 0), the live value: a
     /// 2-vCPU builder holds `node.lock` for the whole pack (11-16 s for
     /// 250-336 txs), which must stay well under the 14.6 s round-0 timeout.
+    /// 2.11.15: default 400. After the 2.11.13 slim and the 2.11.15 head
+    /// dry-run (one draft per sanitize, signatures checked in parallel and
+    /// shared with the pack) a 200-tx pack is under 0.6 s on the leader.
     #[arg(long, default_value_t = DEFAULT_MAX_TXS)]
     max_txs: usize,
     /// Pack as many as possible within this many ms (the real limit).
@@ -9651,7 +9654,7 @@ mod timing_default_tests {
         let a = Args::try_parse_from(["falcon-pl-node", "--id", "v1"]).unwrap();
         assert_eq!(a.pack_budget_ms, 5_000);
         assert_eq!(a.progress_timeout_ms, 4_000);
-        assert_eq!(a.max_txs, 200);
+        assert_eq!(a.max_txs, 400); // 2.11.15
         assert_eq!(a.snapshot_interval_ms, 300_000);
     }
 
