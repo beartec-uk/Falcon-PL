@@ -3058,6 +3058,19 @@ impl PoolTx {
 pub struct Mempool {
     by_id: HashMap<String, PoolTx>,
     order: VecDeque<String>,
+    /// 2.11.19: local wall-clock ms each tx first entered this pool. Kept a
+    /// few seconds past removal so a leader can tell, at seal time, which
+    /// body txs are too fresh to have reached its peers (compact relay).
+    /// Local liveness hint only; never hashed or serialized.
+    arrived: HashMap<String, u64>,
+}
+
+/// Local wall clock in ms (compact-relay freshness hints only).
+pub fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Mempool {
@@ -3086,8 +3099,28 @@ impl Mempool {
             ));
         }
         self.order.push_back(tx.tx_id.clone());
+        let now = wall_ms();
+        self.arrived.entry(tx.tx_id.clone()).or_insert(now);
+        if self.arrived.len() > 2 * self.by_id.len() + 4096 {
+            let keep = now.saturating_sub(Self::ARRIVED_KEEP_MS);
+            let live = &self.by_id;
+            self.arrived.retain(|id, t| *t >= keep || live.contains_key(id));
+        }
         self.by_id.insert(tx.tx_id.clone(), PoolTx::from_tx(tx));
         Ok(true)
+    }
+
+    /// How long a removed tx's arrival time is remembered.
+    pub const ARRIVED_KEEP_MS: u64 = 10_000;
+
+    /// Local ms this tx first entered the pool (if remembered).
+    pub fn arrived_ms(&self, tx_id: &str) -> Option<u64> {
+        self.arrived.get(tx_id).copied()
+    }
+
+    /// Test hook: pretend a tx arrived at `ms`.
+    pub fn set_arrived_ms(&mut self, tx_id: &str, ms: u64) {
+        self.arrived.insert(tx_id.to_string(), ms);
     }
 
     pub fn len(&self) -> usize {
@@ -3834,6 +3867,17 @@ pub struct Node {
     /// instead of the silence timeout. Lag of 1 that persists this long votes
     /// after 3x. Quorum, lottery and vote rules are unchanged.
     pub lagging_leader_vc_ms: u64,
+    /// 2.11.19 compact relay: the leader carries the full bytes of body txs
+    /// that entered its pool less than this many ms before the seal (peers
+    /// probably lack them). 0 = carry none (2.11.18 behaviour).
+    pub compact_carry_ms: u64,
+    /// 2.11.19: compact shells parked for a short wait (hash -> due ms) so the
+    /// mempool can catch up before an id pull.
+    pub compact_waiting: HashMap<String, u64>,
+    /// 2.11.19: adaptive wait bookkeeping (decayed): waits tried / that the
+    /// mempool finished without a pull.
+    pub compact_wait_tries: u32,
+    pub compact_wait_hits: u32,
     /// 2.11.17: local time each seat's latest tip ad (Hello/Pong) arrived.
     pub tip_ad_at_ms: std::collections::HashMap<String, u64>,
     /// 2.11.17: the last ViewChange this seat cast came from the lagging-leader path.
@@ -4260,6 +4304,10 @@ impl Node {
             future_oks: Vec::new(),
             pace_min_interval_ms: 0,
             lagging_leader_vc_ms: 0,
+            compact_carry_ms: 0,
+            compact_waiting: HashMap::new(),
+            compact_wait_tries: 0,
+            compact_wait_hits: 0,
             tip_ad_at_ms: std::collections::HashMap::new(),
             last_vc_fast: false,
             fast_vc_votes: 0,
@@ -5483,7 +5531,12 @@ impl Node {
     /// Fill a by-id body from the mempool and any txs already pulled.
     /// Missing ids are stored with the shell so one `TxsByIds` can finish it.
     pub fn assemble_body_by_id(&mut self, mut ledger: Ledger) -> Result<Ledger, (String, Vec<String>)> {
-        ledger.txs.clear();
+        // 2.11.19: txs the leader carried in the shell (sealed form) fill like
+        // pulled txs; the rebuild below is idempotent on them.
+        if !ledger.txs.is_empty() {
+            let carried = std::mem::take(&mut ledger.txs);
+            self.note_body_fill(carried);
+        }
         let mut missing = Vec::new();
         let mut txs = Vec::with_capacity(ledger.tx_ids.len());
         for id in &ledger.tx_ids {
@@ -5539,6 +5592,103 @@ impl Node {
         by_id
     }
 
+    /// 2.11.19: compact shell that also carries the full sealed bytes of body
+    /// txs that entered our pool less than `compact_carry_ms` before `now_ms`
+    /// (peers probably lack them). Returns the shell and the carried count.
+    pub fn compact_shell_fresh(&self, ledger: &Ledger, now_ms: u64) -> (Ledger, usize) {
+        let mut by_id = ledger.clone();
+        by_id.txs.clear();
+        if self.compact_carry_ms == 0 {
+            return (by_id, 0);
+        }
+        let cut = now_ms.saturating_sub(self.compact_carry_ms);
+        by_id.txs = ledger
+            .txs
+            .iter()
+            .filter(|t| self.mempool.arrived_ms(&t.tx_id).map_or(false, |a| a >= cut))
+            .cloned()
+            .collect();
+        let n = by_id.txs.len();
+        (by_id, n)
+    }
+
+    /// 2.11.19: should a compact shell missing `missing` of `total` txs wait
+    /// briefly for the mempool instead of pulling now? Only for a few missing
+    /// txs, and only while waits keep paying off (adaptive: after 8 tries,
+    /// at least half must finish without a pull).
+    pub fn compact_should_wait(&self, missing: usize, total: usize) -> bool {
+        missing > 0
+            && missing <= (total / 50).max(4)
+            && (self.compact_wait_tries < 8 || self.compact_wait_hits * 2 >= self.compact_wait_tries)
+    }
+
+    /// Park a shell for a short wait.
+    pub fn park_compact(&mut self, hash: &str, due_ms: u64) {
+        if self.compact_waiting.len() >= 8 {
+            self.compact_waiting.clear();
+        }
+        self.compact_waiting.insert(hash.to_string(), due_ms);
+    }
+
+    fn note_compact_wait(&mut self, hit: bool) {
+        if self.compact_wait_tries >= 32 {
+            self.compact_wait_tries /= 2;
+            self.compact_wait_hits /= 2;
+        }
+        self.compact_wait_tries += 1;
+        if hit {
+            self.compact_wait_hits += 1;
+        }
+    }
+
+    /// Parked shells whose wait is over: finished bodies, and id pulls for
+    /// the ones still missing txs.
+    pub fn take_compact_due(&mut self, now_ms: u64) -> (Vec<Ledger>, Vec<(String, Vec<String>, String)>) {
+        let due: Vec<String> = self
+            .compact_waiting
+            .iter()
+            .filter(|(_, d)| **d <= now_ms)
+            .map(|(h, _)| h.clone())
+            .collect();
+        let mut done = Vec::new();
+        let mut pulls = Vec::new();
+        for h in due {
+            self.compact_waiting.remove(&h);
+            let Some(shell) = self.body_shells.get(&h).cloned() else {
+                continue;
+            };
+            if shell.height <= self.tip_height {
+                self.body_shells.remove(&h);
+                continue;
+            }
+            let packer = shell.packer.clone();
+            match self.assemble_body_by_id(shell) {
+                Ok(l) => {
+                    self.note_compact_wait(true);
+                    done.push(l);
+                }
+                Err((hash, ids)) => {
+                    self.note_compact_wait(false);
+                    pulls.push((hash, ids, packer));
+                }
+            }
+        }
+        (done, pulls)
+    }
+
+    /// 2.11.19: answer an id pull from the sealed body if we hold it, else
+    /// from the mempool / compact fill cache (any peer can serve).
+    pub fn txs_for_ids(&self, ledger_hash: &str, tx_ids: &[String]) -> Vec<Tx> {
+        let want: std::collections::BTreeSet<&str> = tx_ids.iter().map(|s| s.as_str()).collect();
+        if let Some(ledger) = self.ledger_body(ledger_hash) {
+            return ledger.txs.into_iter().filter(|t| want.contains(t.tx_id.as_str())).collect();
+        }
+        tx_ids
+            .iter()
+            .filter_map(|id| self.mempool.get_tx(id).or_else(|| self.body_fill.get(id).cloned()))
+            .collect()
+    }
+
     /// Most txs `body_fill` keeps. It is a short-lived cache for compact
     /// bodies, not a second mempool.
     pub const BODY_FILL_CAP: usize = 4_000;
@@ -5572,6 +5722,11 @@ impl Node {
         self.note_body_fill(txs);
         let shell = self.body_shells.get(ledger_hash)?.clone();
         self.assemble_body_by_id(shell).ok()
+    }
+
+    /// 2.11.19: is a compact shell for this hash still waiting for txs?
+    pub fn has_body_shell(&self, ledger_hash: &str) -> bool {
+        self.body_shells.contains_key(ledger_hash)
     }
 
     /// Header seen without a body — pull from packer/hubs (v2.9.13).

@@ -1212,6 +1212,14 @@ struct Args {
     /// vote the existing ViewChange after this many ms (lag 1: after 3x).
     #[arg(long, default_value_t = 400)]
     lagging_leader_vc_ms: u64,
+    /// 2.11.19 compact relay: carry the full bytes of body txs that reached
+    /// this leader less than this many ms before the seal (0 = none).
+    #[arg(long, default_value_t = 500)]
+    compact_carry_ms: u64,
+    /// 2.11.19 compact relay: a receiver missing only a few txs waits this
+    /// long for its mempool before the id pull (adaptive; 0 = pull at once).
+    #[arg(long, default_value_t = 150)]
+    compact_wait_ms: u64,
     /// v2.9.59: pacing ends early once the local mempool holds this many txs.
     #[arg(long, default_value_t = 400)]
     pace_mempool_txs: usize,
@@ -1366,6 +1374,17 @@ struct CompactRelayStats {
     rebuilt: std::sync::atomic::AtomicU64,
     /// Compact bodies that needed an id pull.
     pulled: std::sync::atomic::AtomicU64,
+    /// 2.11.19: txs the leader carried in full inside compact shells.
+    carried: std::sync::atomic::AtomicU64,
+    /// 2.11.19: shells parked for a short mempool wait / finished by the wait.
+    waited: std::sync::atomic::AtomicU64,
+    wait_hit: std::sync::atomic::AtomicU64,
+    /// 2.11.19: id-pull replies that did not finish the body yet (others may).
+    partial: std::sync::atomic::AtomicU64,
+    /// 2.11.19: id-pull replies for a body already finished (ignored).
+    late: std::sync::atomic::AtomicU64,
+    /// Last shell counted as a fallback (dedupe ticker retries).
+    last_fallback: parking_lot::Mutex<String>,
     /// Id pulls that did not complete the body (full-body pull follows).
     fallback: std::sync::atomic::AtomicU64,
 }
@@ -1381,6 +1400,11 @@ impl CompactRelayStats {
             "sent_full": g(&self.sent_full),
             "rebuilt": g(&self.rebuilt),
             "pulled": g(&self.pulled),
+            "carried": g(&self.carried),
+            "waited": g(&self.waited),
+            "wait_hit": g(&self.wait_hit),
+            "partial": g(&self.partial),
+            "late": g(&self.late),
             "fallback": g(&self.fallback),
         })
     }
@@ -1401,6 +1425,8 @@ struct Shared {
     is_archive: bool,
     /// 2.11.18 `--compact-body-relay`.
     compact_body_relay: bool,
+    /// 2.11.19 `--compact-wait-ms`.
+    compact_wait_ms: u64,
     /// 2.11.18: seats whose latest Hello advertised `compact-body-v1`.
     compact_peers: Mutex<std::collections::HashSet<String>>,
     /// 2.11.18 compact relay counters (since start).
@@ -2683,6 +2709,30 @@ impl Shared {
         }
     }
 
+    /// 2.11.19: id pull to the packer plus one other body-lane seat (any
+    /// peer can answer from its mempool), skipping `skip` (already asked).
+    fn fan_ids_pull(&self, fanout: &Arc<Vec<PeerOut>>, m: &WireMsg, packer: &str, skip: &str) {
+        let (me, lane) = {
+            let n = self.node.lock();
+            (n.id.clone(), n.body_lane_seats())
+        };
+        let mut to: Vec<String> = Vec::new();
+        if !packer.is_empty() && packer != skip && packer != me {
+            to.push(packer.to_string());
+        }
+        for s in lane {
+            if to.len() >= 2 {
+                break;
+            }
+            if s != me && s != skip && !to.contains(&s) {
+                to.push(s);
+            }
+        }
+        if !to.is_empty() {
+            self.fan_ledger_body(fanout, m, &to);
+        }
+    }
+
     /// Directed NeedTxs to hub peers (or all if none tagged).
     fn fan_need_txs(&self, fanout: &Arc<Vec<PeerOut>>, m: &WireMsg) {
         let Ok(s) = serde_json::to_string(m) else {
@@ -2984,6 +3034,7 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
     node.pace_min_interval_ms = args.min_block_interval_ms;
     node.pace_mempool_txs = args.pace_mempool_txs.max(1);
     node.lagging_leader_vc_ms = args.lagging_leader_vc_ms;
+    node.compact_carry_ms = args.compact_carry_ms;
     info!("lagging-leader view-change: {} ms (0 = off)", node.lagging_leader_vc_ms);
     info!(
         "packer pacing: min_block_interval_ms={} (effective {}) pace_mempool_txs={}",
@@ -3275,6 +3326,7 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
         is_hub: args.hub,
         is_archive: args.archive,
         compact_body_relay: args.compact_body_relay,
+        compact_wait_ms: args.compact_wait_ms,
         compact_peers: Mutex::new(std::collections::HashSet::new()),
         cr: CompactRelayStats::default(),
         snapshot_out: PathBuf::from(&args.snapshot_out),
@@ -3809,7 +3861,36 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                     let seats = n.body_lane_seats();
                     let push = n.take_pending_body_push();
                     let pull = n.take_body_pull();
+                    let pull_is_fallback = pull.as_deref().map_or(false, |h| n.has_body_shell(h));
+                    let (cdone, cpulls) = n.take_compact_due(unix_ms());
                     drop(n);
+                    if pull_is_fallback {
+                        // Count each shell once, not every 200 ms retry.
+                        let h = pull.clone().unwrap_or_default();
+                        let mut last = shared_c.cr.last_fallback.lock();
+                        if *last != h {
+                            *last = h;
+                            CompactRelayStats::bump(&shared_c.cr.fallback, 1);
+                        }
+                    }
+                    // 2.11.19: parked compact shells whose wait is over.
+                    for ledger in cdone {
+                        CompactRelayStats::bump(&shared_c.cr.wait_hit, 1);
+                        CompactRelayStats::bump(&shared_c.cr.rebuilt, 1);
+                        info!("body-ids h={} filled-after-wait", ledger.height);
+                        let _ = dispatch_wire(
+                            &shared_c,
+                            WireMsg::ProposeLedger { ledger, catchup: false },
+                            Some(&fanout),
+                            false,
+                            false,
+                        );
+                    }
+                    for (hash, tx_ids, packer) in cpulls {
+                        CompactRelayStats::bump(&shared_c.cr.pulled, 1);
+                        let ask = WireMsg::NeedTxsByIds { ledger_hash: hash, tx_ids };
+                        shared_c.fan_ids_pull(&fanout, &ask, &packer, "");
+                    }
                     if let Some(led) = push {
                         if !led.batch_sig.is_empty() {
                             // Retry the small Merkle body on the must-send body
@@ -4468,6 +4549,13 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                                             if wire.txs.len() >= 400 {
                                                 let _ = std::fs::remove_file("/tmp/fpl-only-pack");
                                             }
+                                            let carry_shell = if shared_c.compact_body_relay
+                                                && fd_pl::Node::compact_relay_eligible(&wire)
+                                            {
+                                                Some(n.compact_shell_fresh(&wire, fd_pl::wall_ms()))
+                                            } else {
+                                                None
+                                            };
                                             drop(n);
                                             // 2.11.18: compact shell only to seats that advertised
                                             // `compact-body-v1`; everyone else gets the full body.
@@ -4481,12 +4569,13 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                                                     (Vec::new(), seats.clone())
                                                 };
                                             if !cseats.is_empty() {
-                                                let shell = WireMsg::LedgerBodyById {
-                                                    ledger: fd_pl::Node::compact_shell(&wire),
-                                                };
+                                                let (sh, carried) = carry_shell
+                                                    .unwrap_or_else(|| (fd_pl::Node::compact_shell(&wire), 0));
+                                                CompactRelayStats::bump(&shared_c.cr.carried, carried as u64);
+                                                let shell = WireMsg::LedgerBodyById { ledger: sh };
                                                 let sb = serde_json::to_string(&shell).map(|s| s.len()).unwrap_or(0);
                                                 info!(
-                                                    "compact-body h={} txs={} bytes={sb} full={bytes} compact_to={} full_to={}",
+                                                    "compact-body h={} txs={} carried={carried} bytes={sb} full={bytes} compact_to={} full_to={}",
                                                     wire.height,
                                                     wire.txs.len(),
                                                     cseats.len(),
@@ -5957,6 +6046,7 @@ fn process_msg(
         WireMsg::LedgerBodyById { ledger } => {
             let height = ledger.height;
             let n_ids = ledger.tx_ids.len();
+            let packer = ledger.packer.clone();
             let mut n = shared.node.lock();
             let me = n.id.clone();
             match n.assemble_body_by_id(ledger) {
@@ -5969,25 +6059,39 @@ fn process_msg(
                     }
                 }
                 Err((hash, tx_ids)) => {
-                    CompactRelayStats::bump(&shared.cr.pulled, 1);
                     let miss = tx_ids.len();
                     info!(
                         "body-ids seat={me} h={height} n={n_ids} have={} miss={miss} pull",
                         n_ids.saturating_sub(miss)
                     );
-                    // 2.11.18: if the id pull does not finish the body, the
-                    // periodic full-body pull takes over after ~800 ms.
-                    if height > n.tip_height {
-                        n.note_want_body(height, &hash);
-                        n.last_want_body_ms = n.now_ms.saturating_add(600);
+                    if height <= n.tip_height {
+                        return None;
                     }
+                    // 2.11.19: a few missing txs are usually still in flight on
+                    // the tx plane; wait briefly (adaptive) before pulling.
+                    let wait = shared.compact_wait_ms;
+                    if wait > 0 && n.compact_should_wait(miss, n_ids) && !n.compact_waiting.contains_key(&hash) {
+                        n.park_compact(&hash, unix_ms().saturating_add(wait));
+                        n.note_want_body(height, &hash);
+                        n.last_want_body_ms = n.now_ms.saturating_add(wait + 600);
+                        CompactRelayStats::bump(&shared.cr.waited, 1);
+                        return None;
+                    }
+                    CompactRelayStats::bump(&shared.cr.pulled, 1);
+                    // If the id pulls do not finish the body, the periodic
+                    // full-body pull takes over after ~800 ms.
+                    n.note_want_body(height, &hash);
+                    n.last_want_body_ms = n.now_ms.saturating_add(600);
                     drop(n);
                     let ask = WireMsg::NeedTxsByIds {
                         ledger_hash: hash,
                         tx_ids,
                     };
+                    // 2.11.19: ask the sender (reply below), the packer and one
+                    // more seat, not the archive first.
                     if let Some(f) = fanout {
-                        shared.fan_body_pull(f, &ask);
+                        let from = shared.wire_from.lock().clone();
+                        shared.fan_ids_pull(f, &ask, &packer, &from);
                     }
                     return Some(ask);
                 }
@@ -6009,10 +6113,16 @@ fn process_msg(
                     }
                 }
                 None => {
-                    CompactRelayStats::bump(&shared.cr.fallback, 1);
-                    info!("body-ids seat={me} hash={ledger_hash} full-body-fallback");
-                    drop(n);
-                    return Some(WireMsg::NeedLedgerBody { ledger_hash });
+                    // 2.11.19: a reply for a finished body is ignored; a
+                    // partial one waits for the other pulls. The full-body
+                    // pull (counted as `fallback`) runs from the ticker only
+                    // if the shell is still open ~800 ms after it arrived.
+                    if n.has_body_shell(&ledger_hash) {
+                        CompactRelayStats::bump(&shared.cr.partial, 1);
+                    } else {
+                        CompactRelayStats::bump(&shared.cr.late, 1);
+                    }
+                    return None;
                 }
             }
         }
@@ -6744,15 +6854,8 @@ fn process_msg(
         }
         WireMsg::NeedTxsByIds { ledger_hash, tx_ids } => {
             let n = shared.node.lock();
-            let Some(ledger) = n.ledger_body(&ledger_hash) else {
-                return None;
-            };
-            let want: std::collections::BTreeSet<&str> = tx_ids.iter().map(|s| s.as_str()).collect();
-            let txs: Vec<_> = ledger
-                .txs
-                .into_iter()
-                .filter(|t| want.contains(t.tx_id.as_str()))
-                .collect();
+            // 2.11.19: any peer answers, from the body or its mempool.
+            let txs = n.txs_for_ids(&ledger_hash, &tx_ids);
             if txs.is_empty() {
                 None
             } else {
@@ -8136,6 +8239,7 @@ mod inbound_ack_tests {
             is_hub: true,
             is_archive: false,
             compact_body_relay: false,
+            compact_wait_ms: 0,
             compact_peers: parking_lot::Mutex::new(std::collections::HashSet::new()),
             cr: CompactRelayStats::default(),
             snapshot_out: PathBuf::from("/tmp/falcon-test-snap.bin"),
