@@ -388,7 +388,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.13";
+pub const PRODUCT_VERSION: &str = "2.11.14";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -13540,6 +13540,12 @@ impl Node {
             || err.contains("sync committee not in")
             || err.contains("need ")
             || err.contains("confs")
+            // 2.11.14: a duplicate withdraw note, and a first-key that
+            // nothing commits to, can never apply. Classing them as
+            // transient left them at v10's pool head so it packed
+            // nothing and view-changed.
+            || err.contains("duplicate withdraw note")
+            || err.contains(KEY_BIND_REFUSED)
     }
 
     /// Safety cap when `max_txs_per_ledger == 0` (v2.9.49). ~3.3 KB per
@@ -17410,6 +17416,16 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_withdraw_and_key_bind_refused_are_permanent() {
+        // 2.11.14: v10 held dave seq 63 ("duplicate withdraw note") and
+        // falcon-node#seat seq 0 (KEY_BIND_REFUSED) as transient, so they
+        // were never evicted and a pool of only those txs packed nothing.
+        assert!(Node::is_permanent_tx_failure("duplicate withdraw note"));
+        assert!(Node::is_permanent_tx_failure(KEY_BIND_REFUSED));
+        assert!(!Node::is_permanent_tx_failure("no headers"));
+    }
+
+    #[test]
     fn hmac_multi_height() {
         let mut net = Network::bootstrap(
             &["v1", "v2", "v3", "v4", "v5"],
@@ -17781,8 +17797,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.13");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.13");
+        assert_eq!(PRODUCT_VERSION, "2.11.14");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.14");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
