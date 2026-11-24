@@ -1206,6 +1206,12 @@ struct Args {
     /// back to the full body. Turn on only once every seat runs 2.11.18.
     #[arg(long, default_value_t = false)]
     compact_body_relay: bool,
+    /// 2.11.17 lagging-leader fast view-change (local liveness timing; 0 = off,
+    /// the pre-2.11.17 silence/unavailable timeout). When the round proposer's
+    /// latest tip ad, received after the round opened, is >= 2 behind our tip,
+    /// vote the existing ViewChange after this many ms (lag 1: after 3x).
+    #[arg(long, default_value_t = 400)]
+    lagging_leader_vc_ms: u64,
     /// v2.9.59: pacing ends early once the local mempool holds this many txs.
     #[arg(long, default_value_t = 400)]
     pace_mempool_txs: usize,
@@ -2942,6 +2948,8 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
     // v2.9.59 packer pacing (runtime knob; not in the snapshot or cfg digest).
     node.pace_min_interval_ms = args.min_block_interval_ms;
     node.pace_mempool_txs = args.pace_mempool_txs.max(1);
+    node.lagging_leader_vc_ms = args.lagging_leader_vc_ms;
+    info!("lagging-leader view-change: {} ms (0 = off)", node.lagging_leader_vc_ms);
     info!(
         "packer pacing: min_block_interval_ms={} (effective {}) pace_mempool_txs={}",
         node.pace_min_interval_ms,
@@ -4064,7 +4072,8 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                             .as_ref()
                             .map(|p| p.ledger_hash.chars().take(16).collect::<String>());
                         info!(
-                            "view-change vote h={h} round={round} applied={applied} pending={pending_h:?} → lottery {:?}",
+                            "view-change vote h={h} round={round} applied={applied} pending={pending_h:?} fast={} → lottery {:?}",
+                            n.last_vc_fast,
                             n.lottery_packer()
                         );
                         let signature = n.sign_vc_vote(h, &tip, round);

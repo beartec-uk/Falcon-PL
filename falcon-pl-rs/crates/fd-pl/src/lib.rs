@@ -388,7 +388,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.16";
+pub const PRODUCT_VERSION: &str = "2.11.17";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -3827,6 +3827,19 @@ pub struct Node {
     /// block. Capped by [`Self::pace_effective_ms`] so peers' round-0 silence
     /// timers can never fire because of it.
     pub pace_min_interval_ms: u64,
+    /// 2.11.17 lagging-leader fast view-change (local liveness knob, set by
+    /// the node binary; 0 = off = pre-2.11.17 timing). When the open round's
+    /// proposer advertised a tip at least 2 behind ours after this round
+    /// opened, this seat votes the existing ViewChange after this many ms
+    /// instead of the silence timeout. Lag of 1 that persists this long votes
+    /// after 3x. Quorum, lottery and vote rules are unchanged.
+    pub lagging_leader_vc_ms: u64,
+    /// 2.11.17: local time each seat's latest tip ad (Hello/Pong) arrived.
+    pub tip_ad_at_ms: std::collections::HashMap<String, u64>,
+    /// 2.11.17: the last ViewChange this seat cast came from the lagging-leader path.
+    pub last_vc_fast: bool,
+    /// 2.11.17: count of lagging-leader fast ViewChange votes cast.
+    pub fast_vc_votes: u64,
     /// v2.9.59: pacing ends early once the mempool holds this many txs.
     pub pace_mempool_txs: usize,
     /// v2.9.59: last ledger hash whose stage root was precomputed outside
@@ -4246,6 +4259,10 @@ impl Node {
             tip_roots: None,
             future_oks: Vec::new(),
             pace_min_interval_ms: 0,
+            lagging_leader_vc_ms: 0,
+            tip_ad_at_ms: std::collections::HashMap::new(),
+            last_vc_fast: false,
+            fast_vc_votes: 0,
             pace_mempool_txs: Node::PACE_DEFAULT_MEMPOOL_TXS,
             prestaged_hash: String::new(),
             prestage_count: 0,
@@ -8293,6 +8310,9 @@ impl Node {
         snap_height: u64,
     ) {
         self.pong(id);
+        if self.validators.contains_key(id) {
+            self.tip_ad_at_ms.insert(id.to_string(), self.now_ms);
+        }
         if let Some(v) = self.validators.get_mut(id) {
             v.last_advertised_tip = Some(tip_height);
             v.last_mempool_len = mempool_len;
@@ -17551,6 +17571,8 @@ mod sanitize_fast_tests;
 #[cfg(test)]
 mod compact_relay_tests;
 #[cfg(test)]
+mod lagging_leader_vc_tests;
+#[cfg(test)]
 mod hold_cap_tests;
 #[cfg(test)]
 mod snapshot_chunk_tests;
@@ -18047,8 +18069,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.16");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.16");
+        assert_eq!(PRODUCT_VERSION, "2.11.17");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.17");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
