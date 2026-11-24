@@ -1178,6 +1178,10 @@ struct Args {
     /// shared with the pack) a 200-tx pack is under 0.6 s on the leader.
     #[arg(long, default_value_t = DEFAULT_MAX_TXS)]
     max_txs: usize,
+    /// 2.11.16: pack body budget in bytes (0 = auto: max(1 MB, max-txs x 2.3 KB x 1.1),
+    /// ceiling 3.5 MB). Local only.
+    #[arg(long, default_value_t = 0)]
+    pack_body_budget_bytes: usize,
     /// Pack as many as possible within this many ms (the real limit).
     /// 2.11.13: default 5000 (was 1000), the value tested live on 2300 on
     /// 23 Nov 2026, so seats need no per-seat flag.
@@ -2813,6 +2817,7 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
     let mut cfg = ChainConfig {
         network_id: args.network_id,
         max_txs_per_ledger: args.max_txs,
+        pack_body_budget_bytes: args.pack_body_budget_bytes,
         pack_budget_ms: args.pack_budget_ms,
         pong_window_ms: 30_000,
         confirm_depth: 3,
@@ -2914,12 +2919,14 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
     // written (2300 snaps say 128 txs / 1000 ms). The process flags are the
     // live knobs; they are not part of the state root.
     node.cfg.max_txs_per_ledger = args.max_txs;
+    node.cfg.pack_body_budget_bytes = args.pack_body_budget_bytes;
     node.cfg.pack_budget_ms = args.pack_budget_ms;
     node.cfg.progress_timeout_ms = args.progress_timeout_ms;
     node.cfg.max_mempool_txs = args.max_mempool_txs;
     info!(
-        "pack knobs: max_txs={} pack_budget_ms={} progress_timeout_ms={} max_mempool={}",
+        "pack knobs: max_txs={} body_budget={} pack_budget_ms={} progress_timeout_ms={} max_mempool={}",
         node.cfg.max_txs_per_ledger,
+        node.pack_body_budget(),
         node.cfg.pack_budget_ms,
         node.cfg.progress_timeout_ms,
         node.cfg.max_mempool_txs
@@ -3811,6 +3818,7 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                             n.note_need_txs_sent();
                         }
                         let missing = n.gap_needs();
+                        let nb = n.need_txs_batch();
                         let h = n.tip_height.saturating_add(1);
                         let n_miss = missing.len();
                         let log = n.should_log_need_txs();
@@ -3818,12 +3826,12 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                         if log {
                             info!(
                                 "NeedTxs pull h={h} max={} missing={n_miss}",
-                                fd_pl::Node::NEED_TXS_BATCH
+                                nb
                             );
                         }
                         shared_c.fan_need_txs(
                             &fanout,
-                            &WireMsg::need_txs(fd_pl::Node::NEED_TXS_BATCH as u64, missing),
+                            &WireMsg::need_txs(nb as u64, missing),
                         );
                     }
                 }
@@ -4291,6 +4299,7 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                             {
                                 n.mark_pre_pack_need_txs();
                                 let missing = n.gap_needs();
+                                let nb = n.need_txs_batch();
                                 let h = n.tip_height.saturating_add(1);
                                 let n_miss = missing.len();
                                 let log = n.should_log_need_txs();
@@ -4298,12 +4307,12 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                                 if log {
                                     info!(
                                         "NeedTxs pull h={h} max={} missing={n_miss}",
-                                        fd_pl::Node::NEED_TXS_BATCH
+                                        nb
                                     );
                                 }
                                 shared_c.fan_need_txs(
                                     &fanout,
-                                    &WireMsg::need_txs(fd_pl::Node::NEED_TXS_BATCH as u64, missing),
+                                    &WireMsg::need_txs(nb as u64, missing),
                                 );
                             } else if !n.can_seal_empty()
                                 && !(n.mempool.len() > 0 && !n.has_applicable_tx())
@@ -6078,10 +6087,13 @@ fn process_msg(
             }
             if want_txs {
                 if let Some(f) = fanout {
-                    let missing = shared.node.lock().gap_needs();
+                    let (missing, nb) = {
+                        let n = shared.node.lock();
+                        (n.gap_needs(), n.need_txs_batch())
+                    };
                     shared.fan_need_txs(
                         f,
-                        &WireMsg::need_txs(fd_pl::Node::NEED_TXS_BATCH as u64, missing),
+                        &WireMsg::need_txs(nb as u64, missing),
                     );
                 }
             }

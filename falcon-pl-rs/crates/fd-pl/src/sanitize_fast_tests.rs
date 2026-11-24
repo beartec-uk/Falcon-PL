@@ -258,3 +258,72 @@ fn body_400_bound_txs_fits_budgets() {
     assert_eq!(led.txs.len(), 400, "400 bound txs fit the body budget");
     assert!(json_m < Node::CATCHUP_BATCH_MAX_BYTES, "one full block fits a catch-up batch");
 }
+
+#[test]
+fn pack_body_budget_scales_with_max_txs() {
+    let mut net = six(2, 200);
+    let n = net.nodes.get_mut("v1").unwrap();
+    assert_eq!(n.pack_body_budget(), Node::PACK_BODY_BUDGET_BYTES, "200 keeps 1 MB");
+    n.cfg.max_txs_per_ledger = 400;
+    assert_eq!(n.pack_body_budget(), 1_012_000);
+    n.cfg.max_txs_per_ledger = 800;
+    assert_eq!(n.pack_body_budget(), 2_024_000);
+    n.cfg.max_txs_per_ledger = 5_000;
+    assert_eq!(n.pack_body_budget(), Node::PACK_BODY_BUDGET_MAX_BYTES, "ceiling");
+    n.cfg.pack_body_budget_bytes = 1_500_000;
+    assert_eq!(n.pack_body_budget(), 1_500_000, "explicit override");
+}
+
+/// 2.11.16: full blocks of bound wallets at 500..800 txs: sizes and timings.
+/// `cargo test -p fd-pl --release --lib body_caps -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn body_caps_500_to_800_fit() {
+    for cap in [500usize, 600, 700, 800] {
+        let mut net = six(cap, cap);
+        let pks: Vec<(String, String)> = (0..cap)
+            .map(|i| { let id = format!("w{i}"); let pk = net.user_keys.public_hex(&id).unwrap(); (id, pk) })
+            .collect();
+        for n in net.nodes.values_mut() {
+            for (id, pk) in &pks {
+                let mut a = n.state.get(id);
+                a.meta.public_key = pk.clone();
+                n.state.accounts.insert(id.clone(), a);
+            }
+        }
+        for i in 0..cap {
+            net.payment(&format!("w{i}"), &format!("w{}", (i + 1) % cap), 1, 1).unwrap();
+        }
+        net.pong_all();
+        let packer = net.nodes["v1"].lottery_packer().unwrap();
+        let other = ["v1", "v2", "v3", "v4", "v5", "v6"].iter().find(|s| **s != packer).unwrap().to_string();
+        let n = net.nodes.get_mut(&packer).unwrap();
+        let t = Instant::now();
+        let _ = n.sanitize_mempool();
+        let san = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        let mut led = n.pack_as(&packer).unwrap();
+        let pack = t.elapsed().as_secs_f64() * 1000.0;
+        let _ = led.attach_merkle_batch_known(&n.keys, &|id| n.account_public_key(id));
+        let lean = led.estimate_wire_bytes();
+        let t = Instant::now();
+        net.nodes.get_mut(&other).unwrap().accept_ledger(&led).unwrap();
+        let acc = t.elapsed().as_secs_f64() * 1000.0;
+        println!("CAP cap={cap} txs={} budget={} wire_est={lean} sanitize_ms={san:.1} pack_ms={pack:.1} peer_accept_ms={acc:.1}",
+            led.txs.len(), net.nodes[&packer].pack_body_budget());
+        assert_eq!(led.txs.len(), cap);
+        assert!(lean < 4 * 1024 * 1024, "fits the body lane");
+    }
+}
+
+#[test]
+fn need_txs_batch_follows_cap() {
+    let mut net = six(2, 200);
+    let n = net.nodes.get_mut("v1").unwrap();
+    n.cfg.max_txs_per_ledger = 200;
+    assert_eq!(n.need_txs_batch(), 400);
+    n.cfg.max_txs_per_ledger = 700;
+    assert_eq!(n.need_txs_batch(), 700);
+    n.cfg.max_txs_per_ledger = 5000;
+    assert_eq!(n.need_txs_batch(), Node::NEED_TXS_BATCH_MAX);
+}

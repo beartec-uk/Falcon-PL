@@ -388,7 +388,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.15";
+pub const PRODUCT_VERSION: &str = "2.11.16";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -3405,6 +3405,11 @@ pub struct ChainConfig {
     /// Optional hard ceiling (0 = **no cap** — only time budget stops packing).
     /// Prefer time budget alone so faster packers simply include more.
     pub max_txs_per_ledger: usize,
+    /// 2.11.16: pack body budget in bytes (estimated). 0 = auto: the larger of
+    /// 1 MB and `max_txs * 2.3 KB * 1.1`, so raising `--max-txs` raises the
+    /// budget with it. Clamped to [`Node::PACK_BODY_BUDGET_MAX_BYTES`].
+    /// Local only: receivers never re-derive the selection.
+    pub pack_body_budget_bytes: usize,
     /// Pack as many applicable txs as possible within this many ms.
     /// 0 = no time limit (then max_txs should be > 0 or pack can run very long).
     /// Faster machines fill more before the deadline → naturally perform better.
@@ -3523,6 +3528,7 @@ impl Default for ChainConfig {
         Self {
             network_id: NETWORK_ID_PRIVATE_V22,
             max_txs_per_ledger: 0, // 0 = unlimited; stop only when pack_budget_ms hits
+            pack_body_budget_bytes: 0,
             pack_budget_ms: 1_000, // "fill as many as you can in 1 second"
             // Multi-host under Falcon inject: pongs share the consensus queue with
             // ProposeLedger/LedgerOk. A 5s window falsely marks live remotes
@@ -5420,6 +5426,17 @@ impl Node {
     /// Hub → packer working set. Same size as a full ledger (`PACK_DEFAULT_MAX_TXS`).
     /// 128 left packers sealing a short dish while the hub still held the pool.
     pub const NEED_TXS_BATCH: usize = 400;
+    /// 2.11.16: largest NeedTxs / hub export batch a seat will request or serve.
+    /// At `--max-txs 800` a one-ledger working set is ~2.7 MB of JSON, still
+    /// under the 4 MB tx lane. Tx plane only; not consensus.
+    pub const NEED_TXS_BATCH_MAX: usize = 800;
+
+    /// 2.11.16: NeedTxs request size, sized to the pack cap (400..=800).
+    /// Before, it was fixed at 400, so a seat at `--max-txs 800` pulled and
+    /// dished half a block.
+    pub fn need_txs_batch(&self) -> usize {
+        self.pack_cap_txs().clamp(Self::NEED_TXS_BATCH, Self::NEED_TXS_BATCH_MAX)
+    }
     /// Max named (account, seq) heads in one gap-fill NeedTxs.
     pub const NEED_TXS_GAP_MAX: usize = 64;
     /// Rate-limit NeedTxs / gap-fill info lines (ms).
@@ -5914,7 +5931,7 @@ impl Node {
         max_count: usize,
         missing: &[MissingSeq],
     ) -> (Vec<Tx>, usize) {
-        let max = max_count.clamp(1, Self::NEED_TXS_BATCH.max(1));
+        let max = max_count.clamp(1, Self::NEED_TXS_BATCH_MAX);
         let mut out = Vec::new();
         let mut have = std::collections::HashSet::new();
         let mut filled = 0usize;
@@ -5966,7 +5983,7 @@ impl Node {
     /// All heads first left the packer with a short queue behind them.
     /// A gap stops that account. Later sequences are not a walk.
     pub fn export_packer_batch(&self, max: usize) -> Vec<Tx> {
-        let max = max.clamp(1, Self::NEED_TXS_BATCH.max(1));
+        let max = max.clamp(1, Self::NEED_TXS_BATCH_MAX);
         let mut by: std::collections::HashMap<String, Vec<Tx>> = std::collections::HashMap::new();
         for tx in self.mempool.iter_candidates() {
             if self.v3_deposit_pre_activation(tx) {
@@ -13716,6 +13733,20 @@ impl Node {
     /// 1 MB stays under the 1.5 MB catch-up batch and under the ~1.3 MB body
     /// that stalled the pipe. Not consensus: receivers do not re-derive it.
     pub const PACK_BODY_BUDGET_BYTES: usize = 1_000_000;
+    /// 2.11.16: ceiling for the pack body budget. Stays under the 4 MB body
+    /// lane queue and the 8 MB wire frame with room for two bodies in flight.
+    pub const PACK_BODY_BUDGET_MAX_BYTES: usize = 3_500_000;
+
+    /// 2.11.16: effective pack body budget (see `ChainConfig::pack_body_budget_bytes`).
+    pub fn pack_body_budget(&self) -> usize {
+        let b = if self.cfg.pack_body_budget_bytes > 0 {
+            self.cfg.pack_body_budget_bytes
+        } else {
+            let cap = self.pack_cap_txs();
+            Self::PACK_BODY_BUDGET_BYTES.max(cap.saturating_mul(Self::KNOWN_KEY_TX_EST_BYTES).saturating_mul(11) / 10)
+        };
+        b.clamp(1, Self::PACK_BODY_BUDGET_MAX_BYTES)
+    }
     pub const NEW_KEY_TX_EST_BYTES: usize = 5_000;
     pub const KNOWN_KEY_TX_EST_BYTES: usize = 2_300;
     /// v2.9.59: default mempool size that ends packer pacing early.
@@ -13849,6 +13880,7 @@ impl Node {
         // Size budget, not a count. A fixed cap of 8 new keys made a mempool
         // of first-seen accounts drain at 8 txs a block.
         let mut body_est = 0usize;
+        let body_budget = self.pack_body_budget();
         while progressed {
             if hard_cap > 0 && chosen.len() >= hard_cap {
                 break;
@@ -13924,7 +13956,7 @@ impl Node {
                     Self::KNOWN_KEY_TX_EST_BYTES
                 };
                 if !chosen.is_empty()
-                    && body_est.saturating_add(add) > Self::PACK_BODY_BUDGET_BYTES
+                    && body_est.saturating_add(add) > body_budget
                 {
                     continue;
                 }
@@ -17980,8 +18012,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.15");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.15");
+        assert_eq!(PRODUCT_VERSION, "2.11.16");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.16");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
