@@ -35,6 +35,7 @@ fn big_exec_map(mb: usize) -> crate::exec_map::ExecHeaderMap {
                 parent_hash: format!("{:064x}", i),
                 receipts_root: "00".repeat(32),
                 rlp_hex: "f9".repeat(per / 2),
+                timestamp: 0,
             },
         );
     }

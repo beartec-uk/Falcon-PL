@@ -460,6 +460,7 @@ mod tests {
             parent_hash: format!("{:064x}", i),
             receipts_root: "00".repeat(32),
             rlp_hex: "f9".repeat(40),
+            timestamp: 0,
         }
     }
 
@@ -553,6 +554,7 @@ mod tests {
         let v2 = Two { a: &a, b: &b };
         assert_eq!(sha256_hex_split(&v2), crate::crypto::sha256_hex(&serde_json::to_vec(&v2).unwrap()));
         let v = Two { a: &a, b: &b };
+        let want = serde_json::to_vec(&v).unwrap();
         assert_eq!(to_vec_split(&v).unwrap(), want);
         // Normal serialization after a split is unaffected (mode reset).
         assert_eq!(serde_json::to_vec(&a).unwrap(), serde_json::to_vec(&*a).unwrap());

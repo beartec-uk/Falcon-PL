@@ -585,3 +585,19 @@ pub fn redraw_from_height(network_id: u32) -> u64 {
     }
     env_u64("FPL_REDRAW_FROM_HEIGHT").unwrap_or(u64::MAX)
 }
+
+/// 2.11.13 bridge slim (D: legacy BTC rail prune + header cap, E: compact
+/// ETH exec headers) on testnet 2300. CONSENSUS. Deliberately the SAME
+/// height as the committee redraw: the release build sets only
+/// [`TESTNET_2300_REDRAW_FROM_HEIGHT`] and this follows.
+pub const TESTNET_2300_BRIDGE_SLIM_FROM_HEIGHT: u64 = TESTNET_2300_REDRAW_FROM_HEIGHT;
+
+/// Bridge slim activation height (`u64::MAX` = never). Non-2300 networks may
+/// set `FPL_BRIDGE_SLIM_FROM_HEIGHT` (devnets / rehearsals); tests set
+/// `Node::bridge_slim_from_height` directly.
+pub fn bridge_slim_from_height(network_id: u32) -> u64 {
+    if network_id == NETWORK_ID_PUBLIC_TESTNET_2300 {
+        return TESTNET_2300_BRIDGE_SLIM_FROM_HEIGHT;
+    }
+    env_u64("FPL_BRIDGE_SLIM_FROM_HEIGHT").unwrap_or(u64::MAX)
+}

@@ -4006,6 +4006,10 @@ pub struct Node {
     /// (tests may lower it). From this open height a stalled committee can be
     /// replaced (see [`Node::redraw_committee`]).
     pub redraw_from_height: u64,
+    /// 2.11.13 bridge slim: [`crate::params_v2::bridge_slim_from_height`];
+    /// runtime only (tests may lower it). From this ledger height the
+    /// per-ledger hook runs [`crate::bridge::BridgeState::bridge_slim_convert`].
+    pub bridge_slim_from_height: u64,
     /// 2.11.13 (f): open height at which this seat cast its committee-redraw
     /// ViewChange; it then signs no OK in a pre-redraw round at that height.
     pub redraw_vc_cast_at: u64,
@@ -4154,6 +4158,7 @@ impl Node {
         let external_addrs_from_height = crate::params_v2::external_addrs_from_height(cfg.network_id);
         let empty_block_from_height = crate::params_v2::empty_block_from_height(cfg.network_id);
         let redraw_from_height = crate::params_v2::redraw_from_height(cfg.network_id);
+        let bridge_slim_from_height = crate::params_v2::bridge_slim_from_height(cfg.network_id);
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
         let btc4_most_work_from_height = crate::params_v2::btc4_most_work_from_height(cfg.network_id);
@@ -4310,6 +4315,7 @@ impl Node {
             external_addrs_from_height,
             empty_block_from_height,
             redraw_from_height,
+            bridge_slim_from_height,
             redraw_vc_cast_at: 0,
             btc4_fork_fix_from_height,
             btc4_fork_slot_from_height,
@@ -5358,6 +5364,11 @@ impl Node {
                 .entry(crate::bridge::RAIL_BTC4.to_string())
                 .or_insert_with(crate::bridge::RailState::new_btc4);
             r4.record_fpl_checkpoint(height, &self.tip_hash);
+        }
+        // 2.11.13 bridge slim: one deterministic conversion at the
+        // activation (no-op once `bridge_slim` is set).
+        if height >= self.bridge_slim_from_height {
+            bridge.bridge_slim_convert();
         }
     }
 
@@ -16068,6 +16079,8 @@ impl Node {
             "prepack_runs": self.prepack_runs,
             "prepack_warm_used": self.prepack_warm_used,
             "pack_phases": self.pack_phases,
+            "bridge_slim": self.bridge.bridge_slim,
+            "bridge_slim_from_height": self.bridge_slim_from_height,
             "root_stats": {
                 "full_hashes": crate::exec_map::root_stats().0,
                 "memo_hits": crate::exec_map::root_stats().1,
@@ -23328,6 +23341,7 @@ mod tests {
                         parent_hash: format!("{:064x}", i),
                         receipts_root: "00".repeat(32),
                         rlp_hex: "f9".repeat(600),
+                        timestamp: 0,
                     },
                 );
             }
