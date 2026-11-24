@@ -1355,6 +1355,37 @@ struct HubSnap {
 
 
 
+/// 2.11.18 compact block relay counters.
+#[derive(Default)]
+struct CompactRelayStats {
+    /// Proposals this seat sent as a compact shell (per receiving seat).
+    sent_compact: std::sync::atomic::AtomicU64,
+    /// Proposals this seat sent in full to a seat without the capability.
+    sent_full: std::sync::atomic::AtomicU64,
+    /// Compact bodies rebuilt from the local pool (no pull, or after the id pull).
+    rebuilt: std::sync::atomic::AtomicU64,
+    /// Compact bodies that needed an id pull.
+    pulled: std::sync::atomic::AtomicU64,
+    /// Id pulls that did not complete the body (full-body pull follows).
+    fallback: std::sync::atomic::AtomicU64,
+}
+
+impl CompactRelayStats {
+    fn bump(c: &std::sync::atomic::AtomicU64, n: u64) {
+        c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn json(&self) -> serde_json::Value {
+        let g = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        serde_json::json!({
+            "sent_compact": g(&self.sent_compact),
+            "sent_full": g(&self.sent_full),
+            "rebuilt": g(&self.rebuilt),
+            "pulled": g(&self.pulled),
+            "fallback": g(&self.fallback),
+        })
+    }
+}
+
 struct Shared {
     node: Mutex<Node>,
     /// 2.11.13: woken when the tip advances so the next builder packs
@@ -1370,6 +1401,10 @@ struct Shared {
     is_archive: bool,
     /// 2.11.18 `--compact-body-relay`.
     compact_body_relay: bool,
+    /// 2.11.18: seats whose latest Hello advertised `compact-body-v1`.
+    compact_peers: Mutex<std::collections::HashSet<String>>,
+    /// 2.11.18 compact relay counters (since start).
+    cr: CompactRelayStats,
     snapshot_out: PathBuf,
     snap_meta: Mutex<Option<SnapMeta>>,
     /// One publish of the served join file at a time. Two NeedSnapshot
@@ -3240,6 +3275,8 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
         is_hub: args.hub,
         is_archive: args.archive,
         compact_body_relay: args.compact_body_relay,
+        compact_peers: Mutex::new(std::collections::HashSet::new()),
+        cr: CompactRelayStats::default(),
         snapshot_out: PathBuf::from(&args.snapshot_out),
         snap_meta: Mutex::new(None),
         snap_publish: Mutex::new(()),
@@ -4432,21 +4469,42 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                                                 let _ = std::fs::remove_file("/tmp/fpl-only-pack");
                                             }
                                             drop(n);
-                                            let body_msg = if shared_c.compact_body_relay
-                                                && fd_pl::Node::compact_relay_eligible(&wire)
-                                            {
-                                                let shell = fd_pl::Node::compact_shell(&wire);
-                                                let sb = serde_json::to_string(&WireMsg::LedgerBodyById {
-                                                    ledger: shell.clone(),
-                                                })
-                                                .map(|s| s.len())
-                                                .unwrap_or(0);
-                                                info!("compact-body h={} txs={} bytes={sb} full={bytes}", wire.height, wire.txs.len());
-                                                WireMsg::LedgerBodyById { ledger: shell }
-                                            } else {
-                                                WireMsg::LedgerBody { ledger: wire }
-                                            };
-                                            shared_c.fan_ledger_body(&fanout, &body_msg, &seats);
+                                            // 2.11.18: compact shell only to seats that advertised
+                                            // `compact-body-v1`; everyone else gets the full body.
+                                            let (cseats, fseats): (Vec<String>, Vec<String>) =
+                                                if shared_c.compact_body_relay
+                                                    && fd_pl::Node::compact_relay_eligible(&wire)
+                                                {
+                                                    let cp = shared_c.compact_peers.lock();
+                                                    seats.iter().cloned().partition(|s| cp.contains(s))
+                                                } else {
+                                                    (Vec::new(), seats.clone())
+                                                };
+                                            if !cseats.is_empty() {
+                                                let shell = WireMsg::LedgerBodyById {
+                                                    ledger: fd_pl::Node::compact_shell(&wire),
+                                                };
+                                                let sb = serde_json::to_string(&shell).map(|s| s.len()).unwrap_or(0);
+                                                info!(
+                                                    "compact-body h={} txs={} bytes={sb} full={bytes} compact_to={} full_to={}",
+                                                    wire.height,
+                                                    wire.txs.len(),
+                                                    cseats.len(),
+                                                    fseats.len()
+                                                );
+                                                CompactRelayStats::bump(&shared_c.cr.sent_compact, cseats.len() as u64);
+                                                shared_c.fan_ledger_body(&fanout, &shell, &cseats);
+                                            }
+                                            if !fseats.is_empty() {
+                                                if shared_c.compact_body_relay {
+                                                    CompactRelayStats::bump(&shared_c.cr.sent_full, fseats.len() as u64);
+                                                }
+                                                shared_c.fan_ledger_body(
+                                                    &fanout,
+                                                    &WireMsg::LedgerBody { ledger: wire },
+                                                    &fseats,
+                                                );
+                                            }
                                             // Header still goes to seats that are not on the body lane.
                                             if let Ok(line) = serde_json::to_string(&header) {
                                                 shared_c.fan_line_except(&fanout, line + "\n", &seats);
@@ -4573,6 +4631,12 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                     let op = OBSERVER_PACED_MS.load(std::sync::atomic::Ordering::Relaxed);
                     let orf = OBSERVER_REFUSED.load(std::sync::atomic::Ordering::Relaxed);
                     info!("mesh sockets outbound={n_out} inbound={n_in} queued_out={out_bytes} queued_in={in_bytes} live={socks} observer_bytes={ob} observer_paced_ms={op} observer_refused={orf}");
+                    info!(
+                        "compact-relay on={} peers={} stats={}",
+                        shared_c.compact_body_relay,
+                        shared_c.compact_peers.lock().len(),
+                        shared_c.cr.json()
+                    );
                 }
             }
         });
@@ -5897,6 +5961,7 @@ fn process_msg(
             let me = n.id.clone();
             match n.assemble_body_by_id(ledger) {
                 Ok(ledger) => {
+                    CompactRelayStats::bump(&shared.cr.rebuilt, 1);
                     info!("body-ids seat={me} h={height} n={n_ids} have={n_ids} miss=0");
                     WireMsg::ProposeLedger {
                         ledger,
@@ -5904,6 +5969,7 @@ fn process_msg(
                     }
                 }
                 Err((hash, tx_ids)) => {
+                    CompactRelayStats::bump(&shared.cr.pulled, 1);
                     let miss = tx_ids.len();
                     info!(
                         "body-ids seat={me} h={height} n={n_ids} have={} miss={miss} pull",
@@ -5932,6 +5998,7 @@ fn process_msg(
             let me = n.id.clone();
             match n.supply_body_txs(&ledger_hash, txs) {
                 Some(ledger) => {
+                    CompactRelayStats::bump(&shared.cr.rebuilt, 1);
                     info!(
                         "body-ids seat={me} h={} filled-from-pull",
                         ledger.height
@@ -5942,6 +6009,7 @@ fn process_msg(
                     }
                 }
                 None => {
+                    CompactRelayStats::bump(&shared.cr.fallback, 1);
                     info!("body-ids seat={me} hash={ledger_hash} full-body-fallback");
                     drop(n);
                     return Some(WireMsg::NeedLedgerBody { ledger_hash });
@@ -5968,8 +6036,17 @@ fn process_msg(
             archive,
             snap_height,
             release_version,
-            capabilities: _, // gated earlier via HelloSession::check
+            capabilities, // gated earlier via HelloSession::check
         } => {
+            // 2.11.18: remember whether this seat can take compact bodies.
+            {
+                let mut cp = shared.compact_peers.lock();
+                if fd_pl::utc_header::peer_has_compact_body(&capabilities) {
+                    cp.insert(id.clone());
+                } else {
+                    cp.remove(&id);
+                }
+            }
             // Live bond-in: Hello only advertises keys (+ tip). Bonded seats come
             // from genesis register or Bond ledger txs — never free-register from wire.
             // Lock order: snap_pull before node (ticker holds them that way).
@@ -7833,6 +7910,14 @@ fn health_body(shared: &Shared, fanout: Option<&Arc<Vec<PeerOut>>>, warnings: u3
         c.insert("blocks_per_min_spark".into(), serde_json::json!(spark));
         c.insert("tip_advanced_age_ms".into(), serde_json::json!(adv_age));
     }
+    if let Some(o) = body.as_object_mut() {
+        let mut cr = shared.cr.json();
+        if let Some(m) = cr.as_object_mut() {
+            m.insert("on".into(), shared.compact_body_relay.into());
+            m.insert("peers".into(), shared.compact_peers.lock().len().into());
+        }
+        o.insert("compact_relay".into(), cr);
+    }
     let outbound: Vec<String> = fanout
         .map(|f| {
             f.iter()
@@ -8051,6 +8136,8 @@ mod inbound_ack_tests {
             is_hub: true,
             is_archive: false,
             compact_body_relay: false,
+            compact_peers: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            cr: CompactRelayStats::default(),
             snapshot_out: PathBuf::from("/tmp/falcon-test-snap.bin"),
             snap_meta: parking_lot::Mutex::new(None),
             snap_publish: parking_lot::Mutex::new(()),

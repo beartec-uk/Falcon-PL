@@ -135,3 +135,11 @@ fn compact_shell_is_much_smaller() {
         assert!(!Node::compact_relay_eligible(&led));
     }
 }
+
+#[test]
+fn compact_body_capability_advertised_and_detected() {
+    let caps = crate::utc_header::local_hello_capabilities();
+    assert!(crate::utc_header::peer_has_compact_body(&caps));
+    let old: Vec<String> = vec![crate::utc_header::CAP_UTC_HEADER_V5.to_string()];
+    assert!(!crate::utc_header::peer_has_compact_body(&old));
+}
