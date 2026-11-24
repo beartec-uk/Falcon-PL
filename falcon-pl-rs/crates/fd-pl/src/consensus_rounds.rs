@@ -1046,6 +1046,9 @@ impl Node {
         // sit on other entry seats) and must still vote the existing VC path
         // without waiting the silence timeout.
         let follow = self.following_packer_self_pass(height, r.saturating_add(1));
+        // 2.11.17: the proposer is provably behind (fresh tip ad). Liveness
+        // timing only; the vote below is the same signed ViewChange.
+        let lag_fast = self.lagging_leader_fast_vc(height);
         let work = pending_here
             || self.network_has_pack_work()
             || self.mempool_poisoned()
@@ -1104,9 +1107,10 @@ impl Node {
         // 2.11.12: packer self-pass (or a follower seeing that signed VC)
         // skips the silence timeout. 4-of-6 is unchanged. A 2.11.11 peer
         // never sets `follow` and still waits the full silence window.
-        if !split && !self_pass && !follow && elapsed < timeout {
+        if !split && !self_pass && !follow && !lag_fast && elapsed < timeout {
             return None;
         }
+        let fast_only = lag_fast && !split && !self_pass && !follow && elapsed < timeout;
         let target = r.saturating_add(1);
         let me = self.id.clone();
         // Only committee seats vote rounds; others follow the QC.
@@ -1127,8 +1131,71 @@ impl Node {
         let tip = self.tip_hash.clone();
         let sig = self.sign_vc_vote(height, &tip, target);
         self.last_view_change_vote_ms = self.now_ms;
+        self.last_vc_fast = fast_only;
+        if fast_only {
+            self.fast_vc_votes = self.fast_vc_votes.saturating_add(1);
+        }
         let _ = self.vote_view_change_ex(height, &tip, target, &me, &sig);
         Some((height, tip, target))
+    }
+
+    /// 2.11.17: may this seat vote the open round forward early because the
+    /// round proposer is behind? Liveness timing only. True only when all hold:
+    /// - the knob is on (`lagging_leader_vc_ms > 0`) and the height is round-scoped;
+    /// - this seat is not itself behind a peer (`!still_lagging()`);
+    /// - no body is staged or cached for the height (a proposal in flight
+    ///   keeps the normal round timeout);
+    /// - the proposer is another seat, pong-fresh (an offline seat keeps the
+    ///   existing unavailable timeout), and its latest tip ad arrived after
+    ///   this round opened;
+    /// - that ad is >= 2 behind our tip and `lagging_leader_vc_ms` has passed,
+    ///   or it is 1 behind, arrived >= `lagging_leader_vc_ms` into the round,
+    ///   and 3 x `lagging_leader_vc_ms` has passed.
+    /// A newer ad at our tip clears it. The 4-of-6 quorum still decides.
+    pub fn lagging_leader_fast_vc(&self, height: u64) -> bool {
+        let g = self.lagging_leader_vc_ms;
+        if g == 0 || !self.vote_rounds_at(height) || height != self.tip_height.saturating_add(1) {
+            return false;
+        }
+        if self.still_lagging() {
+            return false;
+        }
+        let pending_here = self
+            .pending_proposal
+            .as_ref()
+            .map(|p| p.height == height)
+            .unwrap_or(false);
+        if pending_here || self.open_bodies.values().any(|b| b.height == height) {
+            return false;
+        }
+        let Some(proposer) = self.round_proposer(self.height_view_round) else {
+            return false;
+        };
+        if proposer == self.id {
+            return false;
+        }
+        let Some(v) = self.validators.get(&proposer) else {
+            return false;
+        };
+        if !v.pong_fresh(self.now_ms, self.cfg.pong_window_ms) {
+            return false;
+        }
+        let Some(t) = v.last_advertised_tip else {
+            return false;
+        };
+        let ad_ms = self.tip_ad_at_ms.get(&proposer).copied().unwrap_or(0);
+        let start = self.round_open_ms.max(self.height_open_ms);
+        if ad_ms < start || start == 0 {
+            return false;
+        }
+        let elapsed = self.now_ms.saturating_sub(start);
+        if t.saturating_add(2) <= self.tip_height {
+            return elapsed >= g;
+        }
+        if t < self.tip_height {
+            return ad_ms.saturating_sub(start) >= g && elapsed >= g.saturating_mul(3);
+        }
+        false
     }
 
     // ------------------------------------------------------------------
