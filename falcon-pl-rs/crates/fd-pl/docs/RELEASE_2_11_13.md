@@ -1,13 +1,16 @@
-# Falcon PL 2.11.13: next-block pre-pack, timing defaults, lock and timer fixes, gated committee redraw (testnet 2300)
+# Falcon PL 2.11.13: next-block pre-pack, timing defaults, lock and timer fixes, bridge-state slimming, gated committee redraw (testnet 2300)
 
-**Rolling-upgrade compatible with 2.11.12 while the redraw is off.** The PR
-ships the redraw activation as a placeholder (`u64::MAX` = never). The release
-build must set it (see "Release-build step" below). From that height it is a
-**consensus change**: every seat must run 2.11.13 with the same constant
-before it, or the network forks at that height.
+**Rolling-upgrade compatible with 2.11.12 while the activation is off.** The
+PR ships one activation height as a placeholder (`u64::MAX` = never) for two
+consensus changes: the committee redraw (f) and the bridge-state slim (D+E,
+`TESTNET_2300_BRIDGE_SLIM_FROM_HEIGHT = TESTNET_2300_REDRAW_FROM_HEIGHT`).
+The release build must set it (see "Release-build step" below). From that
+height it is a **consensus change**: every seat must run 2.11.13 with the same
+constant before it, or the network forks at that height.
 
 Nothing else changes consensus, the block format, signatures, the 4-of-6
-commit QC or the round-0 lottery.
+commit QC or the round-0 lottery. Before activation the state bytes, state
+root and snapshot files are byte-identical to 2.11.12.
 
 ## What changed
 
@@ -97,6 +100,66 @@ This only applies from `TESTNET_2300_REDRAW_FROM_HEIGHT`
   the redraw cannot be entered. If live base seats already OK'd a proposal,
   they cannot vote it, and the redraw can also fall short of 7.
 
+### Bridge-state slimming
+
+**A. Copy-on-write rail header maps (local).** `RailState.headers` is a
+`CachedMap` (Arc + generation counter + cached JSON), like the ETH exec map.
+Cloning the bridge (every pack draft, every mempool-head dry run in
+`sanitize_mempool`, every status call) is now a refcount bump instead of a
+deep copy of ~120 MB of JSON-shaped data. Serialized bytes are unchanged.
+
+**B. Cached map encodings in the state root (local).** The split root hasher
+splices every embedded `CachedMap`'s cached JSON (rail maps and the exec map)
+and memoizes the result by (segment hash, generations). The root bytes and
+value are unchanged; only unchanged maps are no longer re-encoded.
+
+**C. Visibility and snapshot interval (local/config).**
+* Per-phase pack timers: status `pack_phases` {height, txs, sanitize_us,
+  clone_us, hook_us, apply_us, root_us, accept_height, stage_us,
+  stage_root_us} and `root_stats` {full_hashes, memo_hits}.
+* An info log per sealed block: `pack-phases h= txs= pack_ms= sanitize_ms=
+  clone_ms= hook_ms= apply_ms= root_ms= merkle_ms= accept_ms= stage_ms=
+  stage_root_ms= root_full= root_hits=`.
+* `--snapshot-interval-ms` default 300000 (5 min), and
+  `SNAPSHOT_INTERVAL_MS=300000` in `scripts/network-2300.env`.
+
+**D. Prune the frozen legacy BTC rail (CONSENSUS, gated).** At activation the
+legacy `btc` rail keeps its newest 4,032 headers (~4 weeks) plus every
+pinned height (vault UTXO heights, checkpoint, tip). All BTC rails then get a
+hard header cap of 32,768 (`header_cap`, serialized only when set), on top of
+the existing time-based prune. Audit of the live v13 snapshot: no open claim,
+withdrawal or vault item references a header height below the kept window
+(see "Open bridge items" below).
+
+**E. Compact ETH exec headers (CONSENSUS, gated).** At activation every
+stored exec header drops its RLP and keeps hash, parent hash, number,
+receipts root and the timestamp decoded from the RLP. After activation new
+headers are fully RLP-verified on insert, then compacted. Ancestry for
+receipt proofs uses the stored links on compact headers (they were verified
+on insert); the head timestamp comes from the stored field. The conversion is
+one deterministic pass, run once (`bridge_slim` flag) in the ledger hook at
+the activation height. A submitted `timestamp` field is zeroed, not
+rejected, so old and new parsers agree before activation.
+
+**zstd snapshot files (local, follows activation).** After activation the
+snapshot file and the `join.serve` copy are written zstd level 3 (magic
+`28 b5 2f fd`). The loader and the join header peek accept both plain and
+zstd, so old plain snapshots still load. `FPL_SNAPSHOT_ZSTD=0|1` overrides.
+The state hash is computed over the same JSON bytes as before; compression
+only wraps the file. Old binaries cannot read a zstd file, and scripts that
+`jq` the snapshot need `zstd -dc` first.
+
+**Bounded memory (growth simulation, `slim_tests`).**
+| map | steady state | JSON |
+|---|---|---|
+| ETH exec, compact, 7-day window | 50,401 headers | 14.7 MB |
+| BTC4 at sprint rate, capped | 32,768 headers | 14.1 MB |
+| BTC4 at 10-min blocks (14-day retention) | 16,384 headers | 7.0 MB |
+| legacy BTC after activation | 4,032 + pins, frozen | ~1.7 MB (est.) |
+
+Before slim the BTC hard cap was 500,000 headers and ETH headers carried
+their RLP (the live bridge was 120.8 MB JSON; after conversion 20.3 MB).
+
 ## Release-build step (required): set the redraw height
 `falcon-pl-rs/crates/fd-pl/src/params_v2.rs`:
 
@@ -108,7 +171,11 @@ At release-build time:
 1. Read the 2300 tip: `falcon-pl-ctl --addr <seat> status` -> `tip_height`.
 2. Set the constant to **tip + 400** (about 1 h at 9-10 s blocks), so every
    seat has upgraded before it activates.
-3. Rebuild and run `cargo test -p fd-pl --lib redraw_`. The
+   The bridge slim follows automatically
+   (`TESTNET_2300_BRIDGE_SLIM_FROM_HEIGHT = TESTNET_2300_REDRAW_FROM_HEIGHT`).
+   To ship the redraw without the slim (or the reverse), give the slim
+   constant its own value; it is independent in code.
+3. Rebuild and run `cargo test -p fd-pl --lib redraw_ slim`. The
    `placeholder_keeps_redraw_off_on_2300` test asserts `u64::MAX`. Update it
    to the chosen value in the same commit.
 4. Roll every seat before the height. Before each restart, check
@@ -133,6 +200,14 @@ the tight roll window, or use about tip + 9000 (24 h). Leaving it at
    redraw height.
 4. Watch `prepack_warm_used` and the walk/hold logs. Expect a block span
    of about one pack budget plus vote time.
+5. Watch the `pack-phases` log lines and status `pack_phases` / `root_stats`.
+   Snapshots are now written every 5 min (`SNAPSHOT_INTERVAL_MS=300000`).
+6. At the activation height every seat's status shows `bridge_slim: true`
+   with the same `state_root`. The one-off conversion costs ~0.3 s on brain
+   (estimated 0.6-1.5 s on v10). The next snapshot is a zstd file.
+7. Any script that reads snapshot files must handle zstd (`zstd -dc`).
+   Do not roll back to 2.11.12 after activation: it cannot read the files
+   or follow the chain.
 
 ## Tests
 * Pre-pack: `prepack_walk_continues_past_pending_block_and_next_pack_reuses_it`,
@@ -147,3 +222,48 @@ the tight roll window, or use about tip + 9000 (24 h). Leaving it at
 * (f) `redraw_tests::*`: placeholder off, deterministic redraw, dead
   committee recovers and catch-up verifies, OK'd seats excluded, 4 dead
   cannot reach quorum, no base-round OK after the redraw vote
+* Bridge slim: `exec_map::tests::*` (generic CachedMap, two embedded maps
+  splice), `bridge::slim_tests::*` (pre-activation bytes unchanged, legacy
+  keeps newest 4032 + vault pins, BTC4 sprint capped at 32,768, ETH compact
+  window bounded), `eth_v3_deposit_tests::slim_conversion_is_deterministic_idempotent_and_keeps_links`,
+  `v3_mint_and_refund_verify_the_same_after_conversion`,
+  `inserts_after_conversion_are_verified_then_compacted`,
+  `replay_across_slim_activation_agrees` (byte-identical before, same root
+  after, mint after, a node restored from a pre-activation snapshot replays
+  to the same root), `bridge_slim_tests::legacy_btc_pegout_and_double_mint_guard_after_slim`,
+  `bridge_slim_tests::real_snapshot_converts_deterministically` (ignored;
+  `FPL_SLIM_SNAPSHOT=<file>`; run on the live v13 snapshot: 120,811,585 ->
+  20,317,472 B, legacy BTC 79,327 -> 4,035 headers, sha c802eafa4e1bdde2...,
+  same in every run)
+* zstd: `snapshot_zstd_tests::zstd_only_after_slim_and_both_forms_load_to_the_same_state`
+* C: `timing_default_tests` asserts the snapshot interval CLI default equals
+  the profile.
+* Bench: `cargo run --release --example slim_bench -- <snapshot>`.
+
+## Measured on beartec-brain under v10 limits (2 CPU, 3.8 GB, swap)
+Real v13 state. "before" = 2.11.13 without the slim, "after" = activated.
+| | before | after |
+|---|---|---|
+| bridge JSON | 120.8 MB | 20.3 MB |
+| state root, fresh / after small change | 130-140 / 95-105 ms | 27-33 / 12 ms |
+| bridge clone x10 | 305-323 ms | 3-4 ms |
+| pack 28 txs | 1.02-1.10 s | 36-39 ms |
+| pack 200 txs | 2.13-2.30 s | 50-55 ms |
+| accept | 185-208 ms | 5-23 ms |
+| process peak RSS | 513-526 MB | 323-331 MB |
+| snapshot file (seat) | 123 MB, write 101 ms | 7.3 MB zstd, write 70 ms |
+| snapshot file (full v13) | 139.8 MB, write 120 ms | 17.4 MB zstd, write 139 ms |
+
+Brain cores are about 2-5x faster than v10's; v10 figures scale by that
+(estimate, not measured on v10).
+
+## Open bridge items (live v13 snapshot, read-only)
+* Legacy withdrawals: 06420da2e61ceb95 (10,000, refunded), 8016366c35285587
+  (5,000, refunded), bac114a2e2edc941 (50,000, BitVM claim final, CSV 6,
+  open height 132148, has a signed vault tx).
+* 3 vault UTXOs pinned at BTC heights 5127316 / 5127613 / 5127675
+  (100,000 / 180,385 / 88,985 sats), kept by the prune.
+* 1 claim leaf, 10 spent deposits; minted 1,088,370, burned 50,000.
+* None references a header below the kept window. A deposit to the legacy
+  vault in a pruned block that was never minted would need
+  `backfill_btc_headers` before it can be proven.
