@@ -2,6 +2,11 @@
 //! travels as tx ids and is rebuilt from the receiver's mempool,
 //! byte-identical to the full body; missing ids are pulled; anything else
 //! falls back to the full body.
+//!
+//! Run twice: as part of the normal suite (pre-lean rules on the test network)
+//! and alone with lean bodies on:
+//! `FPL_LEAN_BODY_FROM_HEIGHT=0 cargo test -p fd-pl --release --lib compact_relay -- --nocapture`
+//! (the env var is process-wide, so the lean run filters to this module).
 
 use super::*;
 
@@ -117,6 +122,16 @@ fn compact_shell_is_much_smaller() {
     let (_net, _p, _peer, led) = sealed(400, true);
     let full = wire_len(&WireMsg::LedgerBody { ledger: led.clone() });
     let shell = wire_len(&WireMsg::LedgerBodyById { ledger: Node::compact_shell(&led) });
+    let v = serde_json::to_value(Node::compact_shell(&led)).unwrap();
+    let mut f: Vec<(usize, String)> = v.as_object().unwrap().iter().map(|(k, x)| (x.to_string().len(), k.clone())).collect();
+    f.sort();
+    println!("SHELLFIELDS {:?}", f.iter().rev().take(8).collect::<Vec<_>>());
     println!("COMPACT txs={} full_bytes={full} shell_bytes={shell} ratio={:.1}x", led.txs.len(), full as f64 / shell as f64);
-    assert!(shell * 5 < full, "shell {shell} vs full {full}");
+    if crate::params_v2::lean_body_active(led.network_id, led.height) {
+        assert!(Node::compact_relay_eligible(&led));
+        assert!(shell * 5 < full, "lean shell {shell} vs full {full}");
+    } else {
+        // Pre-lean batch bodies keep per-tx paths and are not sent compact.
+        assert!(!Node::compact_relay_eligible(&led));
+    }
 }
