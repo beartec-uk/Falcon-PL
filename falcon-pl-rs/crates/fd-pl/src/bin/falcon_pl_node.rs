@@ -2720,9 +2720,10 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
             .with(fd_pl::health::WarnCapture)
             .init();
     }
-    info!("tokio worker threads={tokio_workers}");
-
+    // After `Args::parse()`: `--version` / `--help` exit inside it and must
+    // print only the version (the release build and installers read it).
     let mut args = Args::parse();
+    info!("tokio worker threads={tokio_workers}");
     let role = NodeRole::parse(&args.role)
         .or_else(|| {
             std::env::args()
