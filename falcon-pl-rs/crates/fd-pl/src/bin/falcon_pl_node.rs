@@ -6075,6 +6075,7 @@ fn process_msg(
                         n.note_want_body(height, &hash);
                         n.last_want_body_ms = n.now_ms.saturating_add(wait + 600);
                         CompactRelayStats::bump(&shared.cr.waited, 1);
+                        info!("body-ids seat={me} h={height} n={n_ids} have={} miss={miss} wait={wait}ms", n_ids - miss);
                         return None;
                     }
                     CompactRelayStats::bump(&shared.cr.pulled, 1);

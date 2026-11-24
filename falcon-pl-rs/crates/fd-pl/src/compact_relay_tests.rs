@@ -194,7 +194,12 @@ fn carried_shell_is_much_smaller_than_full_when_little_is_fresh() {
     assert_eq!(carried, 6);
     let full = wire_len(&WireMsg::LedgerBody { ledger: led.clone() });
     let comp = wire_len(&WireMsg::LedgerBodyById { ledger: shell });
-    assert!(comp * 3 < full, "compact {comp} vs full {full}");
+    if crate::params_v2::lean_body_active(led.network_id, led.height) {
+        assert!(comp * 3 < full, "compact {comp} vs full {full}");
+    } else {
+        // Pre-lean: per-tx batch paths stay in the shell (ineligible live).
+        assert!(comp < full, "compact {comp} vs full {full}");
+    }
 }
 
 #[test]
