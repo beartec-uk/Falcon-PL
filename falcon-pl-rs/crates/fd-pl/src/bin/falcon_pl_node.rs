@@ -1200,6 +1200,12 @@ struct Args {
     /// (2 windows) cannot fire because of it.
     #[arg(long, default_value_t = 2500)]
     min_block_interval_ms: u64,
+    /// 2.11.18 compact block relay (off by default): send a sealed lean
+    /// Merkle-batch proposal to the body lane as tx ids (`LedgerBodyById`).
+    /// Receivers rebuild it from their mempool, pull missing ids, and fall
+    /// back to the full body. Turn on only once every seat runs 2.11.18.
+    #[arg(long, default_value_t = false)]
+    compact_body_relay: bool,
     /// v2.9.59: pacing ends early once the local mempool holds this many txs.
     #[arg(long, default_value_t = 400)]
     pace_mempool_txs: usize,
@@ -1356,6 +1362,8 @@ struct Shared {
     hub_peer_idxs: Vec<usize>,
     is_hub: bool,
     is_archive: bool,
+    /// 2.11.18 `--compact-body-relay`.
+    compact_body_relay: bool,
     snapshot_out: PathBuf,
     snap_meta: Mutex<Option<SnapMeta>>,
     /// One publish of the served join file at a time. Two NeedSnapshot
@@ -3223,6 +3231,7 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
         hub_peer_idxs,
         is_hub: args.hub,
         is_archive: args.archive,
+        compact_body_relay: args.compact_body_relay,
         snapshot_out: PathBuf::from(&args.snapshot_out),
         snap_meta: Mutex::new(None),
         snap_publish: Mutex::new(()),
@@ -4414,11 +4423,21 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                                                 let _ = std::fs::remove_file("/tmp/fpl-only-pack");
                                             }
                                             drop(n);
-                                            shared_c.fan_ledger_body(
-                                                &fanout,
-                                                &WireMsg::LedgerBody { ledger: wire },
-                                                &seats,
-                                            );
+                                            let body_msg = if shared_c.compact_body_relay
+                                                && fd_pl::Node::compact_relay_eligible(&wire)
+                                            {
+                                                let shell = fd_pl::Node::compact_shell(&wire);
+                                                let sb = serde_json::to_string(&WireMsg::LedgerBodyById {
+                                                    ledger: shell.clone(),
+                                                })
+                                                .map(|s| s.len())
+                                                .unwrap_or(0);
+                                                info!("compact-body h={} txs={} bytes={sb} full={bytes}", wire.height, wire.txs.len());
+                                                WireMsg::LedgerBodyById { ledger: shell }
+                                            } else {
+                                                WireMsg::LedgerBody { ledger: wire }
+                                            };
+                                            shared_c.fan_ledger_body(&fanout, &body_msg, &seats);
                                             // Header still goes to seats that are not on the body lane.
                                             if let Ok(line) = serde_json::to_string(&header) {
                                                 shared_c.fan_line_except(&fanout, line + "\n", &seats);
@@ -5881,6 +5900,12 @@ fn process_msg(
                         "body-ids seat={me} h={height} n={n_ids} have={} miss={miss} pull",
                         n_ids.saturating_sub(miss)
                     );
+                    // 2.11.18: if the id pull does not finish the body, the
+                    // periodic full-body pull takes over after ~800 ms.
+                    if height > n.tip_height {
+                        n.note_want_body(height, &hash);
+                        n.last_want_body_ms = n.now_ms.saturating_add(600);
+                    }
                     drop(n);
                     let ask = WireMsg::NeedTxsByIds {
                         ledger_hash: hash,
@@ -8016,6 +8041,7 @@ mod inbound_ack_tests {
             hub_peer_idxs: Vec::new(),
             is_hub: true,
             is_archive: false,
+            compact_body_relay: false,
             snapshot_out: PathBuf::from("/tmp/falcon-test-snap.bin"),
             snap_meta: parking_lot::Mutex::new(None),
             snap_publish: parking_lot::Mutex::new(()),

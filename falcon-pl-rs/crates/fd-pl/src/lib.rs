@@ -5484,9 +5484,42 @@ impl Node {
             self.body_shells.insert(hash.clone(), ledger);
             return Err((hash, missing));
         }
+        // 2.11.18 compact relay: a Merkle-batch body is rebuilt in the exact
+        // wire form the packer sealed (lean `b64:` sigs, keys the parent state
+        // already holds left off), so it is byte-identical to the full body.
+        if !ledger.batch_sig.is_empty() {
+            let lean = crate::params_v2::lean_body_active(ledger.network_id, ledger.height);
+            for tx in &mut txs {
+                if lean {
+                    if let Some(l) = crate::crypto::sig_to_lean(&tx.signature) {
+                        tx.signature = l;
+                    }
+                }
+                if !tx.body.reads_signer_key()
+                    && self.account_public_key(&tx.account).as_deref() == Some(tx.public_key.as_str())
+                {
+                    tx.public_key.clear();
+                }
+            }
+        }
         ledger.txs = txs;
         self.body_shells.remove(&ledger.ledger_hash);
         Ok(ledger)
+    }
+
+    /// 2.11.18: may this sealed body go out as a compact by-id shell? Lean
+    /// Merkle-batch bodies (no per-tx paths) and plain bodies only; a pre-lean
+    /// batch body keeps per-tx paths and goes out in full.
+    pub fn compact_relay_eligible(ledger: &Ledger) -> bool {
+        !ledger.txs.is_empty() && (ledger.batch_sig.is_empty() || ledger.batch_paths.is_empty())
+    }
+
+    /// 2.11.18: the by-id shell of a sealed body (header fields, tx ids and the
+    /// batch signature; no txs).
+    pub fn compact_shell(ledger: &Ledger) -> Ledger {
+        let mut by_id = ledger.clone();
+        by_id.txs.clear();
+        by_id
     }
 
     /// Most txs `body_fill` keeps. It is a short-lived cache for compact
@@ -17515,6 +17548,8 @@ mod pack_fix_21112_tests;
 mod prepack_tests;
 #[cfg(test)]
 mod sanitize_fast_tests;
+#[cfg(test)]
+mod compact_relay_tests;
 #[cfg(test)]
 mod hold_cap_tests;
 #[cfg(test)]
