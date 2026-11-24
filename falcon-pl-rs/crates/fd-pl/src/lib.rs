@@ -3731,6 +3731,9 @@ pub struct Node {
     pub prepack_runs: u64,
     /// Pre-verified txs the last pack used without a second signature check.
     pub prepack_warm_used: usize,
+    /// 2.11.13: wall-clock phases of the last pack and the last accept stage
+    /// (status `pack_phases`, `pack-phases` info log in the node binary).
+    pub pack_phases: PackPhases,
     /// Local clock when the current tip opened (or last standby skip). Used for
     /// progress-timeout: if #1 seals nothing, #2 gets a turn after timeout + skip QC.
     pub height_open_ms: u64,
@@ -4193,6 +4196,7 @@ impl Node {
             prepack_txs: 0,
             prepack_runs: 0,
             prepack_warm_used: 0,
+            pack_phases: PackPhases::default(),
             height_open_ms: now_ms,
             genesis_ms: now_ms,
             treasury: TREASURY_GENESIS,
@@ -13592,6 +13596,7 @@ impl Node {
         let pending = self.pending_slashes.clone();
         let _seized = self.apply_time_effects_with_slashes(stamp, true, &pending);
         // One clone of the draft per pack (not per candidate tx — v2.9.49).
+        let t_clone = std::time::Instant::now();
         let mut draft = PackDraft {
             state: self.state.clone(),
             defi: self.defi.clone(),
@@ -13601,9 +13606,13 @@ impl Node {
             work: self.epoch_work.clone(),
         };
         ckpt.restore(self);
+        let clone_us = t_clone.elapsed().as_micros() as u64;
         // Same cut as verify (`stage_drafts`) and commit. Before tx select,
         // so the activation block prunes even when it carries no ETH tx.
+        let t_hook = std::time::Instant::now();
         self.prune_eth_exec_for_ledger(&mut draft.bridge, height);
+        let hook_us = t_hook.elapsed().as_micros() as u64;
+        let t_apply = std::time::Instant::now();
         let r0 = self.rv2_round0(height);
         let me = self.id.clone();
         let voters = self
@@ -13807,6 +13816,8 @@ impl Node {
         let skipped = self.skip_claims_for_packer(packer)?;
         let parent_cert = self.tip_parent_cert()?;
         // Slash already applied in the draft preamble (before tx select).
+        let apply_us = t_apply.elapsed().as_micros() as u64;
+        let t_root = std::time::Instant::now();
         let root = Self::commitment_root_parts(
             &draft.state,
             &draft.defi,
@@ -13814,6 +13825,12 @@ impl Node {
             &draft.vals,
             &draft.claim,
         );
+        self.pack_phases.height = height;
+        self.pack_phases.txs = chosen.len();
+        self.pack_phases.clone_us = clone_us;
+        self.pack_phases.hook_us = hook_us;
+        self.pack_phases.apply_us = apply_us;
+        self.pack_phases.root_us = t_root.elapsed().as_micros() as u64;
         let mut led = if self.qc_v4_at(height) {
             self.seal_v4_ledger(
                 height,
@@ -14944,10 +14961,16 @@ impl Node {
     }
 
     fn verify_ledger_state_root(&mut self, ledger: &Ledger) -> Result<u64, String> {
+        let t_stage = std::time::Instant::now();
         let (draft, fee_total, last_settled) = self.stage_drafts(ledger)?;
+        let stage_us = t_stage.elapsed().as_micros() as u64;
         // v2.9.59: normally a memo hit — the node binary precomputed this
         // exact root outside `node.lock` ([`Self::prestage_root_input`]).
+        let t_root = std::time::Instant::now();
         let root = draft.root();
+        self.pack_phases.accept_height = ledger.height;
+        self.pack_phases.stage_us = stage_us;
+        self.pack_phases.stage_root_us = t_root.elapsed().as_micros() as u64;
         if root != ledger.state_root_after {
             return Err(format!(
                 "state root mismatch at h={} (local now_ms={} sealed_at_ms={} last_settled={})",
@@ -16044,6 +16067,11 @@ impl Node {
             "prepack_txs": self.prepack_txs,
             "prepack_runs": self.prepack_runs,
             "prepack_warm_used": self.prepack_warm_used,
+            "pack_phases": self.pack_phases,
+            "root_stats": {
+                "full_hashes": crate::exec_map::root_stats().0,
+                "memo_hits": crate::exec_map::root_stats().1,
+            },
             "schedule_height": self.schedule_height,
             "schedule_online_hash": self.schedule_online_hash,
             "height_view_round": self.height_view_round,
@@ -16459,6 +16487,30 @@ pub struct CatchupPlan {
 // ---------------------------------------------------------------------------
 // Pack draft + per-tx rollback (v2.9.49)
 // ---------------------------------------------------------------------------
+
+/// 2.11.13: wall-clock phases (µs) of the last pack and accept stage.
+/// Local metrics only (status / logs), never consensus.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackPhases {
+    /// Height of the last pack.
+    pub height: u64,
+    /// Txs in the last pack.
+    pub txs: usize,
+    /// Draft clone (state, defi, bridge, validators, claimable, work).
+    pub clone_us: u64,
+    /// Per-ledger bridge hook (ETH prune, 2.11.13 bridge slim at activation).
+    pub hook_us: u64,
+    /// Tx select + apply (incl. signature checks).
+    pub apply_us: u64,
+    /// Commitment root of the packed draft.
+    pub root_us: u64,
+    /// Height of the last accept stage.
+    pub accept_height: u64,
+    /// `stage_drafts` (re-apply) during accept.
+    pub stage_us: u64,
+    /// Root of the staged draft (normally a memo hit).
+    pub stage_root_us: u64,
+}
 
 /// The six state slices a pack dry-run mutates. Cloned **once** per pack.
 #[derive(Debug, Clone)]

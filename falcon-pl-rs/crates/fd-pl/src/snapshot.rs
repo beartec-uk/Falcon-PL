@@ -597,6 +597,7 @@ impl Node {
             prepack_txs: 0,
             prepack_runs: 0,
             prepack_warm_used: 0,
+            pack_phases: crate::PackPhases::default(),
             height_open_ms: snap.height_open_ms,
             genesis_ms: snap.genesis_ms,
             treasury: snap.treasury,

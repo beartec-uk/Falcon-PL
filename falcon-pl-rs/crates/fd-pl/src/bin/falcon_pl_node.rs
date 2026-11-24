@@ -1131,6 +1131,9 @@ fn seat_payout_sync(shared: &Arc<Shared>, id: &str, want: &str) {
 }
 
 /// 2.11.13 seat timing defaults (match `scripts/network-2300.env`).
+/// 2.11.13: seat snapshot interval default (`--snapshot-interval-ms`,
+/// `SNAPSHOT_INTERVAL_MS` in scripts/network-2300.env).
+const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 300_000;
 const DEFAULT_PACK_BUDGET_MS: u64 = 5_000;
 const DEFAULT_PROGRESS_TIMEOUT_MS: u64 = 4_000;
 const DEFAULT_MAX_TXS: usize = 200;
@@ -1194,8 +1197,10 @@ struct Args {
     /// Periodically save snapshot to this path (empty = disabled).
     #[arg(long, default_value = "")]
     snapshot_out: String,
-    /// Snapshot save interval ms (default 60s).
-    #[arg(long, default_value_t = 60_000)]
+    /// Snapshot save interval ms. 2.11.13: default 300 s (was 60 s); each
+    /// write competes with packing on a 2 vCPU seat and a restart catches up
+    /// the remaining blocks from peers. Minimum 5 s.
+    #[arg(long, default_value_t = DEFAULT_SNAPSHOT_INTERVAL_MS)]
     snapshot_interval_ms: u64,
     /// Base min fee when mempool idle (escalates by util tier).
     #[arg(long, default_value_t = 1)]
@@ -4293,15 +4298,38 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                                 let parent = n.chain.last().map(|l| l.sealed_at_ms).unwrap_or(0);
                                 n.now_ms = parent.saturating_add(1_000);
                             }
+                            let t_pack = std::time::Instant::now();
                             match n.pack_or_skip(&my_id) {
                                 Ok(Some(mut ledger)) => {
+                                    let pack_ms = t_pack.elapsed().as_millis();
                                     n.pack_over_budget = false;
+                                    let t_merkle = std::time::Instant::now();
                                     if let Err(e) = ledger.attach_merkle_batch_known(&n.keys, &|id| {
                                         n.account_public_key(id)
                                     }) {
                                         warn!("merkle batch: {e}");
                                     }
-                                    match n.accept_ledger(&ledger) {
+                                    let merkle_ms = t_merkle.elapsed().as_millis();
+                                    let t_accept = std::time::Instant::now();
+                                    let accepted = n.accept_ledger(&ledger);
+                                    let accept_ms = t_accept.elapsed().as_millis();
+                                    {
+                                        // 2.11.13: where the time under node.lock goes.
+                                        let p = n.pack_phases;
+                                        let (full, hits) = fd_pl::exec_map::root_stats();
+                                        info!(
+                                            "pack-phases h={} txs={} pack_ms={pack_ms} clone_ms={} hook_ms={} apply_ms={} root_ms={} merkle_ms={merkle_ms} accept_ms={accept_ms} stage_ms={} stage_root_ms={} root_full={full} root_hits={hits}",
+                                            ledger.height,
+                                            ledger.txs.len(),
+                                            p.clone_us / 1000,
+                                            p.hook_us / 1000,
+                                            p.apply_us / 1000,
+                                            p.root_us / 1000,
+                                            p.stage_us / 1000,
+                                            p.stage_root_us / 1000,
+                                        );
+                                    }
+                                    match accepted {
                                         Ok(r) => {
                                             let committed = n.tip_height >= r.height
                                                 && n.tip_hash == ledger.ledger_hash;
@@ -9533,6 +9561,7 @@ mod timing_default_tests {
         assert_eq!(a.pack_budget_ms, 5_000);
         assert_eq!(a.progress_timeout_ms, 4_000);
         assert_eq!(a.max_txs, 200);
+        assert_eq!(a.snapshot_interval_ms, 300_000);
     }
 
     #[test]
@@ -9540,6 +9569,7 @@ mod timing_default_tests {
         assert_eq!(profile("PACK_BUDGET_MS"), DEFAULT_PACK_BUDGET_MS);
         assert_eq!(profile("PROGRESS_TIMEOUT_MS"), DEFAULT_PROGRESS_TIMEOUT_MS);
         assert_eq!(profile("MAX_TXS") as usize, DEFAULT_MAX_TXS);
+        assert_eq!(profile("SNAPSHOT_INTERVAL_MS"), DEFAULT_SNAPSHOT_INTERVAL_MS);
     }
 
     #[test]
