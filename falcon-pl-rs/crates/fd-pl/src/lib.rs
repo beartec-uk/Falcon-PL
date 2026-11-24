@@ -11663,7 +11663,12 @@ impl Node {
 
     pub fn pack_or_skip(&mut self, packer: &str) -> Result<Option<Ledger>, String> {
         self.may_pack_locally(packer)?;
+        // Per-head dry runs clone the drafts once per mempool head; before
+        // the copy-on-write rail maps that was a deep copy of every rail
+        // header per head (2.11.13 bench: ~1 s of a 28-tx pack).
+        let t_sanitize = std::time::Instant::now();
         let _ = self.sanitize_mempool();
+        self.pack_phases.sanitize_us = t_sanitize.elapsed().as_micros() as u64;
         match self.pack_as(packer) {
             Ok(l) => Ok(Some(l)),
             Err(e) if e.contains("empty mempool") => {
@@ -16509,6 +16514,8 @@ pub struct PackPhases {
     pub height: u64,
     /// Txs in the last pack.
     pub txs: usize,
+    /// Mempool head dry runs before the pack (`sanitize_mempool`).
+    pub sanitize_us: u64,
     /// Draft clone (state, defi, bridge, validators, claimable, work).
     pub clone_us: u64,
     /// Per-ledger bridge hook (ETH prune, 2.11.13 bridge slim at activation).
@@ -17276,6 +17283,8 @@ mod snapshot_chunk_tests;
 mod redraw_tests;
 #[cfg(test)]
 mod snapshot_zstd_tests;
+#[cfg(test)]
+mod bridge_slim_tests;
 mod merkle_batch_tests;
 #[cfg(test)]
 mod lean_body_tests;

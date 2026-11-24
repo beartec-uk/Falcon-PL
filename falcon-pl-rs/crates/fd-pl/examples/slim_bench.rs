@@ -205,7 +205,7 @@ fn slim_convert(b: &mut fd_pl::bridge::BridgeState, t: Instant) -> String {
 }
 fn phases(n: &fd_pl::Node, tag: &str) {
     let p = n.pack_phases;
-    for (k, v) in [("clone", p.clone_us), ("hook", p.hook_us), ("apply", p.apply_us), ("root", p.root_us), ("stage", p.stage_us), ("stage_root", p.stage_root_us)] {
+    for (k, v) in [("sanitize", p.sanitize_us), ("clone", p.clone_us), ("hook", p.hook_us), ("apply", p.apply_us), ("root", p.root_us), ("stage", p.stage_us), ("stage_root", p.stage_root_us)] {
         res(&format!("{tag}_{k}_ms"), format!("{:.1}", v as f64 / 1000.0));
     }
 }

@@ -4334,9 +4334,10 @@ async fn node_main(tokio_workers: usize) -> Result<()> {
                                         let p = n.pack_phases;
                                         let (full, hits) = fd_pl::exec_map::root_stats();
                                         info!(
-                                            "pack-phases h={} txs={} pack_ms={pack_ms} clone_ms={} hook_ms={} apply_ms={} root_ms={} merkle_ms={merkle_ms} accept_ms={accept_ms} stage_ms={} stage_root_ms={} root_full={full} root_hits={hits}",
+                                            "pack-phases h={} txs={} pack_ms={pack_ms} sanitize_ms={} clone_ms={} hook_ms={} apply_ms={} root_ms={} merkle_ms={merkle_ms} accept_ms={accept_ms} stage_ms={} stage_root_ms={} root_full={full} root_hits={hits}",
                                             ledger.height,
                                             ledger.txs.len(),
+                                            p.sanitize_us / 1000,
                                             p.clone_us / 1000,
                                             p.hook_us / 1000,
                                             p.apply_us / 1000,
