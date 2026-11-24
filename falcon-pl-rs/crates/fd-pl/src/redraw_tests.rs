@@ -91,10 +91,10 @@ fn split(net: &Network, n_dead: usize) -> (Vec<String>, Vec<String>) {
 
 #[test]
 fn placeholder_keeps_redraw_off_on_2300() {
-    // 2.11.13 release: 2300 activates redraw + bridge slim together at 945364.
-    assert_eq!(crate::params_v2::TESTNET_2300_REDRAW_FROM_HEIGHT, 945_364);
-    assert_eq!(crate::params_v2::redraw_from_height(2300), 945_364);
-    assert_eq!(crate::params_v2::bridge_slim_from_height(2300), 945_364);
+    // 2.11.13 release: 2300 activates redraw + bridge slim together at 945474.
+    assert_eq!(crate::params_v2::TESTNET_2300_REDRAW_FROM_HEIGHT, 945_474);
+    assert_eq!(crate::params_v2::redraw_from_height(2300), 945_474);
+    assert_eq!(crate::params_v2::bridge_slim_from_height(2300), 945_474);
     let mut net = ten_after_one();
     let (_dead, live) = split(&net, 3);
     // Not armed (devnet default without FPL_REDRAW_FROM_HEIGHT): no redraw.

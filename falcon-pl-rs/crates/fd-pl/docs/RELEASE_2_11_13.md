@@ -1,5 +1,7 @@
 # Falcon PL 2.11.13: next-block pre-pack, timing defaults, lock and timer fixes, bridge-state slimming, gated committee redraw (testnet 2300)
 
+> **Release build: activation height 945474 on testnet 2300** (redraw and bridge slim together; set at tip 944994 + 480). Every seat must run 2.11.13 before block 945474.
+
 **Rolling-upgrade compatible with 2.11.12 while the activation is off.** The
 PR ships one activation height as a placeholder (`u64::MAX` = never) for two
 consensus changes: the committee redraw (f) and the bridge-state slim (D+E,
