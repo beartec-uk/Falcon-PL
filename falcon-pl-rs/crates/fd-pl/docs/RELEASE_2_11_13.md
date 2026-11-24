@@ -160,6 +160,58 @@ only wraps the file. Old binaries cannot read a zstd file, and scripts that
 Before slim the BTC hard cap was 500,000 headers and ETH headers carried
 their RLP (the live bridge was 120.8 MB JSON; after conversion 20.3 MB).
 
+### Fixes found while verifying 2.11.13 (local)
+* **Restart catch-up stall.** A seat restarted from its snapshot could sit
+  on its old tip forever while the network moved on (also on 2.11.12).
+  Cause: lower seat ids dial higher ones, so a seat yields its own dial to
+  every lower-id peer and talks to them over their inbound sessions. The
+  catch-up router still picked the outbound lane for those peers; that lane
+  is parked for `YIELD_DIAL_SECS` (60 s) and never drained, so every
+  `NeedLedgers` went into a dead queue. A top-id seat (every peer dials it)
+  never got a single ledger. Fix: when a peer has a live inbound session,
+  the pull goes on that session (`NeedLedgers → inbound <id> (our dial
+  yielded)` in the log). Test: `catchup_pull_goes_to_live_inbound_when_our_dial_yielded`.
+* **Debug-build v4-freeze check.** `load_snapshot` freezes the open height
+  before the node applies `keys/lc/bridge.json`, so the check compared a v7
+  draw with the sealed v8 next-6 and panicked (debug builds only) on any
+  snapshot with more than 6 bonded seats, such as the live v13 one. Release
+  always used the sealed set (verified on accept), so consensus was never
+  affected. The check now runs only once the node draws in v8 mode. Test:
+  `redraw_tests::ten_seat_v4_snapshot_loads_with_sealed_next_committee`.
+* **Flaky UTC test.** `utc_rehearsal_tests` set
+  `FPL_UTC_HELLO_ENFORCE_FROM_HEIGHT` process-wide while a sibling test read
+  it. The tests that set or read it now share a lock that also clears it.
+
+* **Silent pack deferral.** A tx that failed with a non-permanent error stayed
+  in the mempool and was skipped at every pack with nothing in the log. The
+  pack now logs `falcon-pl pack defer <tx> seq <n> <account>: <reason>` once
+  per tx. This is how the rehearsal peg-out stall below was found.
+
+### Found, not fixed
+* **Joiner whose id sorts above every seat.** If no seat lists it in
+  `--peers`, every seat refuses its inbound ("we dial them") while it yields
+  its own dials, so it never connects. This comes from the two-sided dial
+  rule (`lower id dials`), and changing it needs its own review. The live
+  joiners (nodesafe, scottspersonalnode) sort below `v*`, so they are not
+  affected.
+* **BTC peg-outs need `keys/bitvm-abort-seed` on every seat.** This is by
+  design (`falcon-pl-ctl bitvm-abort-seed`, same seed on every seat). Without
+  it the withdraw stays in the mempool, and is now logged as a pack defer.
+
+### Activation rehearsal (6 seats, loopback, slim at h60, 30 tx/s, BTC fixture)
+* All 6 seats converted at h63: `bridge_slim:true`, same tip and root, 0
+  mismatches. Blocks continued.
+* Mints worked before and after activation (200,000 sats, 2 UTXOs). A
+  double mint was refused ("deposit already spent").
+* After activation, a peg-out of 50,000 was packed: burned 50,000,
+  withdrawals 1, faucet 150,000.
+* v6 was killed, restarted 30 s later from its zstd snapshot, and caught up
+  in under 30 s via `NeedLedgers → inbound v1 (our dial yielded)`.
+* A fresh joiner adopted a zstd snapshot from v1 (tip 139, 5.2 MB, 20
+  chunks, 0.25 s). It then had the same tip and root as v1 and v6.
+* pack-phases (loopback): 98 txs, pack_ms 10, sanitize 2, apply 1, accept
+  12.
+
 ## Release-build step (required): set the redraw height
 `falcon-pl-rs/crates/fd-pl/src/params_v2.rs`:
 

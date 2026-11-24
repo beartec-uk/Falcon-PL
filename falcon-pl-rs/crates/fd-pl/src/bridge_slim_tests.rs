@@ -171,3 +171,55 @@ fn real_snapshot_converts_deterministically() {
         sha256_hex(&bx)
     );
 }
+
+/// Debug helper for loopback rehearsals: apply a recorded legacy BTC withdraw
+/// (`FPL_WD_JSON` = rehearse_btc output) on a recorded snapshot.
+#[test]
+#[ignore]
+fn rehearsal_withdraw_replay() {
+    let path = std::env::var("FPL_WD_SNAPSHOT").expect("FPL_WD_SNAPSHOT");
+    let wd: serde_json::Value = serde_json::from_str(&std::env::var("FPL_WD_JSON").unwrap()).unwrap();
+    let mut n = Node::load_snapshot(&path, KeyRing::new(CryptoScheme::HmacDev)).unwrap();
+    let vp: crate::vault::VaultPub = serde_json::from_str(&std::fs::read_to_string(std::env::var("FPL_WD_VAULT").unwrap()).unwrap()).unwrap();
+    n.bridge.rail_mut(bridge::RAIL_BTC).unwrap().local_vault_pub = Some(vp);
+    let r = n.rail_withdraw_full(
+        bridge::RAIL_BTC,
+        "faucet",
+        50_000,
+        "n1fH7uhaDauQYfuwG6t1aTncvyuBSZtDEY",
+        wd["vault_sig"].as_str(),
+        wd["signed_btc_tx"].as_str(),
+    );
+    eprintln!("WITHDRAW RESULT {r:?}");
+    // The same withdraw as a signed tx through admission, sanitize and apply.
+    let k = KeyRing::load_dir(std::env::var("FPL_WD_KEYS").unwrap()).unwrap();
+    let mut n = Node::load_snapshot(&path, k.clone()).unwrap();
+    let vp: crate::vault::VaultPub = serde_json::from_str(&std::fs::read_to_string(std::env::var("FPL_WD_VAULT").unwrap()).unwrap()).unwrap();
+    n.bridge.rail_mut(bridge::RAIL_BTC).unwrap().local_vault_pub = Some(vp);
+        let seq = n.state.get("faucet").sequence;
+    let body = TxBody::RailWithdraw {
+        asset: bridge::RAIL_BTC.into(),
+        amount: 50_000,
+        external_to: "n1fH7uhaDauQYfuwG6t1aTncvyuBSZtDEY".into(),
+        vault_sig: wd["vault_sig"].as_str().unwrap().into(),
+        signed_btc_tx: wd["signed_btc_tx"].as_str().unwrap().into(),
+    };
+    let outer: u64 = std::env::var("FPL_WD_OUTER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let tx = Tx::sign_body(&k, "faucet", seq, "", outer, 2, n.cfg.network_id, body).unwrap();
+    let mut n2 = Node::load_snapshot(&path, k.clone()).unwrap();
+    n2.bridge.rail_mut(bridge::RAIL_BTC).unwrap().local_vault_pub = n.bridge.rail(bridge::RAIL_BTC).unwrap().local_vault_pub.clone();
+    eprintln!("SUBMIT {:?}", n.submit_tx(tx.clone()));
+    eprintln!("SANITIZE {:?} pool_after={}", n.sanitize_mempool(), n.mempool.len());
+    eprintln!("APPLY {:?}", n2.apply_protocol_tx(&tx));
+    n.started_ms = 0;
+    for id in ["v1", "v2", "v3", "v4", "v5", "v6"] {
+        let mut m = Node::load_snapshot(&path, k.clone()).unwrap();
+        m.bridge.rail_mut(bridge::RAIL_BTC).unwrap().local_vault_pub = n.bridge.rail(bridge::RAIL_BTC).unwrap().local_vault_pub.clone();
+        m.started_ms = 0;
+        m.id = id.into();
+        let _ = m.submit_tx(tx.clone());
+        let r = m.pack_as_inner(id, true);
+        eprintln!("PACK as {id}: {:?} fail={:?} pool={}", r.as_ref().map(|l| (l.tx_ids.len(), l.tx_ids.contains(&tx.tx_id))), m.last_apply_fail_tx, m.mempool.len());
+    }
+    eprintln!("POOL after pack {}", n.mempool.len());
+}

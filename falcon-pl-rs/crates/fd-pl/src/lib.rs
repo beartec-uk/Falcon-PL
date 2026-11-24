@@ -13822,6 +13822,14 @@ impl Node {
                         // Transient / activation-gated failure (e.g. EthLcUpdate waiting
                         // for activation height). Permanent failures are matched above and
                         // evicted into `drop_ids` + `perm_dropped`.
+                        // 2.11.13: say why once per tx (a tx held back every
+                        // pack was invisible in the log).
+                        if pack_defer_first_seen(&tx.tx_id) {
+                            eprintln!(
+                                "falcon-pl pack defer {} seq {} {}: {_e}",
+                                tx.tx_id, tx.sequence, tx.account
+                            );
+                        }
                     }
                 }
             }
@@ -17294,6 +17302,21 @@ mod snapshot_chunk_tests;
 mod redraw_tests;
 #[cfg(test)]
 mod snapshot_zstd_tests;
+/// First time this process defers `tx_id` at pack (bounded memory).
+fn pack_defer_first_seen(tx_id: &str) -> bool {
+    static SEEN: std::sync::Mutex<std::collections::VecDeque<String>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if g.iter().any(|t| t == tx_id) {
+        return false;
+    }
+    if g.len() >= 512 {
+        g.pop_front();
+    }
+    g.push_back(tx_id.to_string());
+    true
+}
+
 #[cfg(test)]
 mod bridge_slim_tests;
 mod merkle_batch_tests;
