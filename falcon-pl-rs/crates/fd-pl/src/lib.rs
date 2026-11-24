@@ -388,7 +388,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.14";
+pub const PRODUCT_VERSION: &str = "2.11.15";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -3771,6 +3771,14 @@ pub struct Node {
     pub perm_head_memo_since_ms: u64,
     /// Process-lifetime count of head dry-runs (each one clones the drafts).
     pub perm_head_dry_runs: u64,
+    /// 2.11.15: head signatures verified by sanitize (not already warm).
+    pub sanitize_sig_checks: u64,
+    /// 2.11.15: heads re-checked on a fresh clone before a drop.
+    pub sanitize_confirm_runs: u64,
+    /// 2.11.15: head signatures sanitize checked at this tip (tx id -> key
+    /// checked with). Read by the pack like `sig_warm`; cleared with the
+    /// head memo, kept apart so the pre-pack walk is unchanged.
+    pub sanitize_sig_warm: BTreeMap<String, Option<String>>,
     /// v2.9.77: tx ids this seat dropped as permanently invalid (sanitize,
     /// pack drop, refused same-seq replacement). Gossip must not re-admit
     /// them, or seats ping-pong a poison tx forever and it keeps evicting the
@@ -4218,6 +4226,9 @@ impl Node {
             perm_head_memo_tip: String::new(),
             perm_head_memo_since_ms: 0,
             perm_head_dry_runs: 0,
+            sanitize_sig_checks: 0,
+            sanitize_confirm_runs: 0,
+            sanitize_sig_warm: BTreeMap::new(),
             perm_dropped: PermDropSet::default(),
             last_apply_fail_tx: None,
             evicted_since_last_seal: false,
@@ -11282,6 +11293,7 @@ impl Node {
             || self.now_ms < self.perm_head_memo_since_ms
         {
             self.perm_head_memo.clear();
+            self.sanitize_sig_warm.clear();
             self.perm_head_memo_tip = self.tip_hash.clone();
             self.perm_head_memo_since_ms = self.now_ms;
         }
@@ -11295,6 +11307,150 @@ impl Node {
         if heads.is_empty() {
             return 0;
         }
+        if sanitize_legacy() {
+            return self.drop_permanent_heads_full_clone(heads);
+        }
+        self.drop_permanent_heads_shared_draft(heads)
+    }
+
+    /// 2.11.15: the head dry-run, fast path.
+    ///
+    /// Before 2.11.15 every head cloned the six state slices and ran a
+    /// single-threaded Falcon check (`check_sig = true`). With 240 wallets
+    /// sending, that was ~530 ms of v1's 567 ms pack (24 Nov ramp). Now:
+    ///
+    /// * Signatures of heads not already pre-checked (`sig_warm`) are verified
+    ///   once, across the seat's cores, with the pack's own check
+    ///   (`preverify_pack_sigs`). Good results go into `sanitize_sig_warm`, so the pack
+    ///   that follows does not verify them again (`sanitize_sig_warm`).
+    /// * One draft is cloned per call. Each head is applied to it with the
+    ///   signature already checked; a failed head is rolled back
+    ///   (`PackUndo`, as in the pack loop).
+    /// * A head is only ever **dropped** after the pre-2.11.15 check (fresh
+    ///   clone of committed state, signature checked again) also calls it a
+    ///   permanent failure. A bad or unverifiable signature always takes that
+    ///   path. So the drop set can only shrink, never grow; a head the shared
+    ///   draft lets through is kept until the next tip, like any other head.
+    ///
+    /// Local mempool policy only: receivers never re-derive it, and the
+    /// block, state root and vote rules are unchanged.
+    fn drop_permanent_heads_shared_draft(&mut self, heads: Vec<Tx>) -> usize {
+        let saved_now = self.now_ms;
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let mut sig_ok: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut cold: Vec<&Tx> = Vec::new();
+            for tx in &heads {
+                if self.sig_warm_valid(tx) {
+                    sig_ok.insert(tx.tx_id.clone());
+                } else {
+                    cold.push(tx);
+                }
+            }
+            if !cold.is_empty() {
+                let onchain = self.onchain_sig_keys(&cold);
+                let (ok, _bad) = Self::preverify_pack_sigs(&self.keys, &onchain, &cold, workers);
+                self.sanitize_sig_checks = self.sanitize_sig_checks.saturating_add(cold.len() as u64);
+                // Share with the pack (same tip; cleared with the head memo).
+                for tx in &cold {
+                    if ok.contains(&tx.tx_id) {
+                        self.sanitize_sig_warm.insert(tx.tx_id.clone(), onchain.get(&tx.account).cloned());
+                    }
+                }
+                sig_ok.extend(ok);
+            }
+        }
+        let mut draft = PackDraft {
+            state: self.state.clone(),
+            defi: self.defi.clone(),
+            bridge: self.bridge.clone(),
+            vals: self.validators.clone(),
+            claim: self.claimable.clone(),
+            work: self.epoch_work.clone(),
+        };
+        let mut drop_ids = Vec::new();
+        for tx in heads {
+            self.perm_head_dry_runs = self.perm_head_dry_runs.saturating_add(1);
+            let r = if sig_ok.contains(&tx.tx_id) {
+                let undo = PackUndo::capture(&draft, &tx);
+                let r = self.try_protocol_tx_ex(
+                    &mut draft.state,
+                    &mut draft.defi,
+                    &mut draft.bridge,
+                    &mut draft.vals,
+                    &mut draft.claim,
+                    &mut draft.work,
+                    &tx,
+                    false,
+                );
+                match r {
+                    Err(e) => {
+                        undo.restore(&mut draft);
+                        if self.is_permanent_tx_failure_here(&e) {
+                            self.sanitize_confirm_runs = self.sanitize_confirm_runs.saturating_add(1);
+                            self.dry_run_head_fresh(&tx)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                    ok => ok,
+                }
+            } else {
+                self.sanitize_confirm_runs = self.sanitize_confirm_runs.saturating_add(1);
+                self.dry_run_head_fresh(&tx)
+            };
+            match r {
+                Err(e) if self.is_permanent_tx_failure_here(&e) => {
+                    eprintln!(
+                        "falcon-pl sanitize drop {} seq {} {}: {e}",
+                        tx.tx_id, tx.sequence, tx.account
+                    );
+                    { let tip = self.tip_hash.clone(); self.perm_dropped.insert(&tx.tx_id, saved_now, &tip); }
+                    drop_ids.push(tx.tx_id.clone());
+                }
+                _ => {
+                    self.perm_head_memo.insert(tx.tx_id.clone());
+                }
+            }
+        }
+        self.now_ms = saved_now;
+        let n = drop_ids.len();
+        if n > 0 {
+            self.mempool.remove_many(&drop_ids);
+            self.evicted_since_last_seal = true;
+        }
+        n
+    }
+
+    /// The pre-2.11.15 dry-run of one head: fresh clones of committed state,
+    /// signature checked inside apply.
+    fn dry_run_head_fresh(&mut self, tx: &Tx) -> Result<(), String> {
+        let saved_now = self.now_ms;
+        let mut draft_state = self.state.clone();
+        let mut draft_defi = self.defi.clone();
+        let mut draft_bridge = self.bridge.clone();
+        let mut draft_vals = self.validators.clone();
+        let mut draft_claim = self.claimable.clone();
+        let mut draft_work = self.epoch_work.clone();
+        let r = self.try_protocol_tx(
+            &mut draft_state,
+            &mut draft_defi,
+            &mut draft_bridge,
+            &mut draft_vals,
+            &mut draft_claim,
+            &mut draft_work,
+            tx,
+        );
+        self.now_ms = saved_now;
+        r
+    }
+
+    /// Pre-2.11.15 head dry-run (full clone + Falcon check per head). Kept
+    /// behind `FPL_SANITIZE_LEGACY=1` and for the equivalence tests.
+    fn drop_permanent_heads_full_clone(&mut self, heads: Vec<Tx>) -> usize {
         let mut drop_ids = Vec::new();
         let saved_now = self.now_ms;
         for tx in heads {
@@ -11665,8 +11821,9 @@ impl Node {
 
     /// A pre-checked signature is reused only if the key the pack would
     /// verify against now is the key it was checked with.
+    /// 2.11.15: also a signature sanitize checked at this tip.
     fn sig_warm_valid(&self, tx: &Tx) -> bool {
-        match self.sig_warm.get(&tx.tx_id) {
+        match self.sig_warm.get(&tx.tx_id).or_else(|| self.sanitize_sig_warm.get(&tx.tx_id)) {
             Some(k) => *k == self.onchain_sig_key(&tx.account),
             None => false,
         }
@@ -16665,6 +16822,30 @@ pub(crate) fn set_pack_force_full_clone(on: bool) {
     PACK_FORCE_FULL_CLONE.with(|c| c.set(on));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: force the pre-2.11.15 head dry-run (equivalence tests).
+    static SANITIZE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_sanitize_legacy(on: bool) {
+    SANITIZE_LEGACY.with(|c| c.set(on));
+}
+
+/// 2.11.15: `FPL_SANITIZE_LEGACY=1` restores the pre-2.11.15 head dry-run
+/// (operator fallback; local policy only).
+fn sanitize_legacy() -> bool {
+    #[cfg(test)]
+    {
+        if SANITIZE_LEGACY.with(|c| c.get()) {
+            return true;
+        }
+    }
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("FPL_SANITIZE_LEGACY").map(|v| v == "1").unwrap_or(false))
+}
+
 #[inline]
 fn pack_force_full_clone() -> bool {
     #[cfg(test)]
@@ -17301,6 +17482,8 @@ mod pack_fix_21112_tests;
 #[cfg(test)]
 mod prepack_tests;
 #[cfg(test)]
+mod sanitize_fast_tests;
+#[cfg(test)]
 mod hold_cap_tests;
 #[cfg(test)]
 mod snapshot_chunk_tests;
@@ -17797,8 +17980,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.14");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.14");
+        assert_eq!(PRODUCT_VERSION, "2.11.15");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.15");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
