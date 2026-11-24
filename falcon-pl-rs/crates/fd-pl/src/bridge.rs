@@ -309,8 +309,9 @@ pub struct RailState {
     pub tip_merkle_root: String,
     pub total_minted: u64,
     pub total_burned: u64,
-    /// height -> header
-    pub headers: BTreeMap<u64, RailHeader>,
+    /// height -> header. 2.11.13: copy-on-write with a cached JSON encoding
+    /// (same bytes as the `BTreeMap`; mutate via `make_mut()`).
+    pub headers: crate::exec_map::RailHeaderMap,
     /// spent external txids (deposits)
     pub spent_deposits: BTreeSet<String>,
     /// open withdraw notes: note_id -> (amount, external_to, from)
@@ -439,7 +440,7 @@ impl RailState {
             tip_merkle_root: String::new(),
             total_minted: 0,
             total_burned: 0,
-            headers: BTreeMap::new(),
+            headers: Default::default(),
             spent_deposits: BTreeSet::new(),
             withdrawals: BTreeMap::new(),
             vault_utxos: Vec::new(),
@@ -852,7 +853,7 @@ impl RailState {
         // Old main suffix becomes a side branch (it may win back later).
         let old: Vec<u64> = self.headers.range(fork_h + 1..).map(|(k, _)| *k).collect();
         for k in old {
-            if let Some(o) = self.headers.remove(&k) {
+            if let Some(o) = self.headers.make_mut().remove(&k) {
                 self.btc_side.insert(Self::btc_side_key(&o.hash), o);
             }
         }
@@ -861,7 +862,7 @@ impl RailState {
             self.tip_height = b.height;
             self.tip_hash = b.hash.clone();
             self.tip_merkle_root = b.merkle_root.clone();
-            self.headers.insert(b.height, b);
+            self.headers.make_mut().insert(b.height, b);
         }
         let lrb = self.btc_last_real_bits(self.tip_height, 0);
         if lrb != 0 {
@@ -1242,7 +1243,7 @@ impl RailState {
             self.tip_merkle_root.clone(),
             self.last_real_bits,
         );
-        self.headers.retain(|k, _| *k < start);
+        self.headers.make_mut().retain(|k, _| *k < start);
         self.tip_height = ancestor.height;
         self.tip_hash = ancestor.hash.clone();
         self.tip_merkle_root = ancestor.merkle_root.clone();
@@ -1292,7 +1293,7 @@ impl RailState {
                     return Err("BTC header does not match frozen checkpoint".into());
                 }
             }
-            self.headers.clear();
+            self.headers.make_mut().clear();
             return self.commit_header(h, true);
         }
 
@@ -1322,7 +1323,7 @@ impl RailState {
                 return Err("BTC bits do not follow parent / testnet min-diff".into());
             }
             let cut = h.height;
-            self.headers.retain(|k, _| *k < cut);
+            self.headers.make_mut().retain(|k, _| *k < cut);
             self.tip_height = ancestor.height;
             self.tip_hash = ancestor.hash;
             self.tip_merkle_root = ancestor.merkle_root;
@@ -1420,7 +1421,7 @@ impl RailState {
         self.tip_height = h.height;
         self.tip_hash = h.hash.clone();
         self.tip_merkle_root = h.merkle_root.clone();
-        self.headers.insert(h.height, h);
+        self.headers.make_mut().insert(h.height, h);
         self.prune_btc_headers();
         Ok(())
     }
@@ -1457,7 +1458,7 @@ impl RailState {
             let Some(k) = self.headers.keys().copied().find(|hgt| !keep.contains(hgt)) else {
                 break;
             };
-            self.headers.remove(&k);
+            self.headers.make_mut().remove(&k);
         }
         // Then drop only headers older than the claim window, and never below
         // HEADER_HISTORY. A deposit from a few days ago stays claimable.
@@ -1471,7 +1472,7 @@ impl RailState {
             }) else {
                 break;
             };
-            self.headers.remove(&k);
+            self.headers.make_mut().remove(&k);
         }
     }
 
@@ -1543,7 +1544,7 @@ impl RailState {
             if self.headers.contains_key(ht) {
                 return Err(format!("backfill height {ht} already stored"));
             }
-            self.headers.insert(
+            self.headers.make_mut().insert(
                 *ht,
                 RailHeader {
                     height: *ht,
@@ -3614,7 +3615,7 @@ mod tests {
         });
         // commit many headers; height 1 must remain because of the UTXO
         for i in 1..300u64 {
-            r.headers.insert(
+            r.headers.make_mut().insert(
                 i,
                 RailHeader {
                     height: i,
@@ -3973,7 +3974,7 @@ mod tests {
         for h in 200..=205u64 {
             let mut hdr = RailHeader::fixture(h, format!("{h:064x}"), format!("{:064x}", h - 1), if h == 200 { root_display.clone() } else { "00".repeat(32) });
             hdr.raw = "00".repeat(80);
-            rail.headers.insert(h, hdr);
+            rail.headers.make_mut().insert(h, hdr);
         }
         rail.tip_height = 205;
         let ckpt_h = 127u64;
