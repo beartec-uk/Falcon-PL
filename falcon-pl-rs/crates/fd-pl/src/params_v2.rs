@@ -569,12 +569,10 @@ pub fn empty_block_from_height(network_id: u32) -> u64 {
 
 /// 2.11.13 (f): committee redraw activation on testnet 2300. CONSENSUS.
 ///
-/// RELEASE-BUILD STEP: this is a placeholder (`u64::MAX` = never). Before the
-/// release build, set it to (2300 tip at build time) + ~400 blocks (about
-/// 1 h at 9-10 s blocks) so every seat has upgraded before it activates; see
-/// `docs/RELEASE_2_11_13.md` and the runbook. Every seat must run a build
-/// with the same value before that height or the network forks there.
-pub const TESTNET_2300_REDRAW_FROM_HEIGHT: u64 = u64::MAX;
+/// Set at the 2.11.13 release build: 2300 tip at build time + 400. Every seat
+/// must run a build with the same value before this height or the network
+/// forks there; see `docs/RELEASE_2_11_13.md` and the runbook.
+pub const TESTNET_2300_REDRAW_FROM_HEIGHT: u64 = 945_364;
 
 /// Committee redraw activation height (`u64::MAX` = never). Non-2300
 /// networks may set `FPL_REDRAW_FROM_HEIGHT` (devnets / rehearsals); tests
