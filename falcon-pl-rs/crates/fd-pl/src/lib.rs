@@ -9191,10 +9191,21 @@ impl Node {
             if l.is_v4() && !l.next_committee.is_empty() {
                 // Membership must match; sealed next-6 order is authoritative
                 // (draw_committee Vec order can differ after snapshot load).
-                debug_assert_eq!(
-                    self.schedule_committee.iter().collect::<BTreeSet<_>>(),
-                    l.next_committee.iter().collect::<BTreeSet<_>>(),
-                    "v4 freeze must equal sealed next-6 (as sets)"
+                // 2.11.13: only comparable once this node draws in v8 mode.
+                // `load_snapshot` freezes before the caller applies
+                // `keys/lc/bridge.json` (qc_header_version is still 3 there),
+                // so its draw used the v7 tag + tip hash while the sealed set
+                // is the v8 draw (checked on accept, `v4 next_committee
+                // mismatch`). With more than 6 bonded seats the two differ
+                // and debug builds panicked on loading a live snapshot. The
+                // sealed set is used either way, so release was unaffected.
+                debug_assert!(
+                    !self.qc_v4_active_tip()
+                        || self.schedule_committee.iter().collect::<BTreeSet<_>>()
+                            == l.next_committee.iter().collect::<BTreeSet<_>>(),
+                    "v4 freeze must equal sealed next-6 (as sets): drew {:?}, sealed {:?}",
+                    self.schedule_committee,
+                    l.next_committee
                 );
                 self.schedule_committee = l.next_committee.clone();
             }

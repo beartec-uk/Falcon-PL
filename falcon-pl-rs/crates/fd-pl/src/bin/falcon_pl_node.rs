@@ -1869,6 +1869,19 @@ impl Shared {
             }
         }
         let mut full = 0usize;
+        // 2.11.13: a live inbound session from a peer means our own dial to
+        // it has yielded (lower seat id dials) or is refused ("we dial
+        // them"). That outbound lane is not drained while it waits out
+        // YIELD_DIAL_SECS, so a NeedLedgers queued there was never sent. A
+        // restarted top-id seat (every peer dials it) queued every pull into
+        // dead lanes and never caught up. Send on the live inbound session.
+        let live_in: Vec<InboundSink> = self
+            .inbound
+            .lock()
+            .iter()
+            .filter(|s| !s.id.is_empty() && !s.close.load(std::sync::atomic::Ordering::Relaxed))
+            .cloned()
+            .collect();
         for k in route.iter().copied() {
             let i = plan.order[k];
             let Some(p) = fanout.get(i) else {
@@ -1881,6 +1894,16 @@ impl Shared {
                 i,
             );
             if slow.contains(&pid) {
+                continue;
+            }
+            let lane_id = peers.get(i).map(|(_, id)| id.as_str()).unwrap_or("");
+            if let Some(s) = live_in.iter().find(|s| !lane_id.is_empty() && s.id == lane_id) {
+                if s.tx.try_send(line.clone(), ConsClass::Other) {
+                    note(&pid);
+                    info!("NeedLedgers → inbound {} (our dial yielded)", s.id);
+                    return;
+                }
+                full += 1;
                 continue;
             }
             if p.catchq.try_send(line.clone(), ConsClass::Other) {
@@ -8007,6 +8030,56 @@ mod inbound_ack_tests {
             gap_dish: parking_lot::Mutex::new(0),
             gap_walk: parking_lot::Mutex::new((0, String::new())),
         })
+    }
+
+    /// 2.11.13 regression: restarted v6 (every peer dials it) queued every
+    /// NeedLedgers into yielded outbound lanes and never caught up.
+    #[test]
+    fn catchup_pull_goes_to_live_inbound_when_our_dial_yielded() {
+        let sh = test_shared("v6");
+        sh.node.lock().validators.get_mut("v9").unwrap().last_advertised_tip = Some(50);
+        let mk_out = || {
+            let (cons, _a) = byte_tx(64, 1 << 20);
+            let (txq, _b) = byte_tx(64, 1 << 20);
+            let (bodyq, _c) = byte_tx(64, 1 << 20);
+            let (catchq, rx) = byte_tx(64, 1 << 20);
+            let p = PeerOut {
+                cons,
+                txq,
+                bodyq,
+                catchq,
+                peer_id: Arc::new(parking_lot::Mutex::new("v9".into())),
+                large_out: Arc::new(LargeGate::new()),
+            };
+            (p, rx, _a, _b, _c)
+        };
+        let pull = WireMsg::NeedLedgers { from_height: 1, max_count: 64 };
+        // No inbound session: the outbound lane is the route (unchanged).
+        let (p, mut out_rx, _a, _b, _c) = mk_out();
+        let fanout = Arc::new(vec![p]);
+        sh.fan_catchup(&fanout, &pull);
+        assert!(out_rx.try_recv().is_ok(), "outbound lane used without inbound");
+        // v9 dials us (live inbound): the pull must use that session, not
+        // the yielded outbound lane nobody drains.
+        let (p, mut out_rx, _a2, _b2, _c2) = mk_out();
+        let fanout = Arc::new(vec![p]);
+        let (in_tx, mut in_rx) = byte_tx(64, 1 << 20);
+        sh.inbound.lock().push(InboundSink {
+            id: "v9".into(),
+            tx: in_tx,
+            close: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            large_out: Arc::new(LargeGate::new()),
+        });
+        *sh.ledger_slow.lock() = fd_pl::catchup_slow::LedgerSlowList::default();
+        sh.fan_catchup(&fanout, &pull);
+        let got = in_rx.try_recv().expect("pull sent on the live inbound session");
+        assert_eq!(serde_json::to_value(serde_json::from_str::<WireMsg>(got.trim()).unwrap()).unwrap(), serde_json::to_value(&pull).unwrap());
+        assert!(out_rx.try_recv().is_err(), "nothing queued on the yielded lane");
+        // A closed inbound session falls back to the outbound lane.
+        sh.inbound.lock()[0].close.store(true, std::sync::atomic::Ordering::Relaxed);
+        *sh.ledger_slow.lock() = fd_pl::catchup_slow::LedgerSlowList::default();
+        sh.fan_catchup(&fanout, &pull);
+        assert!(out_rx.try_recv().is_ok());
     }
 
     fn big_line() -> String {

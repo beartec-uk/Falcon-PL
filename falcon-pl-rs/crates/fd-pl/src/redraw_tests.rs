@@ -214,3 +214,31 @@ fn four_dead_cannot_reach_the_bonded_quorum() {
         assert!(net.nodes[id].height_view_round < Node::REDRAW_AFTER_ROUNDS);
     }
 }
+
+/// 2.11.13: a debug build panicked loading a live (more than 6 bonded) v4
+/// snapshot: `load_snapshot` freezes the open height before the node applies
+/// its QC bridge config, so it drew in v7 mode and the set check against the
+/// sealed v8 next-6 failed. The load must succeed and use the sealed set, and
+/// the check must still hold once v4 is configured.
+#[test]
+fn ten_seat_v4_snapshot_loads_with_sealed_next_committee() {
+    let mut net = ten_after_one();
+    for _ in 0..4 {
+        net.payment("alice", "bob", 1, 1).unwrap();
+        net.pong_all();
+        net.seal_next_height().expect("seal");
+    }
+    let v1 = &net.nodes["v1"];
+    let tip = v1.chain.last().unwrap().clone();
+    assert!(tip.is_v4() && tip.next_committee.len() == 6);
+    let path = std::env::temp_dir().join(format!("fpl-v4-freeze-{}-{}.json", std::process::id(), v1.tip_height));
+    std::fs::write(&path, serde_json::to_vec(&v1.to_snapshot()).unwrap()).unwrap();
+    let mut loaded = Node::load_snapshot(path.to_str().unwrap(), v1.keys.clone()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(loaded.schedule_committee, tip.next_committee);
+    // As the binary does after load: arm v4, then re-freeze (debug check on).
+    loaded.qc_header_version = 4;
+    loaded.qc_start_height = 1;
+    loaded.freeze_open_height_schedule();
+    assert_eq!(loaded.schedule_committee, tip.next_committee);
+}

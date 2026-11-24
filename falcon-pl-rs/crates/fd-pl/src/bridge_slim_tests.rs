@@ -127,8 +127,12 @@ fn legacy_btc_pegout_and_double_mint_guard_after_slim() {
 #[ignore]
 fn real_snapshot_converts_deterministically() {
     let path = std::env::var("FPL_SLIM_SNAPSHOT").expect("FPL_SLIM_SNAPSHOT");
-    // Parse the file directly (a debug-build Node load runs live-committee
-    // asserts unrelated to the bridge).
+    // A debug-build Node load of a live snapshot (13 bonded) used to trip the
+    // v4-freeze check; it must load now.
+    {
+        let n = Node::load_snapshot(&path, KeyRing::new(CryptoScheme::HmacDev)).unwrap();
+        assert_eq!(n.schedule_committee, n.chain.last().unwrap().next_committee);
+    }
     let raw = std::fs::read(&path).unwrap();
     let a = crate::snapshot::parse_snapshot_bytes(&raw).unwrap();
     let b = crate::snapshot::parse_snapshot_bytes(&raw).unwrap();
