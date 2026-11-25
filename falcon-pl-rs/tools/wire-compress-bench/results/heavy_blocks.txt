@@ -1,0 +1,17 @@
+heavy blocks 10 mean txs 60.1
+hex_json (today)     none             167222 B/blk  +0.0%
+hex_json (today)     zstd-3 msg        84564 B/blk +49.4%
+hex_json (today)     zstd-3 stream     61715 B/blk +63.1%
+lean_json (PR#44)    none             141837 B/blk +15.2%
+lean_json (PR#44)    zstd-3 msg        80333 B/blk +52.0%
+lean_json (PR#44)    zstd-3 stream     57052 B/blk +65.9%
+lean_json_nopk       none             138249 B/blk +17.3%
+lean_json_nopk       zstd-3 msg        78451 B/blk +53.1%
+lean_json_nopk       zstd-3 stream     56558 B/blk +66.2%
+binary (est)         none              70858 B/blk +57.6%
+binary (est)         zstd-3 msg        68050 B/blk +59.3%
+binary (est)         zstd-3 stream     52144 B/blk +68.8%
+binary_nopk (est)    none              69060 B/blk +58.7%
+binary_nopk (est)    zstd-3 msg        66230 B/blk +60.4%
+binary_nopk (est)    zstd-3 stream     51613 B/blk +69.1%
+sig floor 44682 B/blk 73.3% max
