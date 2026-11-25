@@ -237,3 +237,35 @@ fn peer_release_is_observability_only() {
     assert_eq!(before, (n.tip_hash.clone(), n.commitment_root()));
     assert!(n.hello_release_reject("").is_none());
 }
+
+/// crypto-dashboard, 18 Nov 2026: status said `unbond_ready: true` while chain
+/// time (tip `sealed_at`, the clock CompleteUnbond is checked against) was still
+/// ~13 chain days short. The node's local `now_ms` ran ~17.7 days ahead of chain
+/// time. Ready must follow chain time.
+#[test]
+fn unbond_ready_follows_chain_time_not_local_clock() {
+    let mut net = sealed(1);
+    let n = net.nodes.get_mut("v1").unwrap();
+    let chain = n.parent_sealed_at();
+    {
+        let v = n.validators.get_mut("v1").unwrap();
+        v.unbonding = 500;
+        v.unbond_ready_ms = chain + 10_000;
+    }
+    n.now_ms = chain + 1_000_000_000; // local clock far ahead of chain time
+    let b = &n.health_core()["balance"];
+    assert_eq!(b["unbond_ready"], false);
+    assert_eq!(b["unbond_remaining_ms"], 10_000);
+    let st = n.status_json();
+    let v1 = st["validators"].as_array().unwrap().iter().find(|v| v["id"] == "v1").unwrap();
+    assert_eq!(v1["unbond_ready"], false);
+    assert_eq!(v1["unbond_remaining_ms"], 10_000);
+    // Once chain time passes the ready stamp it flips, whatever the local clock says.
+    n.validators.get_mut("v1").unwrap().unbond_ready_ms = chain;
+    n.now_ms = 0;
+    assert_eq!(n.health_core()["balance"]["unbond_ready"], true);
+    let st = n.status_json();
+    let v1 = st["validators"].as_array().unwrap().iter().find(|v| v["id"] == "v1").unwrap();
+    assert_eq!(v1["unbond_ready"], true);
+    assert_eq!(v1["unbond_remaining_ms"], 0);
+}
