@@ -319,10 +319,13 @@
 //!
 //! See `docs/IDENTITY.md` and `docs/POC.md`.
 
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 pub mod accounts;
 pub mod pieces;
+pub mod wire_zstd;
+#[cfg(test)]
+mod wire_zstd_tests;
 pub mod bitvm;
 pub mod bitvm2_exit;
 pub mod bitvm2_instance;
@@ -385,7 +388,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.4";
+pub const PRODUCT_VERSION: &str = "2.11.19";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -1550,6 +1553,21 @@ impl TxBody {
 }
 
 impl Tx {
+    /// Signature as hex for verification. v2.11.6 lean bodies carry tx sigs
+    /// as `b64:`; the block-level rule ([`Ledger::check_lean_encoding`])
+    /// decides whether that spelling is allowed at the ledger's height.
+    /// Verifiers only ever see hex, so votes/certs/PoP stay hex-only.
+    pub fn sig_hex(&self) -> std::borrow::Cow<'_, str> {
+        if crate::crypto::is_lean_sig(&self.signature) {
+            match crate::crypto::sig_to_hex(&self.signature) {
+                Some(h) => std::borrow::Cow::Owned(h),
+                None => std::borrow::Cow::Borrowed(""),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(&self.signature)
+        }
+    }
+
     pub fn payload(
         account: &str,
         sequence: u64,
@@ -1662,7 +1680,7 @@ impl Tx {
             &self.account,
             &self.public_key,
             &payload,
-            &self.signature,
+            &self.sig_hex(),
         )
     }
 
@@ -2479,6 +2497,20 @@ impl Ledger {
         keys: &KeyRing,
         known: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), String> {
+        let lean = crate::params_v2::lean_body_active(self.network_id, self.height);
+        self.attach_merkle_batch_known_ex(keys, known, lean)
+    }
+
+    /// As [`Self::attach_merkle_batch_known`] with the lean-body rule given
+    /// explicitly. `lean` writes tx sigs as `b64:` and omits `batch_paths`;
+    /// otherwise every tx sig is written as hex (a `b64:` sig from the pool
+    /// is converted back) and paths are attached as before.
+    pub fn attach_merkle_batch_known_ex(
+        &mut self,
+        keys: &KeyRing,
+        known: &dyn Fn(&str) -> Option<String>,
+        lean: bool,
+    ) -> Result<(), String> {
         if self.txs.is_empty() {
             return Ok(());
         }
@@ -2500,12 +2532,26 @@ impl Ledger {
         for tx in &self.txs {
             tx.verify(keys)?;
         }
-        let sig_leaves: Vec<String> = self.txs.iter().map(|t| t.signature.clone()).collect();
+        // Sig root is always over canonical hex, so the wire spelling never
+        // changes `batch_root` (and so never changes the signed batch msg).
+        let sig_leaves: Vec<String> = self.txs.iter().map(|t| t.sig_hex().into_owned()).collect();
         let (root, paths) = merkle_paths(&payloads);
         let (sig_root, _) = merkle_paths(&sig_leaves);
         // payload root, then the root of the sender signatures the packer checked.
         self.batch_root = format!("{}|{}", hex::encode(root), hex::encode(sig_root));
-        self.batch_paths = paths;
+        if lean {
+            self.batch_paths = Vec::new();
+            for tx in &mut self.txs {
+                if let Some(l) = crate::crypto::sig_to_lean(&tx.signature) {
+                    tx.signature = l;
+                }
+            }
+        } else {
+            self.batch_paths = paths;
+            for (tx, hex_sig) in self.txs.iter_mut().zip(sig_leaves) {
+                tx.signature = hex_sig;
+            }
+        }
         for tx in &mut self.txs {
             if !tx.body.reads_signer_key()
                 && known(&tx.account).as_deref() == Some(tx.public_key.as_str())
@@ -2543,6 +2589,30 @@ impl Ledger {
         self.verify_merkle_batch_reg(keys, known, onchain_first, None)
     }
 
+    /// v2.11.6 lean-body encoding rule. Below the activation height a body
+    /// must be legacy: no `b64:` tx signature. From it, tx sigs may be `b64:`
+    /// (canonical base64 only) or hex, and `batch_paths` may be omitted.
+    /// Applies to every body, batch or not, live or catch-up.
+    pub fn check_lean_encoding(&self, lean: bool) -> Result<(), String> {
+        for tx in &self.txs {
+            if crate::crypto::is_lean_sig(&tx.signature) {
+                if !lean {
+                    return Err(format!(
+                        "lean tx signature before activation at h={}",
+                        self.height
+                    ));
+                }
+                if crate::crypto::sig_bytes(&tx.signature).is_none() {
+                    return Err("non-canonical lean tx signature".into());
+                }
+            }
+        }
+        if !lean && !self.batch_sig.is_empty() && self.batch_paths.len() != self.txs.len() {
+            return Err("batch path count".into());
+        }
+        Ok(())
+    }
+
     /// As `verify_merkle_batch_onchain`; `packer_key = Some(k)` (from `H_act`)
     /// verifies the packer batch_sig ONLY against the on-chain registered key
     /// `k` (must equal `packer_public_key`), never the node-local ring.
@@ -2553,10 +2623,26 @@ impl Ledger {
         onchain_first: bool,
         packer_key: Option<&str>,
     ) -> Result<(), String> {
+        let lean = crate::params_v2::lean_body_active(self.network_id, self.height);
+        self.verify_merkle_batch_reg_ex(keys, known, onchain_first, packer_key, lean)
+    }
+
+    /// As [`Self::verify_merkle_batch_reg`] with the lean-body rule given.
+    pub fn verify_merkle_batch_reg_ex(
+        &self,
+        keys: &KeyRing,
+        known: &dyn Fn(&str) -> Option<String>,
+        onchain_first: bool,
+        packer_key: Option<&str>,
+        lean: bool,
+    ) -> Result<(), String> {
         if self.batch_sig.is_empty() {
             return Ok(());
         }
-        if self.batch_paths.len() != self.txs.len() {
+        self.check_lean_encoding(lean)?;
+        // Lean bodies omit the paths: rebuild the root from the txs instead.
+        let rebuild_root = lean && self.batch_paths.is_empty();
+        if !rebuild_root && self.batch_paths.len() != self.txs.len() {
             return Err("batch path count".into());
         }
         let payloads: Vec<String> = self
@@ -2574,14 +2660,23 @@ impl Ledger {
                 )
             })
             .collect();
+        let payload_root = self.batch_root.split('|').next().unwrap_or("");
         for (i, payload) in payloads.iter().enumerate() {
             if sha256_hex(payload.as_bytes()) != self.txs[i].tx_id {
                 return Err("batch tx_id mismatch".into());
             }
+            if rebuild_root {
+                continue;
+            }
             let got = merkle_fold(payload.as_bytes(), &self.batch_paths[i], i);
-            let payload_root = self.batch_root.split('|').next().unwrap_or("");
             if hex::encode(got) != payload_root {
                 return Err("batch path mismatch".into());
+            }
+        }
+        if rebuild_root {
+            let (root, _) = merkle_paths(&payloads);
+            if hex::encode(root) != payload_root {
+                return Err("batch root mismatch".into());
             }
         }
         // Pool entry is not enough. From the sender-sig height every seat
@@ -2606,11 +2701,11 @@ impl Ledger {
             };
             if onchain_first {
                 if let Some(pk) = known(&tx.account) {
-                    keys.verify_account_sig(&tx.account, &tx.public_key, Some(&pk), &payloads[i], &tx.signature)?;
+                    keys.verify_account_sig(&tx.account, &tx.public_key, Some(&pk), &payloads[i], &tx.sig_hex())?;
                     continue;
                 }
             }
-            keys.verify_carried_key(&tx.account, &public_key, &payloads[i], &tx.signature)?;
+            keys.verify_carried_key(&tx.account, &public_key, &payloads[i], &tx.sig_hex())?;
         }
         let msg = format!("pl-batch:v1|{}", self.batch_root);
         if let Some(rk) = packer_key {
@@ -2848,16 +2943,151 @@ impl LedgerHeader {
     }
 }
 
+/// Read access shared by [`Tx`] and [`PoolTx`] for checks that only look at
+/// the body (activation gates), so pool scans need not rebuild a full `Tx`.
+pub trait TxView {
+    fn tx_body(&self) -> &TxBody;
+}
+
+impl TxView for Tx {
+    fn tx_body(&self) -> &TxBody {
+        &self.body
+    }
+}
+
+impl TxView for PoolTx {
+    fn tx_body(&self) -> &TxBody {
+        &self.body
+    }
+}
+
+/// A pending tx as held in the [`Mempool`]. Same fields as [`Tx`], but the
+/// two big hex strings (Falcon-512 public key ~1.8 KB, signature ~1.3 KB of
+/// hex) are kept as raw bytes when they are canonical lowercase hex. Any other
+/// spelling is kept verbatim, so [`PoolTx::to_tx`] always rebuilds the exact
+/// `Tx` that was inserted: tx_id, payload, sig root and every hash are
+/// unchanged. Local memory only; never serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolTx {
+    pub account: String,
+    pub sequence: u64,
+    pub destination: String,
+    pub amount: u64,
+    pub fee: u64,
+    pub network_id: u32,
+    public_key: crate::crypto::CompactHex,
+    signature: crate::crypto::CompactHex,
+    pub tx_id: String,
+    pub body: TxBody,
+}
+
+impl PoolTx {
+    pub fn from_tx(tx: Tx) -> Self {
+        PoolTx {
+            public_key: crate::crypto::CompactHex::new(&tx.public_key),
+            signature: crate::crypto::CompactHex::new(&tx.signature),
+            account: tx.account,
+            sequence: tx.sequence,
+            destination: tx.destination,
+            amount: tx.amount,
+            fee: tx.fee,
+            network_id: tx.network_id,
+            tx_id: tx.tx_id,
+            body: tx.body,
+        }
+    }
+
+    /// The exact `Tx` that was inserted.
+    pub fn to_tx(&self) -> Tx {
+        Tx {
+            account: self.account.clone(),
+            sequence: self.sequence,
+            destination: self.destination.clone(),
+            amount: self.amount,
+            fee: self.fee,
+            network_id: self.network_id,
+            public_key: self.public_key.as_text().into_owned(),
+            signature: self.signature.as_text().into_owned(),
+            tx_id: self.tx_id.clone(),
+            body: self.body.clone(),
+        }
+    }
+
+    /// Carried public key, as the text that was inserted.
+    pub fn public_key(&self) -> std::borrow::Cow<'_, str> {
+        self.public_key.as_text()
+    }
+
+    /// True when the carried public key is empty (stripped / known account).
+    pub fn public_key_is_empty(&self) -> bool {
+        self.public_key.is_empty()
+    }
+
+    /// Carried public key equals `pk` (text compare, no allocation).
+    pub fn public_key_eq(&self, pk: &str) -> bool {
+        self.public_key.eq_text(pk)
+    }
+
+    /// Signature, as the text that was inserted (pool sigs are hex).
+    pub fn signature(&self) -> std::borrow::Cow<'_, str> {
+        self.signature.as_text()
+    }
+
+    /// True when the pooled signature is empty.
+    pub fn signature_is_empty(&self) -> bool {
+        self.signature.is_empty()
+    }
+
+    /// Raw signature bytes when the pooled sig was canonical hex.
+    pub fn signature_bytes(&self) -> Option<&[u8]> {
+        self.signature.bytes()
+    }
+
+    /// Heap bytes owned by the string and compact fields (the body enum is
+    /// not counted). Diagnostics only.
+    pub fn approx_heap_bytes(&self) -> usize {
+        self.account.capacity()
+            + self.destination.capacity()
+            + self.tx_id.capacity()
+            + self.public_key.heap_bytes()
+            + self.signature.heap_bytes()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Mempool {
-    by_id: HashMap<String, Tx>,
+    by_id: HashMap<String, PoolTx>,
     order: VecDeque<String>,
+    /// 2.11.19: local wall-clock ms each tx first entered this pool. Kept a
+    /// few seconds past removal so a leader can tell, at seal time, which
+    /// body txs are too fresh to have reached its peers (compact relay).
+    /// Local liveness hint only; never hashed or serialized.
+    arrived: HashMap<String, u64>,
+}
+
+/// Local wall clock in ms (compact-relay freshness hints only).
+pub fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Mempool {
     /// Insert tx. Returns `Ok(true)` if new, `Ok(false)` if already present (same tx_id).
     /// When `max_txs > 0` and the pool is full, rejects **new** txs (dupes still ok).
-    pub fn insert(&mut self, tx: Tx, max_txs: usize) -> Result<bool, String> {
+    ///
+    /// Lean pool: keeps the key and signature as raw bytes
+    /// ([`PoolTx`]); reads rebuild the same hex text, so nothing downstream
+    /// (pack, sig root, verify, gossip) sees a different string.
+    pub fn insert(&mut self, mut tx: Tx, max_txs: usize) -> Result<bool, String> {
+        // v2.11.6: the pool (and tx gossip) always holds hex sigs; only a
+        // sealed lean body carries `b64:`. Same bytes, so tx_id is unchanged.
+        if crate::crypto::is_lean_sig(&tx.signature) {
+            if let Some(h) = crate::crypto::sig_to_hex(&tx.signature) {
+                tx.signature = h;
+            }
+        }
         if self.by_id.contains_key(&tx.tx_id) {
             return Ok(false);
         }
@@ -2869,8 +3099,28 @@ impl Mempool {
             ));
         }
         self.order.push_back(tx.tx_id.clone());
-        self.by_id.insert(tx.tx_id.clone(), tx);
+        let now = wall_ms();
+        self.arrived.entry(tx.tx_id.clone()).or_insert(now);
+        if self.arrived.len() > 2 * self.by_id.len() + 4096 {
+            let keep = now.saturating_sub(Self::ARRIVED_KEEP_MS);
+            let live = &self.by_id;
+            self.arrived.retain(|id, t| *t >= keep || live.contains_key(id));
+        }
+        self.by_id.insert(tx.tx_id.clone(), PoolTx::from_tx(tx));
         Ok(true)
+    }
+
+    /// How long a removed tx's arrival time is remembered.
+    pub const ARRIVED_KEEP_MS: u64 = 10_000;
+
+    /// Local ms this tx first entered the pool (if remembered).
+    pub fn arrived_ms(&self, tx_id: &str) -> Option<u64> {
+        self.arrived.get(tx_id).copied()
+    }
+
+    /// Test hook: pretend a tx arrived at `ms`.
+    pub fn set_arrived_ms(&mut self, tx_id: &str, ms: u64) {
+        self.arrived.insert(tx_id.to_string(), ms);
     }
 
     pub fn len(&self) -> usize {
@@ -2881,7 +3131,7 @@ impl Mempool {
         self.by_id.is_empty()
     }
 
-    pub fn iter_candidates(&self) -> impl Iterator<Item = &Tx> {
+    pub fn iter_candidates(&self) -> impl Iterator<Item = &PoolTx> {
         self.order.iter().filter_map(|id| self.by_id.get(id))
     }
 
@@ -2911,8 +3161,18 @@ impl Mempool {
         self.by_id.contains_key(tx_id)
     }
 
-    pub fn get(&self, tx_id: &str) -> Option<&Tx> {
+    pub fn get(&self, tx_id: &str) -> Option<&PoolTx> {
         self.by_id.get(tx_id)
+    }
+
+    /// The pooled tx rebuilt as a full [`Tx`] (hex key and signature).
+    pub fn get_tx(&self, tx_id: &str) -> Option<Tx> {
+        self.by_id.get(tx_id).map(PoolTx::to_tx)
+    }
+
+    /// Estimated heap bytes held by pooled entries (diagnostics).
+    pub fn approx_heap_bytes(&self) -> usize {
+        self.by_id.values().map(PoolTx::approx_heap_bytes).sum()
     }
 
     /// Export up to `max` pending txs in arrival order (for NeedTxs / hub sync).
@@ -2923,7 +3183,7 @@ impl Mempool {
     /// [`Self::export_batch`] over only the txs `keep` accepts. The filter
     /// runs before the `max` limit, so skipped entries never use up the
     /// batch and starve later eligible txs.
-    pub fn export_batch_where(&self, max: usize, keep: impl Fn(&Tx) -> bool) -> Vec<Tx> {
+    pub fn export_batch_where(&self, max: usize, keep: impl Fn(&PoolTx) -> bool) -> Vec<Tx> {
         let max = max.clamp(1, 512);
         let mut out = Vec::with_capacity(max.min(self.order.len()));
         for id in &self.order {
@@ -2932,7 +3192,7 @@ impl Mempool {
             }
             if let Some(tx) = self.by_id.get(id) {
                 if keep(tx) {
-                    out.push(tx.clone());
+                    out.push(tx.to_tx());
                 }
             }
         }
@@ -3178,6 +3438,11 @@ pub struct ChainConfig {
     /// Optional hard ceiling (0 = **no cap** — only time budget stops packing).
     /// Prefer time budget alone so faster packers simply include more.
     pub max_txs_per_ledger: usize,
+    /// 2.11.16: pack body budget in bytes (estimated). 0 = auto: the larger of
+    /// 1 MB and `max_txs * 2.3 KB * 1.1`, so raising `--max-txs` raises the
+    /// budget with it. Clamped to [`Node::PACK_BODY_BUDGET_MAX_BYTES`].
+    /// Local only: receivers never re-derive the selection.
+    pub pack_body_budget_bytes: usize,
     /// Pack as many applicable txs as possible within this many ms.
     /// 0 = no time limit (then max_txs should be > 0 or pack can run very long).
     /// Faster machines fill more before the deadline → naturally perform better.
@@ -3296,6 +3561,7 @@ impl Default for ChainConfig {
         Self {
             network_id: NETWORK_ID_PRIVATE_V22,
             max_txs_per_ledger: 0, // 0 = unlimited; stop only when pack_budget_ms hits
+            pack_body_budget_bytes: 0,
             pack_budget_ms: 1_000, // "fill as many as you can in 1 second"
             // Multi-host under Falcon inject: pongs share the consensus queue with
             // ProposeLedger/LedgerOk. A 5s window falsely marks live remotes
@@ -3405,6 +3671,57 @@ pub struct Bitvm2AttestPrepare {
     pub mimc_leaves: Vec<String>,
 }
 
+/// 2.11.13: N+1 pre-pack work picked under the node lock; [`Self::verify`]
+/// runs without it (public-only key ring, owned txs).
+pub struct PrepackPlan {
+    pending_hash: String,
+    mempool_len: usize,
+    walk_len: usize,
+    fresh: bool,
+    todo: Vec<Tx>,
+    onchain: BTreeMap<String, String>,
+    keys: crate::crypto::KeyRing,
+}
+
+/// Result of [`PrepackPlan::verify`], stored by [`Node::apply_prepack`].
+pub struct PrepackDone {
+    pending_hash: String,
+    mempool_len: usize,
+    walk_len: usize,
+    fresh: bool,
+    ok: Vec<(String, Option<String>)>,
+}
+
+impl PrepackPlan {
+    /// Txs left to check (0 = only bookkeeping).
+    pub fn todo_len(&self) -> usize {
+        self.todo.len()
+    }
+
+    /// Falcon checks, in parallel, without the node lock.
+    pub fn verify(self) -> PrepackDone {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let refs: Vec<&Tx> = self.todo.iter().collect();
+        let (ok, _) = Node::preverify_pack_sigs(&self.keys, &self.onchain, &refs, workers);
+        let ok = self
+            .todo
+            .iter()
+            .filter(|t| ok.contains(&t.tx_id))
+            .map(|t| (t.tx_id.clone(), self.onchain.get(&t.account).cloned()))
+            .collect();
+        PrepackDone {
+            pending_hash: self.pending_hash,
+            mempool_len: self.mempool_len,
+            walk_len: self.walk_len,
+            fresh: self.fresh,
+            ok,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Node {
     pub id: String,
@@ -3438,10 +3755,24 @@ pub struct Node {
     /// Live proposal at tip+1 awaiting soft QC before tip advance (None = none).
     pub pending_proposal: Option<Ledger>,
     /// Transaction ids whose signatures were checked while the previous
-    /// quorum was still assembling. `pack_or_skip` does not check them again.
-    pub sig_warm: BTreeSet<String>,
-    /// Pending ledger hash `sig_warm` was built against.
+    /// quorum was still assembling, with the on-chain key each was checked
+    /// against (`None` = ring / carried key). `pack_or_skip` skips the check
+    /// again only while that key is still the one it would use (2.11.13).
+    pub sig_warm: BTreeMap<String, Option<String>>,
+    /// Anchor (pending ledger hash, or `tip:<h>:<hash>`) of the last pre-pack.
     pipeline_for: String,
+    /// Mempool size at the last pre-pack of `pipeline_for` (refresh trigger).
+    pipeline_mempool: usize,
+    /// 2.11.13 pre-pack: txs in the next block's verified candidate walk
+    /// (accounts continued past the pending block's sequences).
+    pub prepack_txs: usize,
+    /// Pre-pack passes run (status).
+    pub prepack_runs: u64,
+    /// Pre-verified txs the last pack used without a second signature check.
+    pub prepack_warm_used: usize,
+    /// 2.11.13: wall-clock phases of the last pack and the last accept stage
+    /// (status `pack_phases`, `pack-phases` info log in the node binary).
+    pub pack_phases: PackPhases,
     /// Local clock when the current tip opened (or last standby skip). Used for
     /// progress-timeout: if #1 seals nothing, #2 gets a turn after timeout + skip QC.
     pub height_open_ms: u64,
@@ -3479,6 +3810,14 @@ pub struct Node {
     pub perm_head_memo_since_ms: u64,
     /// Process-lifetime count of head dry-runs (each one clones the drafts).
     pub perm_head_dry_runs: u64,
+    /// 2.11.15: head signatures verified by sanitize (not already warm).
+    pub sanitize_sig_checks: u64,
+    /// 2.11.15: heads re-checked on a fresh clone before a drop.
+    pub sanitize_confirm_runs: u64,
+    /// 2.11.15: head signatures sanitize checked at this tip (tx id -> key
+    /// checked with). Read by the pack like `sig_warm`; cleared with the
+    /// head memo, kept apart so the pre-pack walk is unchanged.
+    pub sanitize_sig_warm: BTreeMap<String, Option<String>>,
     /// v2.9.77: tx ids this seat dropped as permanently invalid (sanitize,
     /// pack drop, refused same-seq replacement). Gossip must not re-admit
     /// them, or seats ping-pong a poison tx forever and it keeps evicting the
@@ -3521,6 +3860,30 @@ pub struct Node {
     /// block. Capped by [`Self::pace_effective_ms`] so peers' round-0 silence
     /// timers can never fire because of it.
     pub pace_min_interval_ms: u64,
+    /// 2.11.17 lagging-leader fast view-change (local liveness knob, set by
+    /// the node binary; 0 = off = pre-2.11.17 timing). When the open round's
+    /// proposer advertised a tip at least 2 behind ours after this round
+    /// opened, this seat votes the existing ViewChange after this many ms
+    /// instead of the silence timeout. Lag of 1 that persists this long votes
+    /// after 3x. Quorum, lottery and vote rules are unchanged.
+    pub lagging_leader_vc_ms: u64,
+    /// 2.11.19 compact relay: the leader carries the full bytes of body txs
+    /// that entered its pool less than this many ms before the seal (peers
+    /// probably lack them). 0 = carry none (2.11.18 behaviour).
+    pub compact_carry_ms: u64,
+    /// 2.11.19: compact shells parked for a short wait (hash -> due ms) so the
+    /// mempool can catch up before an id pull.
+    pub compact_waiting: HashMap<String, u64>,
+    /// 2.11.19: adaptive wait bookkeeping (decayed): waits tried / that the
+    /// mempool finished without a pull.
+    pub compact_wait_tries: u32,
+    pub compact_wait_hits: u32,
+    /// 2.11.17: local time each seat's latest tip ad (Hello/Pong) arrived.
+    pub tip_ad_at_ms: std::collections::HashMap<String, u64>,
+    /// 2.11.17: the last ViewChange this seat cast came from the lagging-leader path.
+    pub last_vc_fast: bool,
+    /// 2.11.17: count of lagging-leader fast ViewChange votes cast.
+    pub fast_vc_votes: u64,
     /// v2.9.59: pacing ends early once the mempool holds this many txs.
     pub pace_mempool_txs: usize,
     /// v2.9.59: last ledger hash whose stage root was precomputed outside
@@ -3613,6 +3976,17 @@ pub struct Node {
     pub mempool_absorbed: u64,
     /// Pack attempts that found mempool non-empty but no next-seq match (seq poison / holes).
     pub pack_no_applicable: u64,
+    /// Last pack/verify on this height ran past `pack_budget_ms` without a ledger.
+    /// Local only. Triggers packer self-pass (2.11.12).
+    pub pack_over_budget: bool,
+    /// A signed ViewChange from the current round proposer was accepted for
+    /// this open height / target round. Local follow flag; not consensus.
+    pub follow_self_pass_height: u64,
+    pub follow_self_pass_round: u64,
+    /// Rate-limit NeedTxs / gap-fill info logs (ms).
+    pub last_need_txs_log_ms: u64,
+    /// Test/ops hook: treat this seat as under memory pressure (self-pass).
+    pub force_memory_pressure: bool,
     /// After all-skip clear, refuse new SkipPacker until this time (stops thrash).
     pub skip_reopen_cooldown_until_ms: u64,
 
@@ -3699,10 +4073,23 @@ pub struct Node {
     pub external_addrs_from_height: u64,
     /// v2.10.0: [`crate::params_v2::empty_block_from_height`]; runtime only.
     pub empty_block_from_height: u64,
+    /// 2.11.13 (f): [`crate::params_v2::redraw_from_height`]; runtime only
+    /// (tests may lower it). From this open height a stalled committee can be
+    /// replaced (see [`Node::redraw_committee`]).
+    pub redraw_from_height: u64,
+    /// 2.11.13 bridge slim: [`crate::params_v2::bridge_slim_from_height`];
+    /// runtime only (tests may lower it). From this ledger height the
+    /// per-ledger hook runs [`crate::bridge::BridgeState::bridge_slim_convert`].
+    pub bridge_slim_from_height: u64,
+    /// 2.11.13 (f): open height at which this seat cast its committee-redraw
+    /// ViewChange; it then signs no OK in a pre-redraw round at that height.
+    pub redraw_vc_cast_at: u64,
     /// v2.10.1: [`crate::params_v2::btc4_fork_fix_from_height`]; runtime only.
     pub btc4_fork_fix_from_height: u64,
     /// Later-height BTC4 fork-slot replacement; runtime only.
     pub btc4_fork_slot_from_height: u64,
+    /// [`crate::params_v2::btc4_most_work_from_height`]; runtime only.
+    pub btc4_most_work_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::btc4_lend_scale_from_height`]; runtime only.
     pub btc4_lend_scale_from_height: u64,
     /// Fix B (2300: 904,000): [`crate::params_v2::bitvm2_leaf_prune_from_height`]; runtime only.
@@ -3841,8 +4228,11 @@ impl Node {
         let seat_payout_from_height = crate::params_v2::seat_payout_from_height(cfg.network_id);
         let external_addrs_from_height = crate::params_v2::external_addrs_from_height(cfg.network_id);
         let empty_block_from_height = crate::params_v2::empty_block_from_height(cfg.network_id);
+        let redraw_from_height = crate::params_v2::redraw_from_height(cfg.network_id);
+        let bridge_slim_from_height = crate::params_v2::bridge_slim_from_height(cfg.network_id);
         let btc4_fork_fix_from_height = crate::params_v2::btc4_fork_fix_from_height(cfg.network_id);
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
+        let btc4_most_work_from_height = crate::params_v2::btc4_most_work_from_height(cfg.network_id);
         let btc4_lend_scale_from_height = crate::params_v2::btc4_lend_scale_from_height(cfg.network_id);
         let bitvm2_leaf_prune_from_height = crate::params_v2::bitvm2_leaf_prune_from_height(cfg.network_id);
         let orderbook_from_height = crate::params_v2::orderbook_from_height(cfg.network_id);
@@ -3876,8 +4266,13 @@ impl Node {
             soft_ok: BTreeSet::new(),
             hard_ok: BTreeSet::new(),
             pending_proposal: None,
-            sig_warm: BTreeSet::new(),
+            sig_warm: BTreeMap::new(),
             pipeline_for: String::new(),
+            pipeline_mempool: 0,
+            prepack_txs: 0,
+            prepack_runs: 0,
+            prepack_warm_used: 0,
+            pack_phases: PackPhases::default(),
             height_open_ms: now_ms,
             genesis_ms: now_ms,
             treasury: TREASURY_GENESIS,
@@ -3894,6 +4289,9 @@ impl Node {
             perm_head_memo_tip: String::new(),
             perm_head_memo_since_ms: 0,
             perm_head_dry_runs: 0,
+            sanitize_sig_checks: 0,
+            sanitize_confirm_runs: 0,
+            sanitize_sig_warm: BTreeMap::new(),
             perm_dropped: PermDropSet::default(),
             last_apply_fail_tx: None,
             evicted_since_last_seal: false,
@@ -3905,6 +4303,14 @@ impl Node {
             tip_roots: None,
             future_oks: Vec::new(),
             pace_min_interval_ms: 0,
+            lagging_leader_vc_ms: 0,
+            compact_carry_ms: 0,
+            compact_waiting: HashMap::new(),
+            compact_wait_tries: 0,
+            compact_wait_hits: 0,
+            tip_ad_at_ms: std::collections::HashMap::new(),
+            last_vc_fast: false,
+            fast_vc_votes: 0,
             pace_mempool_txs: Node::PACE_DEFAULT_MEMPOOL_TXS,
             prestaged_hash: String::new(),
             prestage_count: 0,
@@ -3947,6 +4353,11 @@ impl Node {
             mempool_served: 0,
             mempool_absorbed: 0,
             pack_no_applicable: 0,
+            pack_over_budget: false,
+            follow_self_pass_height: 0,
+            follow_self_pass_round: 0,
+            last_need_txs_log_ms: 0,
+            force_memory_pressure: false,
             skip_reopen_cooldown_until_ms: 0,
             online_epoch_id: 0,
             online_members: BTreeSet::new(),
@@ -3985,8 +4396,12 @@ impl Node {
             seat_payout_from_height,
             external_addrs_from_height,
             empty_block_from_height,
+            redraw_from_height,
+            bridge_slim_from_height,
+            redraw_vc_cast_at: 0,
             btc4_fork_fix_from_height,
             btc4_fork_slot_from_height,
+            btc4_most_work_from_height,
             btc4_lend_scale_from_height,
             bitvm2_leaf_prune_from_height,
             orderbook_from_height,
@@ -4331,8 +4746,8 @@ impl Node {
 
     /// Seat payout txs (or any tx from a `#seat` sender) before activation:
     /// refused at admission, never relayed/exported, rejected at apply.
-    pub fn seat_tx_pre_activation(&self, tx: &Tx) -> bool {
-        tx.body.is_seat_tx() && !self.seat_payout_at(self.tip_height.saturating_add(1))
+    pub fn seat_tx_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
+        tx.tx_body().is_seat_tx() && !self.seat_payout_at(self.tip_height.saturating_add(1))
     }
 
     /// v2.10.0: `SetExternalAddrs` / `Account.external_addrs` rules apply to the
@@ -4345,6 +4760,25 @@ impl Node {
     /// Later-height BTC4 fork-slot replacement for the ledger being applied now (`tip + 1`).
     pub fn btc4_fork_slot_open(&self) -> bool {
         self.tip_height.saturating_add(1) >= self.btc4_fork_slot_from_height
+    }
+
+    /// BTC4 most-work rail for the ledger applied now (`tip + 1`), consensus
+    /// path: the 2-hour future limit uses the parent ledger's attested UTC
+    /// (`sealed_utc_ms`, only non-zero once `H_utc` is armed). See
+    /// [`crate::bridge::MostWork`].
+    pub fn btc4_most_work_apply(&self) -> Option<crate::bridge::MostWork> {
+        if self.tip_height.saturating_add(1) < self.btc4_most_work_from_height {
+            return None;
+        }
+        let utc = self.parent_sealed_utc();
+        Some(crate::bridge::MostWork { utc_now_secs: (utc > 0).then_some(utc / 1000) })
+    }
+
+    /// As [`Self::btc4_most_work_apply`] for mempool admission (local only):
+    /// the future limit uses this seat's OS wall clock.
+    pub fn btc4_most_work_admit(&self) -> Option<crate::bridge::MostWork> {
+        self.btc4_most_work_apply()
+            .map(|_| crate::bridge::MostWork { utc_now_secs: Some(self.utc_pack_clock.now_unix_ms() / 1000) })
     }
 
     /// v2.10.4: BTC4 lend markets pin 1e8 raw/coin for the ledger applied now.
@@ -4375,8 +4809,8 @@ impl Node {
     /// variant), rejected at apply.
     /// v2.10.4: order-book tx kinds before the 2.10.4 height. Refused before
     /// fee / sequence and never kept or relayed (2.10.3 cannot decode them).
-    pub fn orderbook_tx_pre_activation(&self, tx: &Tx) -> bool {
-        matches!(tx.body, TxBody::PlaceLimitOrder { .. } | TxBody::CancelOrder { .. })
+    pub fn orderbook_tx_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
+        matches!(tx.tx_body(), TxBody::PlaceLimitOrder { .. } | TxBody::CancelOrder { .. })
             && !self.orderbook_open()
     }
 
@@ -4405,8 +4839,8 @@ impl Node {
         self.defi = df;
     }
 
-    pub fn external_addrs_tx_pre_activation(&self, tx: &Tx) -> bool {
-        matches!(tx.body, TxBody::SetExternalAddrs { .. })
+    pub fn external_addrs_tx_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
+        matches!(tx.tx_body(), TxBody::SetExternalAddrs { .. })
             && !self.external_addrs_at(self.tip_height.saturating_add(1))
     }
 
@@ -4847,7 +5281,8 @@ impl Node {
         if !self.rv2_at(height) {
             return None;
         }
-        self.lottery_order().into_iter().next()
+        // Round-0 seat of the base committee (a redraw never moves it).
+        self.base_lottery_order().into_iter().next()
     }
 
     /// v2.9.61 (#34): true for an `EthV3Deposit` that cannot apply in the open
@@ -4856,8 +5291,8 @@ impl Node {
     /// (TxsBatch / NeedTxs replies), and never exported, so it is not kept,
     /// does not hold its submitter's sequence, and never reaches a seat that
     /// cannot decode the variant. Apply/verify are unchanged.
-    pub fn v3_deposit_pre_activation(&self, tx: &Tx) -> bool {
-        (matches!(tx.body, TxBody::EthV3Deposit { .. })
+    pub fn v3_deposit_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
+        (matches!(tx.tx_body(), TxBody::EthV3Deposit { .. })
             && !self.eth_v3_at(self.tip_height.saturating_add(1)))
             || self.rv2_tx_pre_activation(tx)
             || self.seat_tx_pre_activation(tx)
@@ -4867,9 +5302,9 @@ impl Node {
 
     /// v2.9.62: same treatment for the new v2 tx kinds before `H_act` (not
     /// kept, relayed or exported; 2.9.61 seats cannot decode them).
-    pub fn rv2_tx_pre_activation(&self, tx: &Tx) -> bool {
+    pub fn rv2_tx_pre_activation<T: TxView + ?Sized>(&self, tx: &T) -> bool {
         matches!(
-            tx.body,
+            tx.tx_body(),
             TxBody::BondV2 { .. }
                 | TxBody::Reactivate { .. }
                 | TxBody::ApproveValidator { .. }
@@ -5012,6 +5447,11 @@ impl Node {
                 .or_insert_with(crate::bridge::RailState::new_btc4);
             r4.record_fpl_checkpoint(height, &self.tip_hash);
         }
+        // 2.11.13 bridge slim: one deterministic conversion at the
+        // activation (no-op once `bridge_slim` is set).
+        if height >= self.bridge_slim_from_height {
+            bridge.bridge_slim_convert();
+        }
     }
 
     /// v4 pack/verify for this ledger height.
@@ -5051,6 +5491,21 @@ impl Node {
     /// Hub → packer working set. Same size as a full ledger (`PACK_DEFAULT_MAX_TXS`).
     /// 128 left packers sealing a short dish while the hub still held the pool.
     pub const NEED_TXS_BATCH: usize = 400;
+    /// 2.11.16: largest NeedTxs / hub export batch a seat will request or serve.
+    /// At `--max-txs 800` a one-ledger working set is ~2.7 MB of JSON, still
+    /// under the 4 MB tx lane. Tx plane only; not consensus.
+    pub const NEED_TXS_BATCH_MAX: usize = 800;
+
+    /// 2.11.16: NeedTxs request size, sized to the pack cap (400..=800).
+    /// Before, it was fixed at 400, so a seat at `--max-txs 800` pulled and
+    /// dished half a block.
+    pub fn need_txs_batch(&self) -> usize {
+        self.pack_cap_txs().clamp(Self::NEED_TXS_BATCH, Self::NEED_TXS_BATCH_MAX)
+    }
+    /// Max named (account, seq) heads in one gap-fill NeedTxs.
+    pub const NEED_TXS_GAP_MAX: usize = 64;
+    /// Rate-limit NeedTxs / gap-fill info lines (ms).
+    pub const NEED_TXS_LOG_INTERVAL_MS: u64 = 1_000;
     /// Pull if local mempool is below this and we may pack (or are a light val lagging work).
     pub const NEED_TXS_LOW_WATER: usize = 8;
     /// After pre-pack NeedTxs, wait this long for TxsBatch before sealing empty (P1).
@@ -5076,11 +5531,16 @@ impl Node {
     /// Fill a by-id body from the mempool and any txs already pulled.
     /// Missing ids are stored with the shell so one `TxsByIds` can finish it.
     pub fn assemble_body_by_id(&mut self, mut ledger: Ledger) -> Result<Ledger, (String, Vec<String>)> {
-        ledger.txs.clear();
+        // 2.11.19: txs the leader carried in the shell (sealed form) fill like
+        // pulled txs; the rebuild below is idempotent on them.
+        if !ledger.txs.is_empty() {
+            let carried = std::mem::take(&mut ledger.txs);
+            self.note_body_fill(carried);
+        }
         let mut missing = Vec::new();
         let mut txs = Vec::with_capacity(ledger.tx_ids.len());
         for id in &ledger.tx_ids {
-            if let Some(tx) = self.mempool.get(id).cloned().or_else(|| self.body_fill.get(id).cloned()) {
+            if let Some(tx) = self.mempool.get_tx(id).or_else(|| self.body_fill.get(id).cloned()) {
                 txs.push(tx);
             } else {
                 missing.push(id.clone());
@@ -5094,9 +5554,139 @@ impl Node {
             self.body_shells.insert(hash.clone(), ledger);
             return Err((hash, missing));
         }
+        // 2.11.18 compact relay: a Merkle-batch body is rebuilt in the exact
+        // wire form the packer sealed (lean `b64:` sigs, keys the parent state
+        // already holds left off), so it is byte-identical to the full body.
+        if !ledger.batch_sig.is_empty() {
+            let lean = crate::params_v2::lean_body_active(ledger.network_id, ledger.height);
+            for tx in &mut txs {
+                if lean {
+                    if let Some(l) = crate::crypto::sig_to_lean(&tx.signature) {
+                        tx.signature = l;
+                    }
+                }
+                if !tx.body.reads_signer_key()
+                    && self.account_public_key(&tx.account).as_deref() == Some(tx.public_key.as_str())
+                {
+                    tx.public_key.clear();
+                }
+            }
+        }
         ledger.txs = txs;
         self.body_shells.remove(&ledger.ledger_hash);
         Ok(ledger)
+    }
+
+    /// 2.11.18: may this sealed body go out as a compact by-id shell? Lean
+    /// Merkle-batch bodies (no per-tx paths) and plain bodies only; a pre-lean
+    /// batch body keeps per-tx paths and goes out in full.
+    pub fn compact_relay_eligible(ledger: &Ledger) -> bool {
+        !ledger.txs.is_empty() && (ledger.batch_sig.is_empty() || ledger.batch_paths.is_empty())
+    }
+
+    /// 2.11.18: the by-id shell of a sealed body (header fields, tx ids and the
+    /// batch signature; no txs).
+    pub fn compact_shell(ledger: &Ledger) -> Ledger {
+        let mut by_id = ledger.clone();
+        by_id.txs.clear();
+        by_id
+    }
+
+    /// 2.11.19: compact shell that also carries the full sealed bytes of body
+    /// txs that entered our pool less than `compact_carry_ms` before `now_ms`
+    /// (peers probably lack them). Returns the shell and the carried count.
+    pub fn compact_shell_fresh(&self, ledger: &Ledger, now_ms: u64) -> (Ledger, usize) {
+        let mut by_id = ledger.clone();
+        by_id.txs.clear();
+        if self.compact_carry_ms == 0 {
+            return (by_id, 0);
+        }
+        let cut = now_ms.saturating_sub(self.compact_carry_ms);
+        by_id.txs = ledger
+            .txs
+            .iter()
+            .filter(|t| self.mempool.arrived_ms(&t.tx_id).map_or(false, |a| a >= cut))
+            .cloned()
+            .collect();
+        let n = by_id.txs.len();
+        (by_id, n)
+    }
+
+    /// 2.11.19: should a compact shell missing `missing` of `total` txs wait
+    /// briefly for the mempool instead of pulling now? Only for a few missing
+    /// txs, and only while waits keep paying off (adaptive: after 8 tries,
+    /// at least half must finish without a pull).
+    pub fn compact_should_wait(&self, missing: usize, total: usize) -> bool {
+        missing > 0
+            && missing <= (total / 50).max(4)
+            && (self.compact_wait_tries < 8 || self.compact_wait_hits * 2 >= self.compact_wait_tries)
+    }
+
+    /// Park a shell for a short wait.
+    pub fn park_compact(&mut self, hash: &str, due_ms: u64) {
+        if self.compact_waiting.len() >= 8 {
+            self.compact_waiting.clear();
+        }
+        self.compact_waiting.insert(hash.to_string(), due_ms);
+    }
+
+    fn note_compact_wait(&mut self, hit: bool) {
+        if self.compact_wait_tries >= 32 {
+            self.compact_wait_tries /= 2;
+            self.compact_wait_hits /= 2;
+        }
+        self.compact_wait_tries += 1;
+        if hit {
+            self.compact_wait_hits += 1;
+        }
+    }
+
+    /// Parked shells whose wait is over: finished bodies, and id pulls for
+    /// the ones still missing txs.
+    pub fn take_compact_due(&mut self, now_ms: u64) -> (Vec<Ledger>, Vec<(String, Vec<String>, String)>) {
+        let due: Vec<String> = self
+            .compact_waiting
+            .iter()
+            .filter(|(_, d)| **d <= now_ms)
+            .map(|(h, _)| h.clone())
+            .collect();
+        let mut done = Vec::new();
+        let mut pulls = Vec::new();
+        for h in due {
+            self.compact_waiting.remove(&h);
+            let Some(shell) = self.body_shells.get(&h).cloned() else {
+                continue;
+            };
+            if shell.height <= self.tip_height {
+                self.body_shells.remove(&h);
+                continue;
+            }
+            let packer = shell.packer.clone();
+            match self.assemble_body_by_id(shell) {
+                Ok(l) => {
+                    self.note_compact_wait(true);
+                    done.push(l);
+                }
+                Err((hash, ids)) => {
+                    self.note_compact_wait(false);
+                    pulls.push((hash, ids, packer));
+                }
+            }
+        }
+        (done, pulls)
+    }
+
+    /// 2.11.19: answer an id pull from the sealed body if we hold it, else
+    /// from the mempool / compact fill cache (any peer can serve).
+    pub fn txs_for_ids(&self, ledger_hash: &str, tx_ids: &[String]) -> Vec<Tx> {
+        let want: std::collections::BTreeSet<&str> = tx_ids.iter().map(|s| s.as_str()).collect();
+        if let Some(ledger) = self.ledger_body(ledger_hash) {
+            return ledger.txs.into_iter().filter(|t| want.contains(t.tx_id.as_str())).collect();
+        }
+        tx_ids
+            .iter()
+            .filter_map(|id| self.mempool.get_tx(id).or_else(|| self.body_fill.get(id).cloned()))
+            .collect()
     }
 
     /// Most txs `body_fill` keeps. It is a short-lived cache for compact
@@ -5132,6 +5722,11 @@ impl Node {
         self.note_body_fill(txs);
         let shell = self.body_shells.get(ledger_hash)?.clone();
         self.assemble_body_by_id(shell).ok()
+    }
+
+    /// 2.11.19: is a compact shell for this hash still waiting for txs?
+    pub fn has_body_shell(&self, ledger_hash: &str) -> bool {
+        self.body_shells.contains_key(ledger_hash)
     }
 
     /// Header seen without a body — pull from packer/hubs (v2.9.13).
@@ -5293,17 +5888,56 @@ impl Node {
         n
     }
 
-    /// The walk is well under a full block while a hub is holding a larger
-    /// pool. Twenty-eight heads with only one or two behind each still make
-    /// a short block. The raw pool size does not.
+    /// The walk is well under a full block while later sequences sit behind
+    /// a hole, locally or on a hub. A 290-tx pool with a 239 walk must wait
+    /// and pull. The raw pool size alone is not enough when it equals the walk.
+    ///
+    /// 2.11.12: a local pool deeper than the consecutive walk is a hole, not
+    /// only a hub advertisement ≥ `pace_mempool_txs` (400).
     pub fn short_pack_hole(&self) -> bool {
         let cap = self.pack_cap_txs();
         let walk = self.packable_tx_count();
         if walk >= cap.saturating_mul(3) / 4 {
             return false;
         }
+        let local = self.mempool.len() as u64;
+        if local > walk as u64 {
+            return true;
+        }
         let hub = self.fresh_hub_pool();
         hub > walk as u64 && hub >= self.pace_mempool_txs.max(1) as u64
+    }
+
+    /// Named missing heads: the first sequence not in the local walk while a
+    /// later sequence for that account is in the pool. Bounded, packer-local.
+    pub fn gap_needs(&self) -> Vec<MissingSeq> {
+        let mut by: std::collections::HashMap<String, std::collections::BTreeSet<u64>> =
+            std::collections::HashMap::new();
+        for tx in self.mempool.iter_candidates() {
+            by.entry(tx.account.clone())
+                .or_default()
+                .insert(tx.sequence);
+        }
+        let mut out = Vec::new();
+        for (account, seqs) in &by {
+            let mut need = self.state.get(account).sequence;
+            if !seqs.iter().any(|&s| s >= need) {
+                continue;
+            }
+            while seqs.contains(&need) {
+                need = need.saturating_add(1);
+            }
+            if seqs.iter().any(|&s| s > need) {
+                out.push(MissingSeq {
+                    account: account.clone(),
+                    sequence: need,
+                });
+            }
+            if out.len() >= Self::NEED_TXS_GAP_MAX {
+                break;
+            }
+        }
+        out
     }
 
     /// P1: lottery winner pulls hub inventory while it has no next-seq head,
@@ -5315,6 +5949,10 @@ impl Node {
         let hole = self.short_pack_hole();
         let hub_more = self.hub_has_more_than_local();
         if !empty && !hole && !hub_more {
+            return false;
+        }
+        // 2.11.13: a walk with something in it never holds past the cap.
+        if !empty && self.hold_window_spent() {
             return false;
         }
         let h = self.tip_height.saturating_add(1);
@@ -5358,6 +5996,10 @@ impl Node {
         if self.need_txs_for_height != h || self.need_txs_open_ms == 0 {
             return false;
         }
+        // 2.11.13: hold capped at half the round-0 silence timeout.
+        if self.has_applicable_tx() && self.hold_window_spent() {
+            return false;
+        }
         // Heads have stopped arriving and the skip is close. Seal the walk
         // that is here. A skip seals nothing. A thin walk does not seal at
         // the 4s pack budget.
@@ -5378,13 +6020,34 @@ impl Node {
     /// in waiting_need_txs_grace and never uses this hold.
     fn thin_walk_hold_ms(&self) -> u64 {
         let limit = self.cfg.progress_timeout_ms;
-        if limit >= 2_000 {
+        let raw = if limit >= 2_000 {
             limit.saturating_sub(2_000)
         } else if self.cfg.pack_budget_ms > 0 {
             self.cfg.pack_budget_ms
         } else {
             Self::NEED_TXS_PRE_PACK_GRACE_MS
-        }
+        };
+        raw.min(self.hold_cap_ms())
+    }
+
+    /// 2.11.13: the most a round-0 builder may hold a thin walk open,
+    /// counted from when the height (or round) opened: half of peers'
+    /// round-0 silence timeout (`2 × live pack window`). Hold + pack budget
+    /// + slack then always fits inside that timeout, so a builder that is
+    /// still collecting txs is never view-changed away mid-pack. Before,
+    /// the hold was `progress_timeout - 2 s` from the first NeedTxs pull
+    /// (7 s at `--progress-timeout-ms 9000`), which with a 4 s pack and
+    /// gossip overran the 12.6 s timeout and cost a whole extra round.
+    pub fn hold_cap_ms(&self) -> u64 {
+        // Peers that see this builder alive time round 0 out at
+        // `round_silence_timeout_ms(0)` = 2 x live pack window.
+        self.live_pack_timeout_ms()
+    }
+
+    /// 2.11.13: the round-0 hold window is spent; seal what is packed now.
+    pub fn hold_window_spent(&self) -> bool {
+        let start = self.height_open_ms.max(self.round_open_ms);
+        self.now_ms.saturating_sub(start) >= self.hold_cap_ms()
     }
 
     /// Track whether new account heads are still landing on this height.
@@ -5462,18 +6125,70 @@ impl Node {
     /// Serve a NeedTxs request (hub or any peer with inventory).
     /// Applicable heads first so a remote packer can seal this height.
     pub fn serve_need_txs(&mut self, max_count: usize) -> Vec<Tx> {
-        let batch = self.export_packer_batch(max_count);
-        if !batch.is_empty() {
+        self.serve_need_txs_for(max_count, &[]).0
+    }
+
+    /// Walk-shaped export plus any named missing heads the requester asked for.
+    /// A gap-fill head is included even when it is not part of this seat's walk
+    /// (the packer has later seqs and needs this one). Returns (batch, gap_filled).
+    pub fn serve_need_txs_for(
+        &mut self,
+        max_count: usize,
+        missing: &[MissingSeq],
+    ) -> (Vec<Tx>, usize) {
+        let max = max_count.clamp(1, Self::NEED_TXS_BATCH_MAX);
+        let mut out = Vec::new();
+        let mut have = std::collections::HashSet::new();
+        let mut filled = 0usize;
+        for m in missing.iter().take(Self::NEED_TXS_GAP_MAX) {
+            if out.len() >= max {
+                break;
+            }
+            let Some(tx) = self.mempool_tx_at(&m.account, m.sequence) else {
+                continue;
+            };
+            if have.insert(tx.tx_id.clone()) {
+                out.push(tx);
+                filled = filled.saturating_add(1);
+            }
+        }
+        for tx in self.export_packer_batch(max) {
+            if out.len() >= max {
+                break;
+            }
+            if have.insert(tx.tx_id.clone()) {
+                out.push(tx);
+            }
+        }
+        if !out.is_empty() {
             self.mempool_served = self.mempool_served.saturating_add(1);
         }
-        batch
+        (out, filled)
+    }
+
+    /// The mempool transaction at exactly `(account, sequence)`, if present.
+    pub fn mempool_tx_at(&self, account: &str, sequence: u64) -> Option<Tx> {
+        self.mempool
+            .iter_candidates()
+            .find(|tx| tx.account == account && tx.sequence == sequence)
+            .map(|tx| tx.to_tx())
+    }
+
+    /// True when this seat should emit a NeedTxs / gap-fill info line.
+    pub fn should_log_need_txs(&mut self) -> bool {
+        if self.now_ms.saturating_sub(self.last_need_txs_log_ms) < Self::NEED_TXS_LOG_INTERVAL_MS
+        {
+            return false;
+        }
+        self.last_need_txs_log_ms = self.now_ms.max(1);
+        true
     }
 
     /// Packer working set, one layer of every account then the next layer.
     /// All heads first left the packer with a short queue behind them.
     /// A gap stops that account. Later sequences are not a walk.
     pub fn export_packer_batch(&self, max: usize) -> Vec<Tx> {
-        let max = max.clamp(1, Self::NEED_TXS_BATCH.max(1));
+        let max = max.clamp(1, Self::NEED_TXS_BATCH_MAX);
         let mut by: std::collections::HashMap<String, Vec<Tx>> = std::collections::HashMap::new();
         for tx in self.mempool.iter_candidates() {
             if self.v3_deposit_pre_activation(tx) {
@@ -5481,7 +6196,7 @@ impl Node {
             }
             let need = self.state.get(&tx.account).sequence;
             if tx.sequence >= need {
-                by.entry(tx.account.clone()).or_default().push(tx.clone());
+                by.entry(tx.account.clone()).or_default().push(tx.to_tx());
             }
         }
         let mut runs: Vec<Vec<Tx>> = Vec::new();
@@ -5827,6 +6542,9 @@ impl Node {
         self.hard_ok.clear();
         self.need_txs_for_height = 0;
         self.need_txs_open_ms = 0;
+        self.pack_over_budget = false;
+        self.follow_self_pass_height = 0;
+        self.follow_self_pass_round = 0;
         self.tip_height = 0;
         self.tip_hash = sha256_hex(b"pl-genesis-v1");
         // Critical: rewind wall clock to genesis so sealed_at_ms advance during
@@ -6938,7 +7656,7 @@ impl Node {
                     tx.network_id,
                     &tx.body,
                 );
-                if !KeyRing::verify_with_public(&pk, &payload, &tx.signature) {
+                if !KeyRing::verify_with_public(&pk, &payload, &tx.sig_hex()) {
                     return Err("bad tx crypto: bad signature".into());
                 }
                 self.keys
@@ -6997,7 +7715,8 @@ impl Node {
         let strict = self.rv2_open();
         let fork_fix = self.btc4_fork_fix_open();
         let slot_fix = self.btc4_fork_slot_open();
-        let progressed = self.bridge.rail_mut(asset)?.submit_header_ex3(header, strict, fork_fix, slot_fix)?;
+        let most_work = self.btc4_most_work_apply();
+        let progressed = self.bridge.rail_mut(asset)?.submit_header_ex4(header, strict, fork_fix, slot_fix, most_work)?;
         if let Some(w) = watcher {
             if progressed {
                 self.watcher_credit(w, 1, true);
@@ -7746,6 +8465,9 @@ impl Node {
         snap_height: u64,
     ) {
         self.pong(id);
+        if self.validators.contains_key(id) {
+            self.tip_ad_at_ms.insert(id.to_string(), self.now_ms);
+        }
         if let Some(v) = self.validators.get_mut(id) {
             v.last_advertised_tip = Some(tip_height);
             v.last_mempool_len = mempool_len;
@@ -7941,13 +8663,14 @@ impl Node {
                     let strict = self.rv2_open();
                     let fork_fix = self.btc4_fork_fix_open();
                     let slot_fix = self.btc4_fork_slot_open();
-                    if let Err(e) = probe.submit_header_ex3(crate::bridge::RailHeader {
+                    let most_work = self.btc4_most_work_admit();
+                    if let Err(e) = probe.submit_header_ex4(crate::bridge::RailHeader {
                         height: *height,
                         hash: hash.clone(),
                         parent_hash: parent_hash.clone(),
                         merkle_root: merkle_root.clone(),
                         raw: raw.clone(),
-                    }, strict, fork_fix, slot_fix) {
+                    }, strict, fork_fix, slot_fix, most_work) {
                         if self.is_permanent_tx_failure_here(&e) {
                             return Err(e);
                         }
@@ -8050,7 +8773,7 @@ impl Node {
         if sequence <= need || sequence - need > Self::BTC_ADMIT_CHAIN_MAX {
             return rail.clone();
         }
-        let mut by_seq: BTreeMap<u64, Vec<&Tx>> = BTreeMap::new();
+        let mut by_seq: BTreeMap<u64, Vec<&PoolTx>> = BTreeMap::new();
         for t in self.mempool.iter_candidates() {
             if t.account == account && t.sequence >= need && t.sequence < sequence {
                 by_seq.entry(t.sequence).or_default().push(t);
@@ -8063,6 +8786,7 @@ impl Node {
         let strict = self.rv2_open();
         let fork_fix = self.btc4_fork_fix_open();
         let slot_fix = self.btc4_fork_slot_open();
+        let most_work = self.btc4_most_work_admit();
         for sibs in by_seq.values() {
             let mut ok = false;
             for t in sibs {
@@ -8076,13 +8800,13 @@ impl Node {
                         raw,
                     } if asset == &rail.asset => {
                         if probe
-                            .submit_header_ex3(crate::bridge::RailHeader {
+                            .submit_header_ex4(crate::bridge::RailHeader {
                                 height: *height,
                                 hash: hash.clone(),
                                 parent_hash: parent_hash.clone(),
                                 merkle_root: merkle_root.clone(),
                                 raw: raw.clone(),
-                            }, strict, fork_fix, slot_fix)
+                            }, strict, fork_fix, slot_fix, most_work)
                             .is_ok()
                         {
                             ok = true;
@@ -8703,10 +9427,21 @@ impl Node {
             if l.is_v4() && !l.next_committee.is_empty() {
                 // Membership must match; sealed next-6 order is authoritative
                 // (draw_committee Vec order can differ after snapshot load).
-                debug_assert_eq!(
-                    self.schedule_committee.iter().collect::<BTreeSet<_>>(),
-                    l.next_committee.iter().collect::<BTreeSet<_>>(),
-                    "v4 freeze must equal sealed next-6 (as sets)"
+                // 2.11.13: only comparable once this node draws in v8 mode.
+                // `load_snapshot` freezes before the caller applies
+                // `keys/lc/bridge.json` (qc_header_version is still 3 there),
+                // so its draw used the v7 tag + tip hash while the sealed set
+                // is the v8 draw (checked on accept, `v4 next_committee
+                // mismatch`). With more than 6 bonded seats the two differ
+                // and debug builds panicked on loading a live snapshot. The
+                // sealed set is used either way, so release was unaffected.
+                debug_assert!(
+                    !self.qc_v4_active_tip()
+                        || self.schedule_committee.iter().collect::<BTreeSet<_>>()
+                            == l.next_committee.iter().collect::<BTreeSet<_>>(),
+                    "v4 freeze must equal sealed next-6 (as sets): drew {:?}, sealed {:?}",
+                    self.schedule_committee,
+                    l.next_committee
                 );
                 self.schedule_committee = l.next_committee.clone();
             }
@@ -8976,13 +9711,23 @@ impl Node {
         if voter.is_empty() || round == 0 {
             return (false, false);
         }
-        if !self.in_committee(voter) {
+        // 2.11.13 (f): the ViewChange that enters the redraw is open to every
+        // bonded seat (bonded-set quorum, see `vote_round_change`).
+        if self.is_redraw_entry(height, round) {
+            if !self.bonded_ids().contains(voter) {
+                return (false, false);
+            }
+        } else if !self.in_committee(voter) {
             return (false, false);
         }
         let payload = Self::vote_vc_payload(self.cfg.network_id, height, tip_hash, round, voter);
         if !self.accept_vote_sig(voter, &payload, signature) {
             return (false, false);
         }
+        // 2.11.12: a signed ViewChange from the current proposer is a self-pass
+        // hint. Followers vote immediately; 4-of-6 is unchanged. 2.11.11 peers
+        // ignore the hint and wait for the silence timeout.
+        self.note_incoming_packer_self_pass(height, voter, round);
         if self.vote_rounds_at(height) {
             // 2.11.4: keep the verified signature so an applied QC can be
             // re-gossiped to seats that missed it (h=891419 round split).
@@ -9101,6 +9846,97 @@ impl Node {
     /// or height is open with applicable txs and no progress for the same window.
     ///
     /// Returns `(height, tip_hash, target_round)` when the node loop should gossip.
+    /// Record a pack/verify attempt that ran past the pack budget without a ledger.
+    pub fn note_pack_attempt_result(&mut self, started_ms: u64, sealed: bool) {
+        if sealed {
+            self.pack_over_budget = false;
+            return;
+        }
+        let budget = self.cfg.pack_budget_ms;
+        if budget > 0 && self.now_ms.saturating_sub(started_ms) >= budget {
+            self.pack_over_budget = true;
+        }
+    }
+
+    /// Local memory-pressure hook. Production sets this only via the explicit
+    /// field; swap-bound slowness is also observed as `pack_over_budget`.
+    pub fn memory_pressure(&self) -> bool {
+        self.force_memory_pressure
+    }
+
+    /// A verified ViewChange from the current round proposer: follow it.
+    pub fn note_incoming_packer_self_pass(&mut self, height: u64, voter: &str, round: u64) {
+        if !self.vote_rounds_at(height) {
+            return;
+        }
+        if height != self.tip_height.saturating_add(1) {
+            return;
+        }
+        let want = self.height_view_round.saturating_add(1);
+        if round != want {
+            return;
+        }
+        let Some(proposer) = self.round_proposer(self.height_view_round) else {
+            return;
+        };
+        if proposer == voter {
+            self.follow_self_pass_height = height;
+            self.follow_self_pass_round = round;
+        }
+    }
+
+    pub fn following_packer_self_pass(&self, height: u64, target_round: u64) -> bool {
+        self.follow_self_pass_height == height && self.follow_self_pass_round == target_round
+    }
+
+    /// Lottery / round winner that cannot pack in budget should sign the
+    /// existing ViewChange path instead of waiting out the silence timeout.
+    /// Does not change 4-of-6 or the lottery. Attributable: the next ledger
+    /// still charges `missed_turns` to the skipped round-0 seat.
+    pub fn packer_should_self_pass(&self, height: u64) -> bool {
+        if !self.vote_rounds_at(height) {
+            return false;
+        }
+        if height != self.tip_height.saturating_add(1) {
+            return false;
+        }
+        if self.still_lagging() {
+            return false;
+        }
+        let Some(proposer) = self.round_proposer(self.height_view_round) else {
+            return false;
+        };
+        if proposer != self.id {
+            return false;
+        }
+        if self.pending_proposal.is_some() {
+            return false;
+        }
+        // Still inside the bounded gap-fill grace: let heads land first.
+        // A pending first NeedTxs must not block self-pass after the live
+        // pack window; otherwise a hole that never fills sits out the silence.
+        if self.waiting_need_txs_grace() {
+            return false;
+        }
+        if self.memory_pressure() || self.pack_over_budget {
+            return true;
+        }
+        // No consecutive walk after the live pack window (pack budget + NeedTxs
+        // grace + slack), not the longer silence timeout.
+        if self.packable_tx_count() > 0 {
+            return false;
+        }
+        // Use the height/round open clock, not `work_seen_since_ms` (that
+        // stamp moves forward while txs sit in the pool, and would keep a
+        // silent packer from ever reaching the live-pack window).
+        let start = self.height_open_ms.max(self.round_open_ms);
+        let elapsed = self.now_ms.saturating_sub(start);
+        if elapsed < self.live_pack_timeout_ms() {
+            return false;
+        }
+        self.mempool.len() > 0 || self.network_has_pack_work()
+    }
+
     pub fn maybe_view_change_vote(&mut self) -> Option<(u64, String, u64)> {
         // Lagging nodes recover via catch-up, not view-change. VC while behind
         // floods the mesh and delays NeedLedgers/LedgersBatch (tip=0 freeze class).
@@ -10267,6 +11103,18 @@ impl Node {
     /// Frozen seats that have since unbonded are filtered out. If the whole
     /// freeze is gone, redraw from current bonded seats.
     pub fn lottery_order(&self) -> Vec<String> {
+        // 2.11.13 (f): from the redraw height, a round entered by the
+        // bonded-set redraw QC uses the redrawn committee.
+        let open = self.tip_height.saturating_add(1);
+        if self.in_redraw_round(open, self.height_view_round) {
+            return self.redraw_committee(self.height_view_round);
+        }
+        self.base_lottery_order()
+    }
+
+    /// The tip-fixed committee for the open height (before 2.11.13 this was
+    /// `lottery_order`; still is below the redraw height / round).
+    pub fn base_lottery_order(&self) -> Vec<String> {
         let open = self.tip_height.saturating_add(1);
         if self.schedule_height == open && !self.schedule_committee.is_empty() {
             let seats = self.bonded_ids();
@@ -10385,6 +11233,9 @@ impl Node {
 
     pub fn sealed_committee(&self) -> Vec<String> {
         let open = self.tip_height.saturating_add(1);
+        if self.in_redraw_round(open, self.height_view_round) {
+            return self.redraw_committee(self.height_view_round);
+        }
         if self.schedule_height == open && !self.schedule_committee.is_empty() {
             return self.schedule_committee.clone();
         }
@@ -10584,7 +11435,7 @@ impl Node {
         }
         for tx in self.mempool.iter_candidates() {
             let need = self.state.get(&tx.account).sequence;
-            if tx.sequence == need && self.is_tx_applicable(tx) {
+            if tx.sequence == need && self.is_tx_applicable(&tx.to_tx()) {
                 return true;
             }
         }
@@ -10602,7 +11453,7 @@ impl Node {
         let mut n = 0usize;
         for tx in self.mempool.iter_candidates() {
             let need = self.state.get(&tx.account).sequence;
-            if tx.sequence == need && self.is_tx_applicable(tx) {
+            if tx.sequence == need && self.is_tx_applicable(&tx.to_tx()) {
                 n += 1;
             }
         }
@@ -10667,6 +11518,7 @@ impl Node {
             || self.now_ms < self.perm_head_memo_since_ms
         {
             self.perm_head_memo.clear();
+            self.sanitize_sig_warm.clear();
             self.perm_head_memo_tip = self.tip_hash.clone();
             self.perm_head_memo_since_ms = self.now_ms;
         }
@@ -10675,11 +11527,155 @@ impl Node {
             .iter_candidates()
             .filter(|tx| self.state.get(&tx.account).sequence == tx.sequence)
             .filter(|tx| !self.perm_head_memo.contains(&tx.tx_id))
-            .cloned()
+            .map(PoolTx::to_tx)
             .collect();
         if heads.is_empty() {
             return 0;
         }
+        if sanitize_legacy() {
+            return self.drop_permanent_heads_full_clone(heads);
+        }
+        self.drop_permanent_heads_shared_draft(heads)
+    }
+
+    /// 2.11.15: the head dry-run, fast path.
+    ///
+    /// Before 2.11.15 every head cloned the six state slices and ran a
+    /// single-threaded Falcon check (`check_sig = true`). With 240 wallets
+    /// sending, that was ~530 ms of v1's 567 ms pack (24 Nov ramp). Now:
+    ///
+    /// * Signatures of heads not already pre-checked (`sig_warm`) are verified
+    ///   once, across the seat's cores, with the pack's own check
+    ///   (`preverify_pack_sigs`). Good results go into `sanitize_sig_warm`, so the pack
+    ///   that follows does not verify them again (`sanitize_sig_warm`).
+    /// * One draft is cloned per call. Each head is applied to it with the
+    ///   signature already checked; a failed head is rolled back
+    ///   (`PackUndo`, as in the pack loop).
+    /// * A head is only ever **dropped** after the pre-2.11.15 check (fresh
+    ///   clone of committed state, signature checked again) also calls it a
+    ///   permanent failure. A bad or unverifiable signature always takes that
+    ///   path. So the drop set can only shrink, never grow; a head the shared
+    ///   draft lets through is kept until the next tip, like any other head.
+    ///
+    /// Local mempool policy only: receivers never re-derive it, and the
+    /// block, state root and vote rules are unchanged.
+    fn drop_permanent_heads_shared_draft(&mut self, heads: Vec<Tx>) -> usize {
+        let saved_now = self.now_ms;
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 16);
+        let mut sig_ok: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut cold: Vec<&Tx> = Vec::new();
+            for tx in &heads {
+                if self.sig_warm_valid(tx) {
+                    sig_ok.insert(tx.tx_id.clone());
+                } else {
+                    cold.push(tx);
+                }
+            }
+            if !cold.is_empty() {
+                let onchain = self.onchain_sig_keys(&cold);
+                let (ok, _bad) = Self::preverify_pack_sigs(&self.keys, &onchain, &cold, workers);
+                self.sanitize_sig_checks = self.sanitize_sig_checks.saturating_add(cold.len() as u64);
+                // Share with the pack (same tip; cleared with the head memo).
+                for tx in &cold {
+                    if ok.contains(&tx.tx_id) {
+                        self.sanitize_sig_warm.insert(tx.tx_id.clone(), onchain.get(&tx.account).cloned());
+                    }
+                }
+                sig_ok.extend(ok);
+            }
+        }
+        let mut draft = PackDraft {
+            state: self.state.clone(),
+            defi: self.defi.clone(),
+            bridge: self.bridge.clone(),
+            vals: self.validators.clone(),
+            claim: self.claimable.clone(),
+            work: self.epoch_work.clone(),
+        };
+        let mut drop_ids = Vec::new();
+        for tx in heads {
+            self.perm_head_dry_runs = self.perm_head_dry_runs.saturating_add(1);
+            let r = if sig_ok.contains(&tx.tx_id) {
+                let undo = PackUndo::capture(&draft, &tx);
+                let r = self.try_protocol_tx_ex(
+                    &mut draft.state,
+                    &mut draft.defi,
+                    &mut draft.bridge,
+                    &mut draft.vals,
+                    &mut draft.claim,
+                    &mut draft.work,
+                    &tx,
+                    false,
+                );
+                match r {
+                    Err(e) => {
+                        undo.restore(&mut draft);
+                        if self.is_permanent_tx_failure_here(&e) {
+                            self.sanitize_confirm_runs = self.sanitize_confirm_runs.saturating_add(1);
+                            self.dry_run_head_fresh(&tx)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                    ok => ok,
+                }
+            } else {
+                self.sanitize_confirm_runs = self.sanitize_confirm_runs.saturating_add(1);
+                self.dry_run_head_fresh(&tx)
+            };
+            match r {
+                Err(e) if self.is_permanent_tx_failure_here(&e) => {
+                    eprintln!(
+                        "falcon-pl sanitize drop {} seq {} {}: {e}",
+                        tx.tx_id, tx.sequence, tx.account
+                    );
+                    { let tip = self.tip_hash.clone(); self.perm_dropped.insert(&tx.tx_id, saved_now, &tip); }
+                    drop_ids.push(tx.tx_id.clone());
+                }
+                _ => {
+                    self.perm_head_memo.insert(tx.tx_id.clone());
+                }
+            }
+        }
+        self.now_ms = saved_now;
+        let n = drop_ids.len();
+        if n > 0 {
+            self.mempool.remove_many(&drop_ids);
+            self.evicted_since_last_seal = true;
+        }
+        n
+    }
+
+    /// The pre-2.11.15 dry-run of one head: fresh clones of committed state,
+    /// signature checked inside apply.
+    fn dry_run_head_fresh(&mut self, tx: &Tx) -> Result<(), String> {
+        let saved_now = self.now_ms;
+        let mut draft_state = self.state.clone();
+        let mut draft_defi = self.defi.clone();
+        let mut draft_bridge = self.bridge.clone();
+        let mut draft_vals = self.validators.clone();
+        let mut draft_claim = self.claimable.clone();
+        let mut draft_work = self.epoch_work.clone();
+        let r = self.try_protocol_tx(
+            &mut draft_state,
+            &mut draft_defi,
+            &mut draft_bridge,
+            &mut draft_vals,
+            &mut draft_claim,
+            &mut draft_work,
+            tx,
+        );
+        self.now_ms = saved_now;
+        r
+    }
+
+    /// Pre-2.11.15 head dry-run (full clone + Falcon check per head). Kept
+    /// behind `FPL_SANITIZE_LEGACY=1` and for the equivalence tests.
+    fn drop_permanent_heads_full_clone(&mut self, heads: Vec<Tx>) -> usize {
         let mut drop_ids = Vec::new();
         let saved_now = self.now_ms;
         for tx in heads {
@@ -10908,57 +11904,164 @@ impl Node {
     /// that would form the next block. The next packer is not known until this
     /// quorum lands, so every seat does the work and the winner proposes
     /// without spending the pack budget on those checks again.
+    ///
+    /// 2.11.13 next-builder pre-pack: the walk is the whole next block, not
+    /// one head per account. Each account continues from the pending block's
+    /// last sequence (`covered + 1`) or its tip sequence, through consecutive
+    /// pool sequences, up to the pack cap. Every tx id is stored with the
+    /// on-chain key it was checked against; [`Self::pack_as`] trusts the
+    /// check only while that key is still the key it would use, so a pending
+    /// block that loses (rival, view-change) or rotates a key can never let an
+    /// unchecked signature through. Nothing here touches state, the selection
+    /// rule, the ledger format or any signature: the pack still applies every
+    /// tx in order against the real post-commit draft. Refreshes when the
+    /// pool grows while the same proposal is still waiting for votes.
+    ///
+    /// With no pending block the walk is the open height's own candidate set
+    /// (anchored on the tip), so a builder that is holding, pacing or inside
+    /// `min_block_interval` checks the signatures before it packs, and a
+    /// follower has them ready if it becomes the builder.
     pub fn warm_pipeline(&mut self) {
-        let Some(pending) = self.pending_proposal.clone() else {
-            return;
-        };
-        if self.pipeline_for == pending.ledger_hash {
-            return;
+        if let Some(plan) = self.prepack_plan() {
+            let done = plan.verify();
+            self.apply_prepack(done);
+        }
+    }
+
+    /// 2.11.13: the cheap, locked half of [`Node::warm_pipeline`]: pick the
+    /// next candidate walk and the txs not yet checked. `None` = nothing to
+    /// do (same anchor and the pool has not grown).
+    pub fn prepack_plan(&self) -> Option<PrepackPlan> {
+        let pending_hash = self.prepack_anchor();
+        let empty: Vec<Tx> = Vec::new();
+        let pending_txs = self
+            .pending_proposal
+            .as_ref()
+            .filter(|p| p.height == self.tip_height.saturating_add(1))
+            .map(|p| &p.txs)
+            .unwrap_or(&empty);
+        let mp = self.mempool.len();
+        if self.pipeline_for == pending_hash
+            && mp < self.pipeline_mempool.saturating_add(Self::PREPACK_REFRESH_TXS)
+        {
+            return None;
         }
         let mut covered: HashMap<String, u64> = HashMap::new();
         let mut in_block = std::collections::HashSet::new();
-        for tx in &pending.txs {
+        for tx in pending_txs {
             in_block.insert(tx.tx_id.clone());
             let e = covered.entry(tx.account.clone()).or_insert(tx.sequence);
             if tx.sequence > *e {
                 *e = tx.sequence;
             }
         }
-        let mut seen = std::collections::HashSet::new();
-        let mut heads: Vec<&Tx> = Vec::new();
+        let cap = self.pack_cap_txs().max(1);
+        let mut by_acct: BTreeMap<String, BTreeMap<u64, Tx>> = BTreeMap::new();
         for tx in self.mempool.iter_candidates() {
-            if in_block.contains(&tx.tx_id) || seen.contains(&tx.account) {
+            if in_block.contains(&tx.tx_id) || tx.signature_is_empty() {
                 continue;
             }
+            by_acct
+                .entry(tx.account.clone())
+                .or_default()
+                .entry(tx.sequence)
+                .or_insert_with(|| tx.to_tx());
+        }
+        // Same account order as the pack (BTreeMap by id); one wave per
+        // sequence depth so the walk matches what the pack reaches first.
+        let mut next: BTreeMap<String, u64> = BTreeMap::new();
+        for acct in by_acct.keys() {
             let need = covered
-                .get(&tx.account)
+                .get(acct)
                 .map(|s| s.saturating_add(1))
-                .unwrap_or_else(|| self.state.get(&tx.account).sequence);
-            if tx.sequence != need || tx.signature.is_empty() {
-                continue;
-            }
-            seen.insert(tx.account.clone());
-            if !self.keys.has_public(&tx.account) && tx.public_key.is_empty() {
-                continue;
-            }
-            heads.push(tx);
-            if heads.len() >= Self::PACK_DEFAULT_MAX_TXS {
-                break;
+                .unwrap_or_else(|| self.state.get(acct).sequence);
+            next.insert(acct.clone(), need);
+        }
+        let mut walk: Vec<Tx> = Vec::new();
+        let mut progressed = true;
+        while progressed && walk.len() < cap {
+            progressed = false;
+            for (acct, seqs) in &by_acct {
+                if walk.len() >= cap {
+                    break;
+                }
+                let need = next[acct];
+                let Some(tx) = seqs.get(&need) else { continue };
+                if !self.keys.has_public(&tx.account) && tx.public_key.is_empty() {
+                    continue;
+                }
+                walk.push(tx.clone());
+                next.insert(acct.clone(), need.saturating_add(1));
+                progressed = true;
             }
         }
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, 16);
-        let onchain = self.onchain_sig_keys(&heads);
-        let (ok, _) = Self::preverify_pack_sigs(&self.keys, &onchain, &heads, workers);
-        self.sig_warm = ok;
-        self.pipeline_for = pending.ledger_hash;
+        // Keep still-valid entries from the previous pass on this proposal;
+        // only new txs pay a check.
+        // Entries stay valid across anchors (key-tagged, tx ids are content
+        // hashes); only bound the memory.
+        let fresh = self.sig_warm.len() > cap.saturating_mul(4);
+        let walk_len = walk.len();
+        let todo: Vec<Tx> = walk
+            .into_iter()
+            .filter(|t| fresh || !self.sig_warm.contains_key(&t.tx_id))
+            .collect();
+        let refs: Vec<&Tx> = todo.iter().collect();
+        let onchain = self.onchain_sig_keys(&refs);
+        let keys = self.keys.publics_only(todo.iter().map(|t| t.account.as_str()));
+        Some(PrepackPlan { pending_hash, mempool_len: mp, walk_len, fresh, todo, onchain, keys })
+    }
+
+    /// What the walk is built on: the pending block at tip+1, else the tip.
+    fn prepack_anchor(&self) -> String {
+        match self.pending_proposal.as_ref() {
+            Some(p) if p.height == self.tip_height.saturating_add(1) => p.ledger_hash.clone(),
+            _ => format!("tip:{}:{}", self.tip_height, self.tip_hash),
+        }
+    }
+
+    /// 2.11.13: the locked half that stores a [`PrepackPlan::verify`]
+    /// result. Dropped (false) if the pending block changed meanwhile;
+    /// entries are key-tagged, so the pack still rejects one whose on-chain
+    /// key moved after the check (`sig_warm_valid`).
+    pub fn apply_prepack(&mut self, done: PrepackDone) -> bool {
+        if self.prepack_anchor() != done.pending_hash {
+            return false;
+        }
+        if done.fresh {
+            self.sig_warm.clear();
+        }
+        for (id, key) in done.ok {
+            self.sig_warm.insert(id, key);
+        }
+        self.prepack_txs = done.walk_len;
+        self.prepack_runs = self.prepack_runs.saturating_add(1);
+        self.pipeline_for = done.pending_hash;
+        self.pipeline_mempool = done.mempool_len;
+        true
+    }
+
+    /// 2.11.13: re-run the pre-pack while the same proposal waits once the
+    /// pool has grown by this many txs.
+    pub const PREPACK_REFRESH_TXS: usize = 32;
+
+    /// A pre-checked signature is reused only if the key the pack would
+    /// verify against now is the key it was checked with.
+    /// 2.11.15: also a signature sanitize checked at this tip.
+    fn sig_warm_valid(&self, tx: &Tx) -> bool {
+        match self.sig_warm.get(&tx.tx_id).or_else(|| self.sanitize_sig_warm.get(&tx.tx_id)) {
+            Some(k) => *k == self.onchain_sig_key(&tx.account),
+            None => false,
+        }
     }
 
     pub fn pack_or_skip(&mut self, packer: &str) -> Result<Option<Ledger>, String> {
         self.may_pack_locally(packer)?;
+        // Per-head dry runs clone the drafts once per mempool head; before
+        // the copy-on-write rail maps that was a deep copy of every rail
+        // header per head (2.11.13 bench: ~1 s of a 28-tx pack).
+        let t_sanitize = std::time::Instant::now();
         let _ = self.sanitize_mempool();
+        self.pack_phases.sanitize_us = t_sanitize.elapsed().as_micros() as u64;
         match self.pack_as(packer) {
             Ok(l) => Ok(Some(l)),
             Err(e) if e.contains("empty mempool") => {
@@ -11945,7 +13048,7 @@ impl Node {
             return Err("bad tx crypto: tx_id mismatch".into());
         }
         self.keys
-            .verify_account_sig(&tx.account, &tx.public_key, Some(&pk), &payload, &tx.signature)
+            .verify_account_sig(&tx.account, &tx.public_key, Some(&pk), &payload, &tx.sig_hex())
     }
 
     /// On-chain keys for pack pre-verify (empty before the Fix B height).
@@ -12664,7 +13767,7 @@ impl Node {
             );
             return sha256_hex(payload.as_bytes()) == tx.tx_id
                 && keys
-                    .verify_account_sig(&tx.account, &tx.public_key, Some(pk), &payload, &tx.signature)
+                    .verify_account_sig(&tx.account, &tx.public_key, Some(pk), &payload, &tx.sig_hex())
                     .is_ok();
         }
         if keys.has_public(&tx.account) {
@@ -12682,7 +13785,7 @@ impl Node {
             tx.network_id,
             &tx.body,
         );
-        keys.verify_carried_key(&tx.account, &tx.public_key, &payload, &tx.signature)
+        keys.verify_carried_key(&tx.account, &tx.public_key, &payload, &tx.sig_hex())
             .is_ok()
     }
 
@@ -12819,6 +13922,12 @@ impl Node {
             || err.contains("sync committee not in")
             || err.contains("need ")
             || err.contains("confs")
+            // 2.11.14: a duplicate withdraw note, and a first-key that
+            // nothing commits to, can never apply. Classing them as
+            // transient left them at v10's pool head so it packed
+            // nothing and view-changed.
+            || err.contains("duplicate withdraw note")
+            || err.contains(KEY_BIND_REFUSED)
     }
 
     /// Safety cap when `max_txs_per_ledger == 0` (v2.9.49). ~3.3 KB per
@@ -12832,6 +13941,20 @@ impl Node {
     /// 1 MB stays under the 1.5 MB catch-up batch and under the ~1.3 MB body
     /// that stalled the pipe. Not consensus: receivers do not re-derive it.
     pub const PACK_BODY_BUDGET_BYTES: usize = 1_000_000;
+    /// 2.11.16: ceiling for the pack body budget. Stays under the 4 MB body
+    /// lane queue and the 8 MB wire frame with room for two bodies in flight.
+    pub const PACK_BODY_BUDGET_MAX_BYTES: usize = 3_500_000;
+
+    /// 2.11.16: effective pack body budget (see `ChainConfig::pack_body_budget_bytes`).
+    pub fn pack_body_budget(&self) -> usize {
+        let b = if self.cfg.pack_body_budget_bytes > 0 {
+            self.cfg.pack_body_budget_bytes
+        } else {
+            let cap = self.pack_cap_txs();
+            Self::PACK_BODY_BUDGET_BYTES.max(cap.saturating_mul(Self::KNOWN_KEY_TX_EST_BYTES).saturating_mul(11) / 10)
+        };
+        b.clamp(1, Self::PACK_BODY_BUDGET_MAX_BYTES)
+    }
     pub const NEW_KEY_TX_EST_BYTES: usize = 5_000;
     pub const KNOWN_KEY_TX_EST_BYTES: usize = 2_300;
     /// v2.9.59: default mempool size that ends packer pacing early.
@@ -12902,6 +14025,7 @@ impl Node {
         let pending = self.pending_slashes.clone();
         let _seized = self.apply_time_effects_with_slashes(stamp, true, &pending);
         // One clone of the draft per pack (not per candidate tx — v2.9.49).
+        let t_clone = std::time::Instant::now();
         let mut draft = PackDraft {
             state: self.state.clone(),
             defi: self.defi.clone(),
@@ -12911,9 +14035,13 @@ impl Node {
             work: self.epoch_work.clone(),
         };
         ckpt.restore(self);
+        let clone_us = t_clone.elapsed().as_micros() as u64;
         // Same cut as verify (`stage_drafts`) and commit. Before tx select,
         // so the activation block prunes even when it carries no ETH tx.
+        let t_hook = std::time::Instant::now();
         self.prune_eth_exec_for_ledger(&mut draft.bridge, height);
+        let hook_us = t_hook.elapsed().as_micros() as u64;
+        let t_apply = std::time::Instant::now();
         let r0 = self.rv2_round0(height);
         let me = self.id.clone();
         let voters = self
@@ -12931,7 +14059,7 @@ impl Node {
         let mut drop_ids: Vec<String> = Vec::new();
         let mut by_acct: BTreeMap<String, Vec<Tx>> = BTreeMap::new();
         for tx in self.mempool.iter_candidates() {
-            by_acct.entry(tx.account.clone()).or_default().push(tx.clone());
+            by_acct.entry(tx.account.clone()).or_default().push(tx.to_tx());
         }
         for txs in by_acct.values_mut() {
             txs.sort_by_key(|t| t.sequence);
@@ -12955,10 +14083,12 @@ impl Node {
             Self::PACK_DEFAULT_MAX_TXS
         };
         let t_start = std::time::Instant::now();
+        let mut warm_used = 0usize;
         let mut progressed = true;
         // Size budget, not a count. A fixed cap of 8 new keys made a mempool
         // of first-seen accounts drain at 8 txs a block.
         let mut body_est = 0usize;
+        let body_budget = self.pack_body_budget();
         while progressed {
             if hard_cap > 0 && chosen.len() >= hard_cap {
                 break;
@@ -12996,7 +14126,8 @@ impl Node {
                 }
                 let (warm, cold): (Vec<&Tx>, Vec<&Tx>) = heads
                     .into_iter()
-                    .partition(|tx| self.sig_warm.contains(&tx.tx_id));
+                    .partition(|tx| self.sig_warm_valid(tx));
+                warm_used = warm_used.saturating_add(warm.len());
                 let onchain = self.onchain_sig_keys(&cold);
                 let (mut sig_ok, sig_bad) =
                     Self::preverify_pack_sigs(&self.keys, &onchain, &cold, verify_workers);
@@ -13033,7 +14164,7 @@ impl Node {
                     Self::KNOWN_KEY_TX_EST_BYTES
                 };
                 if !chosen.is_empty()
-                    && body_est.saturating_add(add) > Self::PACK_BODY_BUDGET_BYTES
+                    && body_est.saturating_add(add) > body_budget
                 {
                     continue;
                 }
@@ -13094,11 +14225,20 @@ impl Node {
                         // Transient / activation-gated failure (e.g. EthLcUpdate waiting
                         // for activation height). Permanent failures are matched above and
                         // evicted into `drop_ids` + `perm_dropped`.
+                        // 2.11.13: say why once per tx (a tx held back every
+                        // pack was invisible in the log).
+                        if pack_defer_first_seen(&tx.tx_id) {
+                            eprintln!(
+                                "falcon-pl pack defer {} seq {} {}: {_e}",
+                                tx.tx_id, tx.sequence, tx.account
+                            );
+                        }
                     }
                 }
             }
         }
         self.now_ms = saved_now;
+        self.prepack_warm_used = warm_used;
         if !drop_ids.is_empty() {
             self.mempool.remove_many(&drop_ids);
             self.evicted_since_last_seal = true;
@@ -13114,6 +14254,8 @@ impl Node {
         let skipped = self.skip_claims_for_packer(packer)?;
         let parent_cert = self.tip_parent_cert()?;
         // Slash already applied in the draft preamble (before tx select).
+        let apply_us = t_apply.elapsed().as_micros() as u64;
+        let t_root = std::time::Instant::now();
         let root = Self::commitment_root_parts(
             &draft.state,
             &draft.defi,
@@ -13121,6 +14263,12 @@ impl Node {
             &draft.vals,
             &draft.claim,
         );
+        self.pack_phases.height = height;
+        self.pack_phases.txs = chosen.len();
+        self.pack_phases.clone_us = clone_us;
+        self.pack_phases.hook_us = hook_us;
+        self.pack_phases.apply_us = apply_us;
+        self.pack_phases.root_us = t_root.elapsed().as_micros() as u64;
         let mut led = if self.qc_v4_at(height) {
             self.seal_v4_ledger(
                 height,
@@ -14181,6 +15329,15 @@ impl Node {
         self.now_ms = ledger.sealed_at_ms;
         let mut fee_total = 0u64;
         let mut err = None;
+        // v2.11.6: body spelling rule (legacy below the lean height).
+        if let Err(e) = ledger.check_lean_encoding(crate::params_v2::lean_body_active(
+            self.cfg.network_id,
+            ledger.height,
+        )) {
+            ckpt.restore(self);
+            self.now_ms = saved;
+            return Err(e);
+        }
         if !ledger.batch_sig.is_empty() {
             let packer_rk = self.packer_registry_key(ledger);
             let known_keys: Vec<(String, String)> = ledger
@@ -14242,10 +15399,16 @@ impl Node {
     }
 
     fn verify_ledger_state_root(&mut self, ledger: &Ledger) -> Result<u64, String> {
+        let t_stage = std::time::Instant::now();
         let (draft, fee_total, last_settled) = self.stage_drafts(ledger)?;
+        let stage_us = t_stage.elapsed().as_micros() as u64;
         // v2.9.59: normally a memo hit — the node binary precomputed this
         // exact root outside `node.lock` ([`Self::prestage_root_input`]).
+        let t_root = std::time::Instant::now();
         let root = draft.root();
+        self.pack_phases.accept_height = ledger.height;
+        self.pack_phases.stage_us = stage_us;
+        self.pack_phases.stage_root_us = t_root.elapsed().as_micros() as u64;
         if root != ledger.state_root_after {
             return Err(format!(
                 "state root mismatch at h={} (local now_ms={} sealed_at_ms={} last_settled={})",
@@ -14378,6 +15541,9 @@ impl Node {
         if self.height_view_round > 0 {
             return false;
         }
+        if self.hold_window_spent() {
+            return false;
+        }
         self.now_ms.saturating_sub(self.tip_advanced_ms) < self.pace_effective_ms()
     }
 
@@ -14401,7 +15567,7 @@ impl Node {
             return Err("v4 claim_root mismatch".into());
         }
         let sealed = self.sealed_committee();
-        if ledger.current_committee != sealed {
+        if ledger.current_committee != sealed && !self.redraw_committee_claim_ok(ledger) {
             return Err("v4 current_committee mismatch".into());
         }
         let want_cur = self.current_committee_root_at(&ledger.current_committee, ledger.height)?;
@@ -14508,6 +15674,11 @@ impl Node {
         self.orderbook_ledger_hook(&mut draft_state, &mut draft_defi, ledger.height);
         let mut fee_total = 0u64;
         let mut apply_err = None;
+        // v2.11.6: body spelling rule (legacy below the lean height).
+        ledger.check_lean_encoding(crate::params_v2::lean_body_active(
+            self.cfg.network_id,
+            ledger.height,
+        ))?;
         // Merkle-batch bodies: packer batch_sig + (from H=520000) per-sender
         // Falcon sigs are checked here. Non-batch bodies verify in try_protocol_tx.
         if !ledger.batch_sig.is_empty() {
@@ -14736,6 +15907,9 @@ impl Node {
         // Fresh open height → allow a new pre-pack NeedTxs cycle (P1).
         self.need_txs_for_height = 0;
         self.need_txs_open_ms = 0;
+        self.pack_over_budget = false;
+        self.follow_self_pass_height = 0;
+        self.follow_self_pass_round = 0;
         if let Some(c) = &ledger.parent_cert {
             self.certs.entry(c.height).or_insert_with(|| c.clone());
         }
@@ -15169,6 +16343,8 @@ impl Node {
                 // v2.10.1: status only (non-consensus) view of pending BTC branches.
                 "btc_fork": crate::bridge::RailState::btc_branch_summary(&r.btc_fork),
                 "btc_fork_alt": crate::bridge::RailState::btc_branch_summary(&r.btc_fork_alt),
+                // Most-work rail: status-only view of stored side branches.
+                "btc_side": r.btc_side_summary(),
                 "header_tail": r.headers.iter().rev().take(64).map(|(hgt, hdr)| serde_json::json!({
                     "height": hgt,
                     "hash": hdr.hash,
@@ -15326,6 +16502,16 @@ impl Node {
                 .unwrap_or(0),
             "pending_proposal_height": self.pending_proposal.as_ref().map(|p| p.height),
             "pending_proposal_hash": self.pending_proposal.as_ref().map(|p| p.ledger_hash.clone()),
+            "prepack_txs": self.prepack_txs,
+            "prepack_runs": self.prepack_runs,
+            "prepack_warm_used": self.prepack_warm_used,
+            "pack_phases": self.pack_phases,
+            "bridge_slim": self.bridge.bridge_slim,
+            "bridge_slim_from_height": self.bridge_slim_from_height,
+            "root_stats": {
+                "full_hashes": crate::exec_map::root_stats().0,
+                "memo_hits": crate::exec_map::root_stats().1,
+            },
             "schedule_height": self.schedule_height,
             "schedule_online_hash": self.schedule_online_hash,
             "height_view_round": self.height_view_round,
@@ -15751,6 +16937,32 @@ pub struct CatchupPlan {
 // Pack draft + per-tx rollback (v2.9.49)
 // ---------------------------------------------------------------------------
 
+/// 2.11.13: wall-clock phases (µs) of the last pack and accept stage.
+/// Local metrics only (status / logs), never consensus.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackPhases {
+    /// Height of the last pack.
+    pub height: u64,
+    /// Txs in the last pack.
+    pub txs: usize,
+    /// Mempool head dry runs before the pack (`sanitize_mempool`).
+    pub sanitize_us: u64,
+    /// Draft clone (state, defi, bridge, validators, claimable, work).
+    pub clone_us: u64,
+    /// Per-ledger bridge hook (ETH prune, 2.11.13 bridge slim at activation).
+    pub hook_us: u64,
+    /// Tx select + apply (incl. signature checks).
+    pub apply_us: u64,
+    /// Commitment root of the packed draft.
+    pub root_us: u64,
+    /// Height of the last accept stage.
+    pub accept_height: u64,
+    /// `stage_drafts` (re-apply) during accept.
+    pub stage_us: u64,
+    /// Root of the staged draft (normally a memo hit).
+    pub stage_root_us: u64,
+}
+
 /// The six state slices a pack dry-run mutates. Cloned **once** per pack.
 #[derive(Debug, Clone)]
 pub(crate) struct PackDraft {
@@ -15859,6 +17071,30 @@ pub(crate) fn set_pack_force_full_clone(on: bool) {
     PACK_FORCE_FULL_CLONE.with(|c| c.set(on));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: force the pre-2.11.15 head dry-run (equivalence tests).
+    static SANITIZE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_sanitize_legacy(on: bool) {
+    SANITIZE_LEGACY.with(|c| c.set(on));
+}
+
+/// 2.11.15: `FPL_SANITIZE_LEGACY=1` restores the pre-2.11.15 head dry-run
+/// (operator fallback; local policy only).
+fn sanitize_legacy() -> bool {
+    #[cfg(test)]
+    {
+        if SANITIZE_LEGACY.with(|c| c.get()) {
+            return true;
+        }
+    }
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("FPL_SANITIZE_LEGACY").map(|v| v == "1").unwrap_or(false))
+}
+
 #[inline]
 fn pack_force_full_clone() -> bool {
     #[cfg(test)]
@@ -15874,6 +17110,13 @@ fn pack_force_full_clone() -> bool {
 // ---------------------------------------------------------------------------
 // Wire protocol (multi-process)
 // ---------------------------------------------------------------------------
+
+/// One missing mempool head named by a 2.11.12 NeedTxs gap-fill pull.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingSeq {
+    pub account: String,
+    pub sequence: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -15982,9 +17225,16 @@ pub enum WireMsg {
         reason: String,
     },
     /// Pull pending txs from a hub / peer (packer path before progress-timeout).
+    /// `missing` is a 2.11.12 gap-fill hint: specific (account, seq) heads the
+    /// packer cannot walk. Empty is omitted on the wire, so a 2.11.11 peer
+    /// sees the same bytes as today. A 2.11.11 peer that receives a non-empty
+    /// `missing` ignores the unknown field (no `deny_unknown_fields`) and
+    /// still serves the walk-shaped export. No activation height.
     NeedTxs {
         #[serde(default = "default_need_txs_batch")]
         max_count: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        missing: Vec<MissingSeq>,
     },
     /// Directed mempool batch response (reply on requesting connection).
     TxsBatch {
@@ -16325,6 +17575,131 @@ impl WireMsg {
     }
 }
 
+/// True when a serialized wire line is tx gossip (`submit_tx`, `txs_batch`,
+/// `txs_by_ids`). serde writes the `type` tag first, so a prefix test is enough.
+pub fn is_tx_gossip_line(line: &[u8]) -> bool {
+    line.starts_with(b"{\"type\":\"submit_tx\"")
+        || line.starts_with(b"{\"type\":\"txs_batch\"")
+        || line.starts_with(b"{\"type\":\"txs_by_ids\"")
+}
+
+/// Writer-side rewrite of one queued hex line for a lean-capable session.
+/// `None` = send the line unchanged (not tx gossip, already lean, nothing to
+/// rewrite, or not parseable). Keeps a trailing newline if the input had one.
+pub fn lean_tx_gossip_line(line: &[u8]) -> Option<String> {
+    if !is_tx_gossip_line(line) {
+        return None;
+    }
+    let text = std::str::from_utf8(line).ok()?;
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let msg: WireMsg = serde_json::from_str(body).ok()?;
+    let lean = msg.to_lean_tx_gossip()?;
+    let mut out = serde_json::to_string(&lean).ok()?;
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Lean tx gossip (negotiated). Tx-carrying gossip messages may spell each tx
+/// signature and carried public key as `b64:` (canonical padded base64)
+/// instead of hex (neither is in the signed payload or tx_id), but only
+/// towards a peer whose Hello advertised
+/// [`crate::crypto::CAP_LEAN_TX_GOSSIP_V1`]. The receiver turns every `b64:`
+/// field back into lowercase hex before the message is handled, so the mempool,
+/// body fill, pack, sig root and verifiers keep seeing the same hex string the
+/// sender held. Block bodies (`LedgerBody`, `LedgersBatch`, ...) are not
+/// touched here: their spelling is the #44 lean-body rule (activation height).
+impl WireMsg {
+    /// True for the gossip messages whose tx sigs follow the lean-gossip rule.
+    pub fn is_tx_gossip(&self) -> bool {
+        matches!(
+            self,
+            WireMsg::SubmitTx { .. } | WireMsg::TxsBatch { .. } | WireMsg::TxsByIds { .. }
+        )
+    }
+
+    /// Copy of a tx-gossip message with canonical-hex tx sigs and carried
+    /// keys re-spelled as `b64:` for a lean-capable peer. `None` = not tx gossip, or nothing to
+    /// rewrite (send the hex line unchanged).
+    pub fn to_lean_tx_gossip(&self) -> Option<WireMsg> {
+        // Signature and carried key: both outside the payload, so tx_id and
+        // every hash are unchanged; both come back as the same hex.
+        fn lean_tx(tx: &mut Tx) -> bool {
+            let mut any = false;
+            if let Some(l) = crate::crypto::gossip_lean_sig(&tx.signature) {
+                tx.signature = l;
+                any = true;
+            }
+            if let Some(l) = crate::crypto::gossip_lean_sig(&tx.public_key) {
+                tx.public_key = l;
+                any = true;
+            }
+            any
+        }
+        fn lean_txs(txs: &[Tx]) -> Option<Vec<Tx>> {
+            let mut out = txs.to_vec();
+            let mut any = false;
+            for tx in &mut out {
+                any |= lean_tx(tx);
+            }
+            any.then_some(out)
+        }
+        match self {
+            WireMsg::SubmitTx { tx } => {
+                let mut tx = tx.clone();
+                lean_tx(&mut tx).then_some(WireMsg::SubmitTx { tx })
+            }
+            WireMsg::TxsBatch { txs } => lean_txs(txs).map(|txs| WireMsg::TxsBatch { txs }),
+            WireMsg::TxsByIds { ledger_hash, txs } => lean_txs(txs).map(|txs| WireMsg::TxsByIds {
+                ledger_hash: ledger_hash.clone(),
+                txs,
+            }),
+            _ => None,
+        }
+    }
+
+    /// One wire line (JSON + `\n`) for a session. `lean` = the peer's Hello on
+    /// this session advertised lean tx gossip; then tx-gossip sigs go `b64:`.
+    pub fn to_wire_line(&self, lean: bool) -> serde_json::Result<String> {
+        if lean {
+            if let Some(m) = self.to_lean_tx_gossip() {
+                return Ok(serde_json::to_string(&m)? + "\n");
+            }
+        }
+        Ok(serde_json::to_string(self)? + "\n")
+    }
+
+    /// Receiver side: rewrite every `b64:` tx sig / carried key in tx gossip
+    /// to lowercase hex. A batch drops txs whose `b64:` field is not canonical
+    /// and returns how many it dropped; a `SubmitTx` with one is `Err`.
+    /// Non-gossip messages are left alone (`Ok(0)`).
+    pub fn normalize_gossip_tx_sigs(&mut self) -> Result<usize, String> {
+        fn fix(tx: &mut Tx) -> Result<(), String> {
+            if crate::crypto::is_lean_sig(&tx.signature) {
+                let h = crate::crypto::gossip_sig_to_hex(&tx.signature)?.into_owned();
+                tx.signature = h;
+            }
+            if crate::crypto::is_lean_sig(&tx.public_key) {
+                let h = crate::crypto::gossip_sig_to_hex(&tx.public_key)
+                    .map_err(|_| "non-canonical lean tx public key in gossip".to_string())?
+                    .into_owned();
+                tx.public_key = h;
+            }
+            Ok(())
+        }
+        match self {
+            WireMsg::SubmitTx { tx } => fix(tx).map(|_| 0),
+            WireMsg::TxsBatch { txs } | WireMsg::TxsByIds { txs, .. } => {
+                let before = txs.len();
+                txs.retain_mut(|tx| fix(tx).is_ok());
+                Ok(before - txs.len())
+            }
+            _ => Ok(0),
+        }
+    }
+}
+
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
@@ -16341,9 +17716,56 @@ fn default_need_txs_batch() -> u64 {
     Node::NEED_TXS_BATCH as u64
 }
 
+impl WireMsg {
+    /// NeedTxs with an optional gap-fill list. Empty `missing` serializes
+    /// identically to a 2.11.11 NeedTxs (field skipped).
+    pub fn need_txs(max_count: u64, missing: Vec<MissingSeq>) -> Self {
+        WireMsg::NeedTxs { max_count, missing }
+    }
+}
+
 #[cfg(test)]
 mod pack_catchup_tests;
+#[cfg(test)]
+mod pack_fix_21112_tests;
+#[cfg(test)]
+mod prepack_tests;
+#[cfg(test)]
+mod sanitize_fast_tests;
+#[cfg(test)]
+mod compact_relay_tests;
+#[cfg(test)]
+mod lagging_leader_vc_tests;
+#[cfg(test)]
+mod hold_cap_tests;
+#[cfg(test)]
+mod snapshot_chunk_tests;
+#[cfg(test)]
+mod redraw_tests;
+#[cfg(test)]
+mod snapshot_zstd_tests;
+/// First time this process defers `tx_id` at pack (bounded memory).
+fn pack_defer_first_seen(tx_id: &str) -> bool {
+    static SEEN: std::sync::Mutex<std::collections::VecDeque<String>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if g.iter().any(|t| t == tx_id) {
+        return false;
+    }
+    if g.len() >= 512 {
+        g.pop_front();
+    }
+    g.push_back(tx_id.to_string());
+    true
+}
+
+#[cfg(test)]
+mod bridge_slim_tests;
 mod merkle_batch_tests;
+#[cfg(test)]
+mod lean_body_tests;
+#[cfg(test)]
+mod lean_gossip_tests;
 
 #[cfg(test)]
 mod leak_2963_tests;
@@ -16426,6 +17848,16 @@ mod tests {
             crate::bridge::EXEC_HEADERS_BELOW_PRUNE_FLOOR
         ));
         // An empty submit stays the temporary "no headers" error.
+        assert!(!Node::is_permanent_tx_failure("no headers"));
+    }
+
+    #[test]
+    fn duplicate_withdraw_and_key_bind_refused_are_permanent() {
+        // 2.11.14: v10 held dave seq 63 ("duplicate withdraw note") and
+        // falcon-node#seat seq 0 (KEY_BIND_REFUSED) as transient, so they
+        // were never evicted and a pool of only those txs packed nothing.
+        assert!(Node::is_permanent_tx_failure("duplicate withdraw note"));
+        assert!(Node::is_permanent_tx_failure(KEY_BIND_REFUSED));
         assert!(!Node::is_permanent_tx_failure("no headers"));
     }
 
@@ -16780,6 +18212,11 @@ mod tests {
         // 2.11.0 accepts its own line and the legacy 2.9.x line.
         assert!(hello_version_compatible("2.11.0"));
         assert!(hello_version_compatible("2.11.7"));
+        assert!(hello_version_compatible("2.11.8"));
+        assert!(hello_version_compatible("2.11.9"));
+        assert!(hello_version_compatible("2.11.10"));
+        assert!(hello_version_compatible("2.11.11"));
+        assert!(hello_version_compatible("2.11.12"));
         assert!(!hello_version_compatible("2.11.07"));
         assert!(!hello_version_compatible("2.10.0"));
         assert!(!hello_version_compatible("3.9.60"));
@@ -16796,8 +18233,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.4");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.4");
+        assert_eq!(PRODUCT_VERSION, "2.11.19");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.19");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);
@@ -19606,7 +21043,7 @@ mod tests {
         let err = net.payment("carol", "alice", 1, 1).unwrap_err();
         assert!(err.contains("mempool full"), "{err}");
         // duplicate of existing still ok (replaces same-(account, seq) without exceeding cap)
-        let existing = net.nodes.get("v1").unwrap().mempool.iter_candidates().next().unwrap().clone();
+        let existing = net.nodes.get("v1").unwrap().mempool.iter_candidates().next().unwrap().to_tx();
         let dup_raw = net.nodes.get_mut("v1").unwrap().mempool.insert(existing.clone(), 2).unwrap();
         assert!(!dup_raw);
         let dup = net.nodes.get_mut("v1").unwrap().submit_tx(existing).unwrap();
@@ -22401,6 +23838,7 @@ mod tests {
                         parent_hash: format!("{:064x}", i),
                         receipts_root: "00".repeat(32),
                         rlp_hex: "f9".repeat(600),
+                        timestamp: 0,
                     },
                 );
             }
@@ -24562,6 +26000,8 @@ mod v2_10_activation_tests;
 
 #[cfg(test)]
 mod btc4_fork_fix_tests;
+#[cfg(test)]
+mod btc4_most_work_tests;
 #[cfg(test)]
 mod btc4_lend_scale_tests;
 #[cfg(test)]

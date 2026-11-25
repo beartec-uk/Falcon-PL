@@ -340,8 +340,22 @@ pub fn packer_msg_for_domain(
 pub const CAP_UTC_HEADER_V5: &str = "utc-header-v5";
 
 /// Capabilities this binary advertises on Hello (additive; empty on ancient peers).
+/// 2.11.18: this seat rebuilds compact (`LedgerBodyById`) Merkle-batch bodies
+/// byte-identically and may be sent them instead of full bodies.
+pub const CAP_COMPACT_BODY_V1: &str = "compact-body-v1";
+
+pub fn peer_has_compact_body(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|c| c == CAP_COMPACT_BODY_V1)
+}
+
 pub fn local_hello_capabilities() -> Vec<String> {
-    vec![CAP_UTC_HEADER_V5.to_string()]
+    let mut caps = vec![CAP_UTC_HEADER_V5.to_string()];
+    caps.push(CAP_COMPACT_BODY_V1.to_string());
+    // Negotiated lean tx gossip (off with FPL_LEAN_TX_GOSSIP=0).
+    if crate::crypto::lean_tx_gossip_enabled() {
+        caps.push(crate::crypto::CAP_LEAN_TX_GOSSIP_V1.to_string());
+    }
+    caps
 }
 
 pub fn peer_has_utc_header_v5(capabilities: &[String]) -> bool {

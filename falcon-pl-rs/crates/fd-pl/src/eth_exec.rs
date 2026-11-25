@@ -27,7 +27,39 @@ pub struct EthExecHeader {
     pub parent_hash: String,
     pub receipts_root: String,
     /// RLP of the execution header (hex). Hash must be keccak256(rlp).
+    ///
+    /// 2.11.13 bridge slim: a stored header is compacted after its RLP was
+    /// verified on insert (empty here, omitted from serde). Every submitted
+    /// header still carries it. Non-empty on every stored header before the
+    /// activation, so those bytes are unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub rlp_hex: String,
+    /// 2.11.13 bridge slim: header timestamp (RLP field 11), filled from the
+    /// verified RLP when the header is compacted. `0` (omitted) on every
+    /// pre-activation header; a submitted value is ignored (zeroed on
+    /// insert), as older nodes' parsers drop the unknown field.
+    #[serde(default, skip_serializing_if = "ts_is_zero")]
+    pub timestamp: u64,
+}
+
+fn ts_is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// 2.11.13 bridge slim: keep (number, hash, parent, receipts_root, timestamp).
+/// Only for a header whose RLP was already verified. Deterministic: an RLP
+/// whose timestamp does not decode keeps `timestamp = 0` (the LC-head time
+/// then uses the slot fallback, as before).
+pub fn compact_exec_header(h: &mut EthExecHeader) {
+    if h.rlp_hex.is_empty() {
+        return;
+    }
+    let raw = h.rlp_hex.trim().trim_start_matches("0x").trim_start_matches("0X");
+    h.timestamp = hex::decode(raw)
+        .ok()
+        .and_then(|rlp| exec_header_timestamp(&rlp).ok())
+        .unwrap_or(0);
+    h.rlp_hex = String::new();
 }
 
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
@@ -190,6 +222,52 @@ pub fn verify_ancestry<'a>(
     }
     let dep = &headers[0];
     verify_exec_header_rlp(dep)?;
+    if dep.number != deposit_number {
+        return Err("deposit block number mismatch".into());
+    }
+    Ok(dep)
+}
+
+/// [`verify_ancestry`] over stored headers. A compacted header (empty RLP,
+/// 2.11.13 bridge slim) was RLP-verified when it was inserted, so only its
+/// stored links are checked; a header that still has its RLP is re-verified
+/// exactly as before. Before the activation every stored header has its RLP,
+/// so this is [`verify_ancestry`].
+pub fn verify_ancestry_stored<'a>(
+    headers: &'a [EthExecHeader],
+    head_hash: &str,
+    deposit_number: u64,
+) -> Result<&'a EthExecHeader, String> {
+    if headers.iter().all(|h| !h.rlp_hex.is_empty()) {
+        return verify_ancestry(headers, head_hash, deposit_number);
+    }
+    if headers.is_empty() {
+        return Err("no execution headers".into());
+    }
+    let check = |h: &EthExecHeader| -> Result<(), String> {
+        if h.rlp_hex.is_empty() {
+            Ok(())
+        } else {
+            verify_exec_header_rlp(h)
+        }
+    };
+    let head = parse32(head_hash)?;
+    let last = headers.last().unwrap();
+    check(last)?;
+    if parse32(&last.hash)? != head {
+        return Err("header chain does not end at LC execution hash".into());
+    }
+    for i in 1..headers.len() {
+        check(&headers[i])?;
+        if parse32(&headers[i].parent_hash)? != parse32(&headers[i - 1].hash)? {
+            return Err(format!("execution parent mismatch at {}", headers[i].number));
+        }
+        if headers[i].number != headers[i - 1].number + 1 {
+            return Err("execution numbers not consecutive".into());
+        }
+    }
+    let dep = &headers[0];
+    check(dep)?;
     if dep.number != deposit_number {
         return Err("deposit block number mismatch".into());
     }
@@ -680,6 +758,7 @@ mod tests {
             parent_hash: hex::encode(parent),
             receipts_root: hex::encode(receipts),
             rlp_hex: hex::encode(&rlp),
+            timestamp: 0,
         }
     }
 

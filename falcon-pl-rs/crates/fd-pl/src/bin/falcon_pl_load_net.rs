@@ -227,7 +227,7 @@ async fn main() -> Result<()> {
     }
     let primary = rpcs[0].clone();
 
-    let accounts: Vec<String> = (0..args.wallets).map(|i| format!("w{i:03}")).collect();
+    let accounts: Vec<String> = (0..args.wallets).map(|i| format!("w{i:02}")).collect(); // genesis names: w00..w99, w100..
     for a in &accounts {
         if keys.public_hex(a).is_none() {
             bail!("keys dir missing wallet {a}");

@@ -115,6 +115,11 @@ impl LargeGate {
 /// Drop a TCP session whose kernel send or receive queue stays over this.
 const PIPE_SHED_BYTES: usize = 1_000_000;
 const PIPE_SHED_HOLD: std::time::Duration = std::time::Duration::from_secs(2);
+/// 2.11.9: a line that must be finished (a torn partial line, an encoded zstd
+/// frame, a must-send or catch-up line) sheds the session only after the
+/// kernel took no byte of it for this long. A shed costs more than this
+/// anyway (BLACKHOLE_SECS, the lost queue and a mempool re-sync).
+const PIPE_STUCK_HOLD: std::time::Duration = std::time::Duration::from_secs(8);
 /// Do not start another large body while the kernel still holds this much.
 const PIPE_PAUSE_BYTES: usize = 256 * 1024;
 /// Transaction relay may queue while a body is in flight. Inventory and
@@ -126,6 +131,171 @@ const CONS_LOW_WATER: usize = 64 * 1024;
 const LARGE_LINE: usize = 64 * 1024;
 /// After a shed, refuse that peer so both sides do not redial in the same second.
 const BLACKHOLE_SECS: u64 = 8;
+
+/// 2.11.10: upload budgets for non-seat sessions (outside peers, relayed
+/// joiners, ctl/load clients). On 21 Nov v1 sent ~1.3 MB/s of its ~3.4 MB/s
+/// upload to relayed peers (one plain session pulled 21.8 MB of `piece`
+/// lines in 20 s) while its seat links shed. Seats are never paced.
+/// `FPL_OBSERVER_UPLOAD_KBPS` (all non-seat sessions together, default 768)
+/// and `FPL_OBSERVER_SESSION_KBPS` (each, default 256); 0 = unlimited.
+const OBSERVER_UPLOAD_KBPS_DEFAULT: u64 = 768;
+const OBSERVER_SESSION_KBPS_DEFAULT: u64 = 256;
+/// A non-seat catch-up request is refused while the shared budget owes more
+/// than this much send time (nothing is built, pieced or encoded for it).
+const OBSERVER_REFUSE_DEBT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Token bucket that may go into bounded debt: `take` charges the bytes and
+/// returns how long the caller should wait before writing them.
+struct UploadBudget {
+    /// Bytes per second; 0 = unlimited.
+    rate: u64,
+    burst: f64,
+    state: parking_lot::Mutex<(f64, std::time::Instant)>,
+}
+
+impl UploadBudget {
+    fn new(rate: u64) -> Self {
+        // One second of burst, at least one piece line.
+        let burst = (rate as f64).max(64.0 * 1024.0);
+        Self { rate, burst, state: parking_lot::Mutex::new((burst, std::time::Instant::now())) }
+    }
+
+    fn from_env_kbps(key: &str, default_kbps: u64) -> Self {
+        let kbps = std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default_kbps);
+        Self::new(kbps.saturating_mul(1024))
+    }
+
+    fn refill(&self, st: &mut (f64, std::time::Instant), now: std::time::Instant) {
+        let dt = now.saturating_duration_since(st.1).as_secs_f64();
+        st.0 = (st.0 + dt * self.rate as f64).min(self.burst);
+        st.1 = now;
+    }
+
+    fn take_at(&self, n: usize, now: std::time::Instant) -> std::time::Duration {
+        if self.rate == 0 {
+            return std::time::Duration::ZERO;
+        }
+        let mut st = self.state.lock();
+        self.refill(&mut st, now);
+        st.0 -= n as f64;
+        if st.0 >= 0.0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64(-st.0 / self.rate as f64)
+        }
+    }
+
+    fn take(&self, n: usize) -> std::time::Duration {
+        self.take_at(n, std::time::Instant::now())
+    }
+
+    /// Current debt expressed as send time (zero when tokens remain).
+    fn debt_at(&self, now: std::time::Instant) -> std::time::Duration {
+        if self.rate == 0 {
+            return std::time::Duration::ZERO;
+        }
+        let mut st = self.state.lock();
+        self.refill(&mut st, now);
+        if st.0 >= 0.0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs_f64(-st.0 / self.rate as f64)
+        }
+    }
+}
+
+fn observer_global_budget() -> &'static UploadBudget {
+    static G: std::sync::OnceLock<UploadBudget> = std::sync::OnceLock::new();
+    G.get_or_init(|| UploadBudget::from_env_kbps("FPL_OBSERVER_UPLOAD_KBPS", OBSERVER_UPLOAD_KBPS_DEFAULT))
+}
+
+static OBSERVER_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OBSERVER_PACED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OBSERVER_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pace one line on a non-seat session through its own and the shared budget
+/// (the writer-loop soak; live sessions use `pace_line_then`).
+#[cfg_attr(not(test), allow(dead_code))]
+async fn pace_observer(sess: &UploadBudget, observer: &std::sync::atomic::AtomicBool, n: usize) {
+    if !observer.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    OBSERVER_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    let wait = sess.take(n).max(observer_global_budget().take(n));
+    if !wait.is_zero() {
+        OBSERVER_PACED_MS.fetch_add(wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// 2.11.11: a loopback client is the node's own operator: `falcon-pl-ctl`,
+/// the installer's autoupgrade health check (`ctl status` with a 30 s limit),
+/// dashboards. 2.11.10 counted it as a non-seat (no Hello), so its ~2 MB
+/// Status reply was paced to 256 kB/s and queued behind the shared observer
+/// debt; on spn every health-check call missed the window and the upgrade
+/// rolled back twice (21 Nov). Public seed relays reach seats over the
+/// tailnet, never loopback, so relayed outsiders stay paced.
+fn remote_is_loopback(remote: &str) -> bool {
+    match remote.parse::<std::net::SocketAddr>() {
+        Ok(std::net::SocketAddr::V4(a)) => a.ip().is_loopback(),
+        Ok(std::net::SocketAddr::V6(a)) => {
+            a.ip().is_loopback() || a.ip().to_ipv4_mapped().is_some_and(|v| v.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Replies to a query (status, health, ok/err acks) are paced on a non-seat
+/// session by that session's own budget only, never by the shared observer
+/// budget: bulk serve debt (catch-up, snapshots, bodies) must not starve a
+/// status call such as the installer's public network check.
+fn is_query_reply_line(line: &[u8]) -> bool {
+    let head = &line[..line.len().min(24)];
+    head.starts_with(br#"{"type":"status","#)
+        || head.starts_with(br#"{"type":"health","#)
+        || head.starts_with(br#"{"type":"ok","#)
+        || head.starts_with(br#"{"type":"err","#)
+}
+
+/// Pace one outgoing line on a non-seat session (`observer`): query replies
+/// by the session budget, everything else by the session and shared budgets.
+async fn pace_line_with(
+    sess: &UploadBudget,
+    global: &UploadBudget,
+    observer: &std::sync::atomic::AtomicBool,
+    line: &[u8],
+) {
+    if !observer.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let n = line.len();
+    OBSERVER_BYTES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    let wait = if is_query_reply_line(line) { sess.take(n) } else { sess.take(n).max(global.take(n)) };
+    if !wait.is_zero() {
+        OBSERVER_PACED_MS.fetch_add(wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// `pace_line_with` on the process-wide budget, then true (leads an `&&`
+/// chain before a write).
+async fn pace_line_then(sess: &UploadBudget, observer: &std::sync::atomic::AtomicBool, line: &[u8]) -> bool {
+    pace_line_with(sess, observer_global_budget(), observer, line).await;
+    true
+}
+
+/// Catch-up / snapshot requests a non-seat may be refused while the shared
+/// observer budget is in debt (the joiner re-asks on its own timers).
+fn is_observer_serve_request(m: &WireMsg) -> bool {
+    matches!(
+        m,
+        WireMsg::NeedLedgers { .. } | WireMsg::NeedSnapshot { .. } | WireMsg::NeedSnapshotChunk { .. }
+    )
+}
+
+fn observer_refuse_now(budget: &UploadBudget, now: std::time::Instant) -> bool {
+    budget.debt_at(now) > OBSERVER_REFUSE_DEBT
+}
 /// v2.9.67 join-serve retention (local only, not consensus). Hashed serve
 /// files `<stem>.join.serve.<sha>.json` stay fetchable by hash: the newest
 /// `JOIN_SERVE_KEEP`, anything younger than `JOIN_SERVE_MIN_AGE_MS`, the
@@ -218,8 +388,47 @@ fn line_must_send(bytes: &[u8]) -> bool {
         || head.starts_with(b"{\"type\":\"piece\"")
 }
 
+/// Session writer: plain lines until the peer negotiated `zstd-stream-v1`.
+type ZWire = fd_pl::wire_zstd::ZWriter<tokio::net::tcp::OwnedWriteHalf>;
+
+enum WritableWait {
+    Ready,
+    TimedOut,
+    Failed,
+}
+
+/// Kernel-level POLLOUT on the socket (not tokio's cached readiness, which
+/// stays "writable" after a write that filled the buffer without blocking).
+fn sock_pollout(fd: std::os::unix::io::RawFd) -> Option<bool> {
+    let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    let rc = unsafe { libc::poll(&mut p, 1, 0) };
+    if rc < 0 {
+        return None;
+    }
+    if p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return None;
+    }
+    Some(p.revents & libc::POLLOUT != 0)
+}
+
+/// Wait until the kernel will take at least part of the next write.
+async fn wait_writable(probe: std::os::unix::io::RawFd, hold: std::time::Duration) -> WritableWait {
+    let deadline = tokio::time::Instant::now() + hold;
+    loop {
+        match sock_pollout(probe) {
+            None => return WritableWait::Failed,
+            Some(true) => return WritableWait::Ready,
+            Some(false) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return WritableWait::TimedOut;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 async fn write_or_shed(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut ZWire,
     probe: std::os::unix::io::RawFd,
     bytes: &[u8],
 ) -> Result<(), WriteEnd> {
@@ -233,9 +442,16 @@ async fn write_or_shed(
     // while the kernel queue is full of transaction fan-out froze 447954:
     // the 1.33 MB body was discarded and the socket stayed open.
     let must_send = line_must_send(bytes);
+    let optional = !must_send && !catchup_body;
+    // 2.11.9: a backlog over the shed line costs the optional lines, not the
+    // session. Before, the write below shed the whole socket ("send") and the
+    // peer lost every queued vote and body with it.
+    if optional && unsent > PIPE_SHED_BYTES {
+        return Err(WriteEnd::Dropped { unsent });
+    }
     if must_send && unsent > PIPE_PAUSE_BYTES {
         // The peer is still reading. Reset only after the queue stops
-        // shrinking for PIPE_SHED_HOLD, not because it is large.
+        // shrinking for PIPE_STUCK_HOLD, not because it is large.
         let mut last = unsent;
         let mut still_since = tokio::time::Instant::now();
         loop {
@@ -246,7 +462,7 @@ async fn write_or_shed(
             if unsent < last {
                 last = unsent;
                 still_since = tokio::time::Instant::now();
-            } else if still_since.elapsed() >= PIPE_SHED_HOLD {
+            } else if still_since.elapsed() >= PIPE_STUCK_HOLD {
                 return Err(WriteEnd::Shed {
                     unsent,
                     unread: tcp_unread(probe).unwrap_or(0),
@@ -259,48 +475,79 @@ async fn write_or_shed(
     if bytes.len() > LARGE_LINE && unsent > PIPE_PAUSE_BYTES && !must_send {
         return Err(WriteEnd::Dropped { unsent });
     }
-    let mut deadline = tokio::time::Instant::now() + PIPE_SHED_HOLD;
+    // 2.11.8 (#58): a compressed session cannot skip a line once it is encoded,
+    // so wait for socket room *before* encoding, and drop an optional line
+    // there with the stream intact.
+    if writer.will_compress() && optional {
+        match wait_writable(probe, PIPE_SHED_HOLD).await {
+            WritableWait::Ready => {}
+            WritableWait::TimedOut => {
+                // 2.11.9: never a shed here. A backlog over the shed line is
+                // handled above (drop); under it, only this line is skipped.
+                return Err(WriteEnd::Dropped { unsent: tcp_unsent(probe).unwrap_or(0) });
+            }
+            WritableWait::Failed => {
+                return Err(WriteEnd::Shed {
+                    unsent: tcp_unsent(probe).unwrap_or(0),
+                    unread: tcp_unread(probe).unwrap_or(0),
+                    which: "send",
+                })
+            }
+        }
+    }
+    // zstd-stream-v1: encode only once the line will be written. Encoding
+    // advances the stream, so from here a compressed line is sent or the
+    // session ends (never silently dropped).
+    let framed = match writer.encode(bytes) {
+        Ok(f) => f,
+        Err(_) => {
+            return Err(WriteEnd::Shed {
+                unsent,
+                unread: tcp_unread(probe).unwrap_or(0),
+                which: "zstd",
+            })
+        }
+    };
+    let compressed = writer.compressed();
+    let out: &[u8] = &framed;
     let mut off = 0usize;
-    let mut progressed = 0usize;
+    let mut last_progress = tokio::time::Instant::now();
     loop {
-        if off == bytes.len() {
+        if off == out.len() {
             return Ok(());
         }
-        if off > progressed {
-            progressed = off;
-            deadline = tokio::time::Instant::now() + PIPE_SHED_HOLD;
-        }
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // Only an untouched plain optional line may still be skipped, and it
+        // gets the short hold as before. Everything else is kept and finished:
+        // a line the kernel has started taking (torn, plain or compressed), an
+        // encoded compressed line (the stream has moved on), a must-send line
+        // and a catch-up body. The partial frame stays in `out` and is written
+        // before the next line; dropping it mid-frame would corrupt the
+        // stream. 2.11.8 shed all of these after PIPE_SHED_HOLD; live, a peer
+        // that paused reading for 2-8 s (block apply on a 2-vCPU seat) turned
+        // into a reset, an 8 s blackhole, a lost queue and a mempool re-sync.
+        let droppable = off == 0 && optional && !compressed;
+        let hold = if droppable { PIPE_SHED_HOLD } else { PIPE_STUCK_HOLD };
+        let left = (last_progress + hold).saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
             let unsent = tcp_unsent(probe).unwrap_or(0);
             let unread = tcp_unread(probe).unwrap_or(0);
-            if unsent > PIPE_SHED_BYTES {
-                return Err(WriteEnd::Shed {
-                    unsent,
-                    unread,
-                    which: "send",
-                });
-            }
-            // The kernel took none of this line, so the next pong is still framed.
-            // A block body must not be discarded: redial and send it on the new socket.
-            if off == 0 && !catchup_body {
-                if must_send {
-                    return Err(WriteEnd::Shed {
-                        unsent,
-                        unread,
-                        which: "body",
-                    });
-                }
+            if droppable {
                 return Err(WriteEnd::Dropped { unsent });
             }
-            // A partial line cannot stay on the socket. Reset it.
-            return Err(WriteEnd::Shed {
-                unsent,
-                unread,
-                which: "torn",
-            });
+            let which = if unsent > PIPE_SHED_BYTES {
+                "send"
+            } else if off == 0 {
+                // A block body must not be discarded: redial and send it on
+                // the new socket.
+                "body"
+            } else {
+                // The peer took part of this line and then nothing for
+                // PIPE_STUCK_HOLD. A partial line cannot stay on the socket.
+                "torn"
+            };
+            return Err(WriteEnd::Shed { unsent, unread, which });
         }
-        match tokio::time::timeout(left, writer.write(&bytes[off..])).await {
+        match tokio::time::timeout(left, writer.inner.write(&out[off..])).await {
             Ok(Ok(0)) => {
                 return Err(WriteEnd::Shed {
                     unsent: tcp_unsent(probe).unwrap_or(0),
@@ -308,7 +555,10 @@ async fn write_or_shed(
                     which: "send",
                 });
             }
-            Ok(Ok(n)) => off += n,
+            Ok(Ok(n)) => {
+                off += n;
+                last_progress = tokio::time::Instant::now();
+            }
             Ok(Err(_)) => {
                 return Err(WriteEnd::Shed {
                     unsent: tcp_unsent(probe).unwrap_or(0),
@@ -322,15 +572,29 @@ async fn write_or_shed(
 }
 
 async fn emit_or_shed(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    writer: &mut ZWire,
     probe: std::os::unix::io::RawFd,
     bytes: &[u8],
     who: &str,
     dir: &str,
+    lean: bool,
 ) -> Result<(), PipeShed> {
+    // Lean tx gossip: queued lines are always hex. A session whose peer advertised
+    // `lean-tx-gossip-v1` in its Hello gets tx gossip with `b64:` sigs; the
+    // choice is made here, per socket, so a line queued before a peer
+    // restarted on an older binary is never sent lean to it.
+    let lean_line = if lean { fd_pl::lean_tx_gossip_line(bytes) } else { None };
+    let bytes = lean_line.as_deref().map(str::as_bytes).unwrap_or(bytes);
     match write_or_shed(writer, probe, bytes).await {
         Ok(()) => Ok(()),
         Err(WriteEnd::Dropped { unsent }) => {
+            if unsent > PIPE_SHED_BYTES {
+                // 2.11.9 backlog drop: can be many lines a second, so rate-limit.
+                if let Some(n) = should_log_reply_dropped(unix_ms(), &BACKLOG_DROP_LAST_MS, &BACKLOG_DROP_SUPPRESSED) {
+                    warn!("backlog drop optional {dir} to {who} bytes={} unsent={unsent} (suppressed={n})", bytes.len());
+                }
+                return Ok(());
+            }
             warn!(
                 "pause large send {dir} to {who} bytes={} unsent={unsent}",
                 bytes.len()
@@ -381,6 +645,19 @@ fn pipe_stuck(
     last_unsent: &mut usize,
     last_unread: &mut usize,
 ) -> Option<(&'static str, usize, usize)> {
+    // 2.11.10: same grace as a must-finish line in write_or_shed (2.11.9).
+    // At 2 s a hub whose uplink was busy serving catch-up shed seat links
+    // ("send") that would have drained.
+    pipe_stuck_for(fd, high_since, last_unsent, last_unread, PIPE_STUCK_HOLD)
+}
+
+fn pipe_stuck_for(
+    fd: std::os::unix::io::RawFd,
+    high_since: &mut Option<std::time::Instant>,
+    last_unsent: &mut usize,
+    last_unread: &mut usize,
+    hold: std::time::Duration,
+) -> Option<(&'static str, usize, usize)> {
     let unsent = tcp_unsent(fd).unwrap_or(0);
     let unread = tcp_unread(fd).unwrap_or(0);
     let moving = unsent < *last_unsent || unread < *last_unread;
@@ -400,7 +677,7 @@ fn pipe_stuck(
         return None;
     }
     let since = high_since.get_or_insert_with(std::time::Instant::now);
-    if since.elapsed() >= PIPE_SHED_HOLD {
+    if since.elapsed() >= hold {
         Some((which.unwrap(), unsent, unread))
     } else {
         None
@@ -740,8 +1017,24 @@ fn unix_ms() -> u64 {
 fn peek_snap_header(path: &std::path::Path) -> Option<(u64, String)> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    let zstd = f.read_exact(&mut magic).is_ok() && magic == fd_pl::snapshot::ZSTD_MAGIC;
+    let f = std::fs::File::open(path).ok()?;
+    // 2.11.13: snapshot files may be zstd (past the bridge-slim activation).
+    let mut r: Box<dyn Read> = if zstd {
+        Box::new(zstd::stream::read::Decoder::new(f).ok()?)
+    } else {
+        Box::new(f)
+    };
     let mut buf = vec![0u8; 16_384];
-    let n = f.read(&mut buf).ok()?;
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(_) => break,
+        }
+    }
     let s = String::from_utf8_lossy(&buf[..n]);
     let tip = s
         .split("\"tip_height\":")
@@ -853,6 +1146,14 @@ fn seat_payout_sync(shared: &Arc<Shared>, id: &str, want: &str) {
     }
 }
 
+/// 2.11.13 seat timing defaults (match `scripts/network-2300.env`).
+/// 2.11.13: seat snapshot interval default (`--snapshot-interval-ms`,
+/// `SNAPSHOT_INTERVAL_MS` in scripts/network-2300.env).
+const DEFAULT_SNAPSHOT_INTERVAL_MS: u64 = 300_000;
+const DEFAULT_PACK_BUDGET_MS: u64 = 5_000;
+const DEFAULT_PROGRESS_TIMEOUT_MS: u64 = 4_000;
+const DEFAULT_MAX_TXS: usize = 400;
+
 #[derive(Parser, Debug)]
 #[command(version = fd_pl::PRODUCT_VERSION)]
 struct Args {
@@ -868,16 +1169,29 @@ struct Args {
     bond: u64,
     #[arg(long, default_value = "")]
     keys_dir: String,
-    /// Optional hard cap (0 = unlimited — pack only limited by --pack-budget-ms).
-    #[arg(long, default_value_t = 0)]
+    /// Hard cap on txs per block (0 = unlimited — pack only limited by
+    /// --pack-budget-ms). 2.11.13: default 200 (was 0), the live value: a
+    /// 2-vCPU builder holds `node.lock` for the whole pack (11-16 s for
+    /// 250-336 txs), which must stay well under the 14.6 s round-0 timeout.
+    /// 2.11.15: default 400. After the 2.11.13 slim and the 2.11.15 head
+    /// dry-run (one draft per sanitize, signatures checked in parallel and
+    /// shared with the pack) a 200-tx pack is under 0.6 s on the leader.
+    #[arg(long, default_value_t = DEFAULT_MAX_TXS)]
     max_txs: usize,
+    /// 2.11.16: pack body budget in bytes (0 = auto: max(1 MB, max-txs x 2.3 KB x 1.1),
+    /// ceiling 3.5 MB). Local only.
+    #[arg(long, default_value_t = 0)]
+    pack_body_budget_bytes: usize,
     /// Pack as many as possible within this many ms (the real limit).
-    #[arg(long, default_value_t = 1000)]
+    /// 2.11.13: default 5000 (was 1000), the value tested live on 2300 on
+    /// 23 Nov 2026, so seats need no per-seat flag.
+    #[arg(long, default_value_t = DEFAULT_PACK_BUDGET_MS)]
     pack_budget_ms: u64,
     /// If #1 produces no tip advance within this many ms (mempool non-empty),
     /// skip them and let the next ranked ponger pack. 0 = disable.
-    /// Default 2500 ≥ pack_budget + multi-host RTT (GROWTH_AND_MEMPOOL).
-    #[arg(long, default_value_t = 2500)]
+    /// 2.11.13: default 4000 (was 2500): 2 s thin-walk hold, 16 s proposal
+    /// timeout, round-0 silence timeout 2 x (pack budget + 2.3 s).
+    #[arg(long, default_value_t = DEFAULT_PROGRESS_TIMEOUT_MS)]
     progress_timeout_ms: u64,
     /// v2.9.59 packer pacing (local; 0 = off): the round-0 winner waits until
     /// this many ms after the height opened before sealing, unless the mempool
@@ -886,6 +1200,26 @@ struct Args {
     /// (2 windows) cannot fire because of it.
     #[arg(long, default_value_t = 2500)]
     min_block_interval_ms: u64,
+    /// 2.11.18 compact block relay (off by default): send a sealed lean
+    /// Merkle-batch proposal to the body lane as tx ids (`LedgerBodyById`).
+    /// Receivers rebuild it from their mempool, pull missing ids, and fall
+    /// back to the full body. Turn on only once every seat runs 2.11.18.
+    #[arg(long, default_value_t = false)]
+    compact_body_relay: bool,
+    /// 2.11.17 lagging-leader fast view-change (local liveness timing; 0 = off,
+    /// the pre-2.11.17 silence/unavailable timeout). When the round proposer's
+    /// latest tip ad, received after the round opened, is >= 2 behind our tip,
+    /// vote the existing ViewChange after this many ms (lag 1: after 3x).
+    #[arg(long, default_value_t = 400)]
+    lagging_leader_vc_ms: u64,
+    /// 2.11.19 compact relay: carry the full bytes of body txs that reached
+    /// this leader less than this many ms before the seal (0 = none).
+    #[arg(long, default_value_t = 500)]
+    compact_carry_ms: u64,
+    /// 2.11.19 compact relay: a receiver missing only a few txs waits this
+    /// long for its mempool before the id pull (adaptive; 0 = pull at once).
+    #[arg(long, default_value_t = 150)]
+    compact_wait_ms: u64,
     /// v2.9.59: pacing ends early once the local mempool holds this many txs.
     #[arg(long, default_value_t = 400)]
     pace_mempool_txs: usize,
@@ -906,8 +1240,10 @@ struct Args {
     /// Periodically save snapshot to this path (empty = disabled).
     #[arg(long, default_value = "")]
     snapshot_out: String,
-    /// Snapshot save interval ms (default 60s).
-    #[arg(long, default_value_t = 60_000)]
+    /// Snapshot save interval ms. 2.11.13: default 300 s (was 60 s); each
+    /// write competes with packing on a 2 vCPU seat and a restart catches up
+    /// the remaining blocks from peers. Minimum 5 s.
+    #[arg(long, default_value_t = DEFAULT_SNAPSHOT_INTERVAL_MS)]
     snapshot_interval_ms: u64,
     /// Base min fee when mempool idle (escalates by util tier).
     #[arg(long, default_value_t = 1)]
@@ -1027,14 +1363,74 @@ struct HubSnap {
 
 
 
+/// 2.11.18 compact block relay counters.
+#[derive(Default)]
+struct CompactRelayStats {
+    /// Proposals this seat sent as a compact shell (per receiving seat).
+    sent_compact: std::sync::atomic::AtomicU64,
+    /// Proposals this seat sent in full to a seat without the capability.
+    sent_full: std::sync::atomic::AtomicU64,
+    /// Compact bodies rebuilt from the local pool (no pull, or after the id pull).
+    rebuilt: std::sync::atomic::AtomicU64,
+    /// Compact bodies that needed an id pull.
+    pulled: std::sync::atomic::AtomicU64,
+    /// 2.11.19: txs the leader carried in full inside compact shells.
+    carried: std::sync::atomic::AtomicU64,
+    /// 2.11.19: shells parked for a short mempool wait / finished by the wait.
+    waited: std::sync::atomic::AtomicU64,
+    wait_hit: std::sync::atomic::AtomicU64,
+    /// 2.11.19: id-pull replies that did not finish the body yet (others may).
+    partial: std::sync::atomic::AtomicU64,
+    /// 2.11.19: id-pull replies for a body already finished (ignored).
+    late: std::sync::atomic::AtomicU64,
+    /// Last shell counted as a fallback (dedupe ticker retries).
+    last_fallback: parking_lot::Mutex<String>,
+    /// Id pulls that did not complete the body (full-body pull follows).
+    fallback: std::sync::atomic::AtomicU64,
+}
+
+impl CompactRelayStats {
+    fn bump(c: &std::sync::atomic::AtomicU64, n: u64) {
+        c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn json(&self) -> serde_json::Value {
+        let g = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        serde_json::json!({
+            "sent_compact": g(&self.sent_compact),
+            "sent_full": g(&self.sent_full),
+            "rebuilt": g(&self.rebuilt),
+            "pulled": g(&self.pulled),
+            "carried": g(&self.carried),
+            "waited": g(&self.waited),
+            "wait_hit": g(&self.wait_hit),
+            "partial": g(&self.partial),
+            "late": g(&self.late),
+            "fallback": g(&self.fallback),
+        })
+    }
+}
+
 struct Shared {
     node: Mutex<Node>,
+    /// 2.11.13: woken when the tip advances so the next builder packs
+    /// straight away instead of on the next seal tick.
+    seal_wake: tokio::sync::Notify,
+    /// 2.11.13: an off-lock N+1 signature pre-check is running.
+    prepack_busy: std::sync::atomic::AtomicBool,
     /// Write sinks for *inbound* sessions (joiners that dialed us).
     inbound: Mutex<Vec<InboundSink>>,
     /// Indices into fanout that are hub peers (for NeedTxs / preferential tx fan).
     hub_peer_idxs: Vec<usize>,
     is_hub: bool,
     is_archive: bool,
+    /// 2.11.18 `--compact-body-relay`.
+    compact_body_relay: bool,
+    /// 2.11.19 `--compact-wait-ms`.
+    compact_wait_ms: u64,
+    /// 2.11.18: seats whose latest Hello advertised `compact-body-v1`.
+    compact_peers: Mutex<std::collections::HashSet<String>>,
+    /// 2.11.18 compact relay counters (since start).
+    cr: CompactRelayStats,
     snapshot_out: PathBuf,
     snap_meta: Mutex<Option<SnapMeta>>,
     /// One publish of the served join file at a time. Two NeedSnapshot
@@ -1555,6 +1951,19 @@ impl Shared {
             }
         }
         let mut full = 0usize;
+        // 2.11.13: a live inbound session from a peer means our own dial to
+        // it has yielded (lower seat id dials) or is refused ("we dial
+        // them"). That outbound lane is not drained while it waits out
+        // YIELD_DIAL_SECS, so a NeedLedgers queued there was never sent. A
+        // restarted top-id seat (every peer dials it) queued every pull into
+        // dead lanes and never caught up. Send on the live inbound session.
+        let live_in: Vec<InboundSink> = self
+            .inbound
+            .lock()
+            .iter()
+            .filter(|s| !s.id.is_empty() && !s.close.load(std::sync::atomic::Ordering::Relaxed))
+            .cloned()
+            .collect();
         for k in route.iter().copied() {
             let i = plan.order[k];
             let Some(p) = fanout.get(i) else {
@@ -1567,6 +1976,16 @@ impl Shared {
                 i,
             );
             if slow.contains(&pid) {
+                continue;
+            }
+            let lane_id = peers.get(i).map(|(_, id)| id.as_str()).unwrap_or("");
+            if let Some(s) = live_in.iter().find(|s| !lane_id.is_empty() && s.id == lane_id) {
+                if s.tx.try_send(line.clone(), ConsClass::Other) {
+                    note(&pid);
+                    info!("NeedLedgers → inbound {} (our dial yielded)", s.id);
+                    return;
+                }
+                full += 1;
                 continue;
             }
             if p.catchq.try_send(line.clone(), ConsClass::Other) {
@@ -1843,7 +2262,7 @@ impl Shared {
         for id in send {
             let tx = {
                 let n = self.node.lock();
-                n.mempool.get(&id).cloned()
+                n.mempool.get_tx(&id)
             };
             let Some(tx) = tx else {
                 continue;
@@ -2023,6 +2442,8 @@ impl Shared {
             return;
         }
         *seen = h;
+        // 2.11.13: the next builder's pre-checked walk is ready now.
+        self.seal_wake.notify_one();
         let winner = n.lottery_packer().unwrap_or_else(|| "-".into());
         info!(
             "round-gap packer-known h={h} winner={winner} parent={}",
@@ -2288,12 +2709,45 @@ impl Shared {
         }
     }
 
+    /// 2.11.19: id pull to the packer plus one other body-lane seat (any
+    /// peer can answer from its mempool), skipping `skip` (already asked).
+    fn fan_ids_pull(&self, fanout: &Arc<Vec<PeerOut>>, m: &WireMsg, packer: &str, skip: &str) {
+        let (me, lane) = {
+            let n = self.node.lock();
+            (n.id.clone(), n.body_lane_seats())
+        };
+        let mut to: Vec<String> = Vec::new();
+        if !packer.is_empty() && packer != skip && packer != me {
+            to.push(packer.to_string());
+        }
+        for s in lane {
+            if to.len() >= 2 {
+                break;
+            }
+            if s != me && s != skip && !to.contains(&s) {
+                to.push(s);
+            }
+        }
+        if !to.is_empty() {
+            self.fan_ledger_body(fanout, m, &to);
+        }
+    }
+
     /// Directed NeedTxs to hub peers (or all if none tagged).
     fn fan_need_txs(&self, fanout: &Arc<Vec<PeerOut>>, m: &WireMsg) {
         let Ok(s) = serde_json::to_string(m) else {
             return;
         };
         let line = s + "\n";
+        // 2.11.12: a named gap-fill must reach non-hub entry seats too.
+        // Ordinary NeedTxs (empty missing) stays hub-only, same as 2.11.11.
+        let gap = matches!(m, WireMsg::NeedTxs { missing, .. } if !missing.is_empty());
+        if gap {
+            for p in fanout.iter() {
+                let _ = p.txq.try_send(line.clone(), ConsClass::Other);
+            }
+            return;
+        }
         if self.hub_peer_idxs.is_empty() {
             let hubs: Vec<String> = {
                 let n = self.node.lock();
@@ -2323,8 +2777,41 @@ const ACCOUNT_HISTORY_LIMIT: usize = 8;
 const ACCOUNT_HISTORY_DISK_HEIGHTS: u64 = 20_000;
 const ACCOUNT_HISTORY_DISK_MS: u64 = 300;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// 2.11.13 (d): the periodic snapshot timer skips missed runs. Tokio's
+/// default (`Burst`) fired every missed tick back-to-back after a stall
+/// (a frozen or swapping seat), so one slow capture became several full
+/// snapshot captures and writes in a row, each taking `node.lock`.
+fn snapshot_ticker(interval_ms: u64) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick
+}
+
+/// 2.11.13 (c): tokio worker floor. A 2-vCPU seat got 2 workers, and one
+/// long `node.lock` holder (snapshot capture, pack root) froze the whole
+/// node for 20-300 s. `TOKIO_WORKER_THREADS` (as set by the live drop-in)
+/// still wins when it is a valid number; otherwise at least 4 workers.
+const MIN_TOKIO_WORKERS: usize = 4;
+
+fn tokio_workers(env: Option<&str>, cpus: usize) -> usize {
+    if let Some(n) = env.and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0) {
+        return n;
+    }
+    cpus.max(MIN_TOKIO_WORKERS)
+}
+
+fn main() -> Result<()> {
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let env = std::env::var("TOKIO_WORKER_THREADS").ok();
+    let workers = tokio_workers(env.as_deref(), cpus);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?
+        .block_on(node_main(workers))
+}
+
+async fn node_main(tokio_workers: usize) -> Result<()> {
     {
         // Same fmt output as before, plus WARN/ERROR copied into the health
         // ring (`falcon.health.v1` `warnings`).
@@ -2339,8 +2826,10 @@ async fn main() -> Result<()> {
             .with(fd_pl::health::WarnCapture)
             .init();
     }
-
+    // After `Args::parse()`: `--version` / `--help` exit inside it and must
+    // print only the version (the release build and installers read it).
     let mut args = Args::parse();
+    info!("tokio worker threads={tokio_workers}");
     let role = NodeRole::parse(&args.role)
         .or_else(|| {
             std::env::args()
@@ -2427,6 +2916,7 @@ async fn main() -> Result<()> {
     let mut cfg = ChainConfig {
         network_id: args.network_id,
         max_txs_per_ledger: args.max_txs,
+        pack_body_budget_bytes: args.pack_body_budget_bytes,
         pack_budget_ms: args.pack_budget_ms,
         pong_window_ms: 30_000,
         confirm_depth: 3,
@@ -2528,12 +3018,14 @@ async fn main() -> Result<()> {
     // written (2300 snaps say 128 txs / 1000 ms). The process flags are the
     // live knobs; they are not part of the state root.
     node.cfg.max_txs_per_ledger = args.max_txs;
+    node.cfg.pack_body_budget_bytes = args.pack_body_budget_bytes;
     node.cfg.pack_budget_ms = args.pack_budget_ms;
     node.cfg.progress_timeout_ms = args.progress_timeout_ms;
     node.cfg.max_mempool_txs = args.max_mempool_txs;
     info!(
-        "pack knobs: max_txs={} pack_budget_ms={} progress_timeout_ms={} max_mempool={}",
+        "pack knobs: max_txs={} body_budget={} pack_budget_ms={} progress_timeout_ms={} max_mempool={}",
         node.cfg.max_txs_per_ledger,
+        node.pack_body_budget(),
         node.cfg.pack_budget_ms,
         node.cfg.progress_timeout_ms,
         node.cfg.max_mempool_txs
@@ -2541,6 +3033,9 @@ async fn main() -> Result<()> {
     // v2.9.59 packer pacing (runtime knob; not in the snapshot or cfg digest).
     node.pace_min_interval_ms = args.min_block_interval_ms;
     node.pace_mempool_txs = args.pace_mempool_txs.max(1);
+    node.lagging_leader_vc_ms = args.lagging_leader_vc_ms;
+    node.compact_carry_ms = args.compact_carry_ms;
+    info!("lagging-leader view-change: {} ms (0 = off)", node.lagging_leader_vc_ms);
     info!(
         "packer pacing: min_block_interval_ms={} (effective {}) pace_mempool_txs={}",
         node.pace_min_interval_ms,
@@ -2824,10 +3319,16 @@ async fn main() -> Result<()> {
 
     let shared = Arc::new(Shared {
         node: Mutex::new(node),
+        seal_wake: tokio::sync::Notify::new(),
+        prepack_busy: std::sync::atomic::AtomicBool::new(false),
         inbound: Mutex::new(Vec::new()),
         hub_peer_idxs,
         is_hub: args.hub,
         is_archive: args.archive,
+        compact_body_relay: args.compact_body_relay,
+        compact_wait_ms: args.compact_wait_ms,
+        compact_peers: Mutex::new(std::collections::HashSet::new()),
+        cr: CompactRelayStats::default(),
         snapshot_out: PathBuf::from(&args.snapshot_out),
         snap_meta: Mutex::new(None),
         snap_publish: Mutex::new(()),
@@ -3002,7 +3503,7 @@ async fn main() -> Result<()> {
         let path = args.snapshot_out.clone();
         let interval = args.snapshot_interval_ms.max(5_000);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval));
+            let mut tick = snapshot_ticker(interval);
             // v2.9.53: the seat's own snapshot is essential (only refused if it
             // would leave < hard reserve); the join + serve copies are optional
             // dumps (skipped under the low-water mark).
@@ -3023,16 +3524,45 @@ async fn main() -> Result<()> {
                 // `node.lock` every minute (seconds on a 2-vCPU seat).
                 // One capture only; the join copy is trimmed from it after the
                 // full file is written (no second deep clone held alongside).
-                let (snap, tip, tip_hash, ring, scheme) = {
+                // 2.11.13 (e): the chain tail (the bulk of the capture) is
+                // copied in short lock holds after the head, then checked
+                // to end at the head's tip and be hash-linked; on any
+                // mismatch fall back to the old one-lock capture.
+                let (head, after, max_chain, tip, tip_hash, ring, scheme) = {
                     let n = shared_c.node.lock();
+                    let (head, after) = n.to_snapshot_head();
                     (
-                        n.to_snapshot(),
+                        head,
+                        after,
+                        n.cfg.max_chain_ledgers,
                         n.tip_height,
                         n.tip_hash.clone(),
                         n.keys.export_publics(),
                         n.keys.scheme,
                     )
                 };
+                let mut tail: Vec<fd_pl::Ledger> = Vec::new();
+                let mut cursor = after;
+                while cursor < tip {
+                    let part = {
+                        let n = shared_c.node.lock();
+                        n.chain_after(cursor, fd_pl::Node::SNAPSHOT_CHAIN_CHUNK)
+                    };
+                    let Some(last) = part.last() else { break };
+                    cursor = last.height;
+                    tail.extend(part);
+                    tokio::task::yield_now().await;
+                }
+                let snap = match fd_pl::Node::finish_chunked_snapshot(head, tail, max_chain) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("snapshot chunked capture fell back to one lock: {e}");
+                        shared_c.node.lock().to_snapshot()
+                    }
+                };
+                // The fallback may have captured a newer tip.
+                let _ = tip_hash;
+                let (tip, tip_hash) = (snap.tip_height, snap.tip_hash.clone());
                 let saved = tokio::task::block_in_place(|| {
                     fd_pl::Node::write_snapshot_checked(&path, &snap, &essential)
                 });
@@ -3209,7 +3739,10 @@ async fn main() -> Result<()> {
             // contains a seat id, is the only seat allowed to seal.
 
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = shared_c.seal_wake.notified() => {}
+                }
                 ntick += 1;
                 // Dish the missing suffix before ordinary SubmitTx, and hold
                 // those seats until this height's walk is queued.
@@ -3328,7 +3861,36 @@ async fn main() -> Result<()> {
                     let seats = n.body_lane_seats();
                     let push = n.take_pending_body_push();
                     let pull = n.take_body_pull();
+                    let pull_is_fallback = pull.as_deref().map_or(false, |h| n.has_body_shell(h));
+                    let (cdone, cpulls) = n.take_compact_due(unix_ms());
                     drop(n);
+                    if pull_is_fallback {
+                        // Count each shell once, not every 200 ms retry.
+                        let h = pull.clone().unwrap_or_default();
+                        let mut last = shared_c.cr.last_fallback.lock();
+                        if *last != h {
+                            *last = h;
+                            CompactRelayStats::bump(&shared_c.cr.fallback, 1);
+                        }
+                    }
+                    // 2.11.19: parked compact shells whose wait is over.
+                    for ledger in cdone {
+                        CompactRelayStats::bump(&shared_c.cr.wait_hit, 1);
+                        CompactRelayStats::bump(&shared_c.cr.rebuilt, 1);
+                        info!("body-ids h={} filled-after-wait", ledger.height);
+                        let _ = dispatch_wire(
+                            &shared_c,
+                            WireMsg::ProposeLedger { ledger, catchup: false },
+                            Some(&fanout),
+                            false,
+                            false,
+                        );
+                    }
+                    for (hash, tx_ids, packer) in cpulls {
+                        CompactRelayStats::bump(&shared_c.cr.pulled, 1);
+                        let ask = WireMsg::NeedTxsByIds { ledger_hash: hash, tx_ids };
+                        shared_c.fan_ids_pull(&fanout, &ask, &packer, "");
+                    }
                     if let Some(led) = push {
                         if !led.batch_sig.is_empty() {
                             // Retry the small Merkle body on the must-send body
@@ -3390,12 +3952,21 @@ async fn main() -> Result<()> {
                         } else {
                             n.note_need_txs_sent();
                         }
+                        let missing = n.gap_needs();
+                        let nb = n.need_txs_batch();
+                        let h = n.tip_height.saturating_add(1);
+                        let n_miss = missing.len();
+                        let log = n.should_log_need_txs();
                         drop(n);
+                        if log {
+                            info!(
+                                "NeedTxs pull h={h} max={} missing={n_miss}",
+                                nb
+                            );
+                        }
                         shared_c.fan_need_txs(
                             &fanout,
-                            &WireMsg::NeedTxs {
-                                max_count: fd_pl::Node::NEED_TXS_BATCH as u64,
-                            },
+                            &WireMsg::need_txs(nb as u64, missing),
                         );
                     }
                 }
@@ -3619,7 +4190,8 @@ async fn main() -> Result<()> {
                             .as_ref()
                             .map(|p| p.ledger_hash.chars().take(16).collect::<String>());
                         info!(
-                            "view-change vote h={h} round={round} applied={applied} pending={pending_h:?} → lottery {:?}",
+                            "view-change vote h={h} round={round} applied={applied} pending={pending_h:?} fast={} → lottery {:?}",
+                            n.last_vc_fast,
                             n.lottery_packer()
                         );
                         let signature = n.sign_vc_vote(h, &tip, round);
@@ -3724,15 +4296,32 @@ async fn main() -> Result<()> {
                             shared_c.note_walk_ready(open, packable, hold);
                         }
                     }
+                    // 2.11.13 pre-pack: check the next walk's signatures every
+                    // tick (while N's votes arrive, and while the builder
+                    // holds / paces / waits out min_block_interval). The
+                    // Falcon checks run off `node.lock`; pick + store are the
+                    // only locked steps.
+                    use std::sync::atomic::Ordering as AOrd;
+                    if !shared_c.prepack_busy.load(AOrd::Acquire) {
+                        if let Some(plan) = n.prepack_plan() {
+                            if plan.todo_len() == 0 {
+                                n.apply_prepack(plan.verify());
+                            } else {
+                                shared_c.prepack_busy.store(true, AOrd::Release);
+                                let sh = shared_c.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let done = plan.verify();
+                                    sh.node.lock().apply_prepack(done);
+                                    sh.prepack_busy.store(false, AOrd::Release);
+                                });
+                            }
+                        }
+                    }
                     if n.in_skip_grace() {
                         // wait
                     } else if !n.tip_is_soft() {
                         // wait for soft QC before packing next height
                     } else if n.pending_proposal.is_some() {
-                        // Votes for this height are still arriving. Check the
-                        // next block's signatures now so the following proposal
-                        // can go out when this quorum lands.
-                        n.warm_pipeline();
                         // Proposal in flight — wait for soft QC. Do **not** clone
                         // the full Falcon body every 200ms tick (was ~100KB × 5/s).
                         let elapsed = n.now_ms.saturating_sub(n.height_open_ms);
@@ -3845,12 +4434,21 @@ async fn main() -> Result<()> {
                                 && n.should_pre_pack_need_txs()
                             {
                                 n.mark_pre_pack_need_txs();
+                                let missing = n.gap_needs();
+                                let nb = n.need_txs_batch();
+                                let h = n.tip_height.saturating_add(1);
+                                let n_miss = missing.len();
+                                let log = n.should_log_need_txs();
                                 drop(n);
+                                if log {
+                                    info!(
+                                        "NeedTxs pull h={h} max={} missing={n_miss}",
+                                        nb
+                                    );
+                                }
                                 shared_c.fan_need_txs(
                                     &fanout,
-                                    &WireMsg::NeedTxs {
-                                        max_count: fd_pl::Node::NEED_TXS_BATCH as u64,
-                                    },
+                                    &WireMsg::need_txs(nb as u64, missing),
                                 );
                             } else if !n.can_seal_empty()
                                 && !(n.mempool.len() > 0 && !n.has_applicable_tx())
@@ -3879,6 +4477,8 @@ async fn main() -> Result<()> {
                                 "pack-walk h={open_height} winner={winner} pool={pool} applicable={applicable} packable={packable} accounts={accounts} min_depth={min_depth} walk_ready={walk_ready}"
                             );
                             shared_c.note_walk_ready(open_height, packable, "propose-call");
+                            let pack_started = std::time::Instant::now();
+                            let pack_budget = n.cfg.pack_budget_ms;
                             if force_full {
                                 // Checker rule is sealed <= max(local+5s, parent+1s).
                                 // A hot snap clock stamps ~20s ahead and the live
@@ -3886,14 +4486,39 @@ async fn main() -> Result<()> {
                                 let parent = n.chain.last().map(|l| l.sealed_at_ms).unwrap_or(0);
                                 n.now_ms = parent.saturating_add(1_000);
                             }
+                            let t_pack = std::time::Instant::now();
                             match n.pack_or_skip(&my_id) {
                                 Ok(Some(mut ledger)) => {
+                                    let pack_ms = t_pack.elapsed().as_millis();
+                                    n.pack_over_budget = false;
+                                    let t_merkle = std::time::Instant::now();
                                     if let Err(e) = ledger.attach_merkle_batch_known(&n.keys, &|id| {
                                         n.account_public_key(id)
                                     }) {
                                         warn!("merkle batch: {e}");
                                     }
-                                    match n.accept_ledger(&ledger) {
+                                    let merkle_ms = t_merkle.elapsed().as_millis();
+                                    let t_accept = std::time::Instant::now();
+                                    let accepted = n.accept_ledger(&ledger);
+                                    let accept_ms = t_accept.elapsed().as_millis();
+                                    {
+                                        // 2.11.13: where the time under node.lock goes.
+                                        let p = n.pack_phases;
+                                        let (full, hits) = fd_pl::exec_map::root_stats();
+                                        info!(
+                                            "pack-phases h={} txs={} pack_ms={pack_ms} sanitize_ms={} clone_ms={} hook_ms={} apply_ms={} root_ms={} merkle_ms={merkle_ms} accept_ms={accept_ms} stage_ms={} stage_root_ms={} root_full={full} root_hits={hits}",
+                                            ledger.height,
+                                            ledger.txs.len(),
+                                            p.sanitize_us / 1000,
+                                            p.clone_us / 1000,
+                                            p.hook_us / 1000,
+                                            p.apply_us / 1000,
+                                            p.root_us / 1000,
+                                            p.stage_us / 1000,
+                                            p.stage_root_us / 1000,
+                                        );
+                                    }
+                                    match accepted {
                                         Ok(r) => {
                                             let committed = n.tip_height >= r.height
                                                 && n.tip_hash == ledger.ledger_hash;
@@ -3924,12 +4549,51 @@ async fn main() -> Result<()> {
                                             if wire.txs.len() >= 400 {
                                                 let _ = std::fs::remove_file("/tmp/fpl-only-pack");
                                             }
+                                            let carry_shell = if shared_c.compact_body_relay
+                                                && fd_pl::Node::compact_relay_eligible(&wire)
+                                            {
+                                                Some(n.compact_shell_fresh(&wire, fd_pl::wall_ms()))
+                                            } else {
+                                                None
+                                            };
                                             drop(n);
-                                            shared_c.fan_ledger_body(
-                                                &fanout,
-                                                &WireMsg::LedgerBody { ledger: wire },
-                                                &seats,
-                                            );
+                                            // 2.11.18: compact shell only to seats that advertised
+                                            // `compact-body-v1`; everyone else gets the full body.
+                                            let (cseats, fseats): (Vec<String>, Vec<String>) =
+                                                if shared_c.compact_body_relay
+                                                    && fd_pl::Node::compact_relay_eligible(&wire)
+                                                {
+                                                    let cp = shared_c.compact_peers.lock();
+                                                    seats.iter().cloned().partition(|s| cp.contains(s))
+                                                } else {
+                                                    (Vec::new(), seats.clone())
+                                                };
+                                            if !cseats.is_empty() {
+                                                let (sh, carried) = carry_shell
+                                                    .unwrap_or_else(|| (fd_pl::Node::compact_shell(&wire), 0));
+                                                CompactRelayStats::bump(&shared_c.cr.carried, carried as u64);
+                                                let shell = WireMsg::LedgerBodyById { ledger: sh };
+                                                let sb = serde_json::to_string(&shell).map(|s| s.len()).unwrap_or(0);
+                                                info!(
+                                                    "compact-body h={} txs={} carried={carried} bytes={sb} full={bytes} compact_to={} full_to={}",
+                                                    wire.height,
+                                                    wire.txs.len(),
+                                                    cseats.len(),
+                                                    fseats.len()
+                                                );
+                                                CompactRelayStats::bump(&shared_c.cr.sent_compact, cseats.len() as u64);
+                                                shared_c.fan_ledger_body(&fanout, &shell, &cseats);
+                                            }
+                                            if !fseats.is_empty() {
+                                                if shared_c.compact_body_relay {
+                                                    CompactRelayStats::bump(&shared_c.cr.sent_full, fseats.len() as u64);
+                                                }
+                                                shared_c.fan_ledger_body(
+                                                    &fanout,
+                                                    &WireMsg::LedgerBody { ledger: wire },
+                                                    &fseats,
+                                                );
+                                            }
                                             // Header still goes to seats that are not on the body lane.
                                             if let Ok(line) = serde_json::to_string(&header) {
                                                 shared_c.fan_line_except(&fanout, line + "\n", &seats);
@@ -3949,6 +4613,16 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 Ok(None) => {
+                                    if pack_budget > 0
+                                        && pack_started.elapsed().as_millis() as u64 >= pack_budget
+                                    {
+                                        n.pack_over_budget = true;
+                                        warn!(
+                                            "pack over budget {}ms (budget {pack_budget}ms) h={}",
+                                            pack_started.elapsed().as_millis(),
+                                            n.tip_height.saturating_add(1)
+                                        );
+                                    }
                                     let h = n.tip_height + 1;
                                     let skipped = n.skip_set_for(h).contains(&my_id);
                                     let tip = n.tip_hash.clone();
@@ -3988,10 +4662,20 @@ async fn main() -> Result<()> {
                                         || e.contains("soft")
                                         || e.contains("pending") =>
                                 {
+                                    if pack_budget > 0
+                                        && pack_started.elapsed().as_millis() as u64 >= pack_budget
+                                    {
+                                        n.pack_over_budget = true;
+                                    }
                                     let h = n.tip_height.saturating_add(1);
                                     shared_c.note_walk_ready(h, n.packable_tx_count(), &e);
                                 }
                                 Err(e) => {
+                                    if pack_budget > 0
+                                        && pack_started.elapsed().as_millis() as u64 >= pack_budget
+                                    {
+                                        n.pack_over_budget = true;
+                                    }
                                     let h = n.tip_height.saturating_add(1);
                                     shared_c.note_walk_ready(h, n.packable_tx_count(), &e);
                                     warn!("pack: {e}");
@@ -4032,7 +4716,16 @@ async fn main() -> Result<()> {
                         .sum();
                     drop(inbound);
                     let socks = shared_c.sock_summary();
-                    info!("mesh sockets outbound={n_out} inbound={n_in} queued_out={out_bytes} queued_in={in_bytes} live={socks}");
+                    let ob = OBSERVER_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                    let op = OBSERVER_PACED_MS.load(std::sync::atomic::Ordering::Relaxed);
+                    let orf = OBSERVER_REFUSED.load(std::sync::atomic::Ordering::Relaxed);
+                    info!("mesh sockets outbound={n_out} inbound={n_in} queued_out={out_bytes} queued_in={in_bytes} live={socks} observer_bytes={ob} observer_paced_ms={op} observer_refused={orf}");
+                    info!(
+                        "compact-relay on={} peers={} stats={}",
+                        shared_c.compact_body_relay,
+                        shared_c.compact_peers.lock().len(),
+                        shared_c.cr.json()
+                    );
                 }
             }
         });
@@ -4171,7 +4864,11 @@ async fn peer_session(
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let probe = unsafe { libc::dup(stream.as_raw_fd()) };
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let zstd_on = fd_pl::wire_zstd::enabled();
+    let peer_zstd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peer_zstd_r = peer_zstd.clone();
+    let mut writer = ZWire::new(writer, peer_zstd.clone(), fd_pl::wire_zstd::level());
 
     // hello (includes tip so peer can start pull catch-up immediately).
     // **Validators only** in publics — never dump load-wallet keyring (was ~1.9MB
@@ -4211,7 +4908,10 @@ async fn peer_session(
                 .map(|m| m.tip)
                 .unwrap_or(0),
             release_version: PRODUCT_VERSION.to_string(),
-            capabilities: fd_pl::utc_header::local_hello_capabilities(),
+            capabilities: fd_pl::wire_zstd::with_capability(
+                fd_pl::utc_header::local_hello_capabilities(),
+                zstd_on,
+            ),
         };
         serde_json::to_string(&hello)? + "\n"
     };
@@ -4229,13 +4929,17 @@ async fn peer_session(
     // the biased select can see a closed reply channel before the task.
     let yield_dial = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let yield_dial_r = yield_dial.clone();
+    // Lean tx gossip: this session's peer advertised lean tx gossip (false until
+    // its Hello on *this* socket says so; never carried across reconnects).
+    let lean_sess = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lean_r = lean_sess.clone();
     let my_id_r = my_id.to_string();
     let peer_id_w = peer_id.clone();
     let hello_rejected: Arc<parking_lot::Mutex<Option<String>>> =
         Arc::new(parking_lot::Mutex::new(None));
     let hello_rejected_r = hello_rejected.clone();
     let mut read_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
+        let mut lines = fd_pl::wire_zstd::LineReader::new(reader, zstd_on);
         let mut gate = HelloSession::default();
         let mut asm = fd_pl::pieces::PieceAssembler::default();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -4250,8 +4954,13 @@ async fn peer_session(
                 continue;
             };
             {
-                if let WireMsg::Hello { id, .. } = &msg {
+                if let WireMsg::Hello { id, capabilities, .. } = &msg {
                     *peer_id.lock() = id.clone();
+                    lean_r.store(
+                        fd_pl::crypto::lean_tx_gossip_enabled()
+                            && fd_pl::crypto::peer_has_lean_tx_gossip(capabilities),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if !we_dial(&my_id_r, id) {
                         yield_dial_r.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -4268,10 +4977,15 @@ async fn peer_session(
                         }
                     }
                 }
+                if let WireMsg::Hello { capabilities, .. } = &msg {
+                    if zstd_on && fd_pl::wire_zstd::peer_has(capabilities) {
+                        peer_zstd_r.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 *shared_r.wire_from.lock() = peer_id.lock().clone();
                 for reply in dispatch_wire(&shared_r, msg, Some(&fanout_r), false, false) {
-                    if let Ok(s) = serde_json::to_string(&reply) {
-                        let out = s + "\n";
+                    // Lean before piecing: a pieced reply is not rewritten later.
+                    if let Ok(out) = reply.to_wire_line(lean_r.load(std::sync::atomic::Ordering::Relaxed)) {
                         let is_catchup = matches!(
                             reply,
                             WireMsg::LedgersBatch { .. }
@@ -4327,7 +5041,7 @@ async fn peer_session(
                     "dish-gate {why} to {who} unsent={}",
                     tcp_unsent(probe).unwrap_or(0)
                 );
-                if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                     read_task.abort();
                     unsafe { libc::close(probe) };
                     return Err(PipeShed.into());
@@ -4347,7 +5061,7 @@ async fn peer_session(
             if let Ok(line) = body_rx.try_recv() {
                 recved(body_used, line.len());
                 if is_tx_dish(line.as_bytes()) {
-                    if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                    if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                         read_task.abort();
                         unsafe { libc::close(probe) };
                         return Err(PipeShed.into());
@@ -4356,7 +5070,7 @@ async fn peer_session(
                     inv_left = DISH_INV_BUDGET;
                     continue;
                 }
-                if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                     read_task.abort();
                     unsafe { libc::close(probe) };
                     return Err(PipeShed.into());
@@ -4364,13 +5078,29 @@ async fn peer_session(
                 continue;
             }
         }
-        // Lanes: LedgersBatch reply → other reply → cons → NeedLedgers → body → inventory.
+        // Lanes: cons → LedgersBatch reply → other reply → NeedLedgers → body → inventory.
+        // 2.11.10: votes first. v1 dials every seat, so all its seat links
+        // are this loop; a lagging seat's pieced LedgersBatch (63 must-send
+        // pieces) used to sit ahead of every vote on that socket.
         tokio::select! {
             biased;
+            line = cons_rx.recv() => {
+                match line {
+                    Some(line) => {
+                        recved(cons_used, line.len());
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
+                            read_task.abort();
+                            unsafe { libc::close(probe) };
+                            return Err(PipeShed.into());
+                        }
+                    }
+                    None => break,
+                }
+            }
             line = catchup_rx.recv() => {
                 match line {
                     Some(line) => {
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4385,20 +5115,7 @@ async fn peer_session(
             line = reply_rx.recv() => {
                 match line {
                     Some(line) => {
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
-                            read_task.abort();
-                            unsafe { libc::close(probe) };
-                            return Err(PipeShed.into());
-                        }
-                    }
-                    None => break,
-                }
-            }
-            line = cons_rx.recv() => {
-                match line {
-                    Some(line) => {
-                        recved(cons_used, line.len());
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4411,7 +5128,7 @@ async fn peer_session(
                 match line {
                     Some(line) => {
                         recved(catch_used, line.len());
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4426,7 +5143,7 @@ async fn peer_session(
                         recved(body_used, line.len());
                         if is_tx_dish(line.as_bytes()) {
                             succ_hold.clear();
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 read_task.abort();
                                 unsafe { libc::close(probe) };
                                 return Err(PipeShed.into());
@@ -4435,7 +5152,7 @@ async fn peer_session(
                             inv_left = DISH_INV_BUDGET;
                         } else if is_body_successor(line.as_bytes()) && dish_blocking(&dish_since, probe) {
                             succ_hold.push_back(line);
-                        } else if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        } else if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4468,7 +5185,7 @@ async fn peer_session(
                         if unsent > CONS_LOW_WATER {
                             inv_left = inv_left.saturating_sub(line.len());
                         }
-                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound").await.is_err() {
+                        if emit_or_shed(&mut writer, probe, line.as_bytes(), &who, "outbound", lean_sess.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                             read_task.abort();
                             unsafe { libc::close(probe) };
                             return Err(PipeShed.into());
@@ -4583,6 +5300,8 @@ fn should_drop_inbound_reply(inbound_registered: bool, was_hello: bool, reply: &
 const REPLY_DROP_LOG_INTERVAL_MS: u64 = 10_000;
 static REPLY_DROP_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REPLY_DROP_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BACKLOG_DROP_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BACKLOG_DROP_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Rate-limit `inbound reply dropped` warnings to at most once every
 /// `REPLY_DROP_LOG_INTERVAL_MS`. Returns `Some(suppressed_count)` when a log
@@ -4627,8 +5346,11 @@ async fn handle_inbound(
         key: remote.clone(),
     };
     let probe = unsafe { libc::dup(stream.as_raw_fd()) };
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let (reader, writer) = stream.into_split();
+    let zstd_on = fd_pl::wire_zstd::enabled();
+    let peer_zstd = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writer = ZWire::new(writer, peer_zstd.clone(), fd_pl::wire_zstd::level());
+    let mut lines = fd_pl::wire_zstd::LineReader::new(reader, zstd_on);
 
     // Register sink so mesh fanout (Pong/ProposeLedger/Skip) reaches joiners
     // that dialed us but are not on our --peers list.
@@ -4681,7 +5403,10 @@ async fn handle_inbound(
                 .map(|m| m.tip)
                 .unwrap_or(0),
             release_version: PRODUCT_VERSION.to_string(),
-            capabilities: fd_pl::utc_header::local_hello_capabilities(),
+            capabilities: fd_pl::wire_zstd::with_capability(
+                fd_pl::utc_header::local_hello_capabilities(),
+                zstd_on,
+            ),
         };
         serde_json::to_string(&hello)? + "\n"
     };
@@ -4704,6 +5429,15 @@ async fn handle_inbound(
     let large_w = large_out.clone();
     let remote_w = remote.clone();
     let shared_w = shared.clone();
+    // Lean tx gossip for this inbound session (set from its Hello).
+    let lean_in = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lean_w = lean_in.clone();
+    // 2.11.10: a session is paced as a non-seat until its Hello names a seat.
+    // 2.11.11: except a loopback client (the operator's own ctl / health check).
+    let local_client = remote_is_loopback(&remote);
+    let observer = Arc::new(std::sync::atomic::AtomicBool::new(!local_client));
+    let observer_w = observer.clone();
+    let obs_budget = UploadBudget::from_env_kbps("FPL_OBSERVER_SESSION_KBPS", OBSERVER_SESSION_KBPS_DEFAULT);
     let mut writer_task = tokio::spawn(async move {
         let mut high_since = None;
         let mut last_unsent = 0usize;
@@ -4730,7 +5464,7 @@ async fn handle_inbound(
                         if dish_since.unwrap().elapsed() >= DISH_GATE { "timeout" } else { "release" },
                         tcp_unsent(probe).unwrap_or(0)
                     );
-                    if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound").await.is_err() {
+                    if pace_line_then(&obs_budget, &observer_w, line.as_bytes()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                         shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
@@ -4748,7 +5482,7 @@ async fn handle_inbound(
                 line = catch_reply_rx.recv() => {
                     match line {
                         Some(line) => {
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound").await.is_err() {
+                            if pace_line_then(&obs_budget, &observer_w, line.as_bytes()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -4759,7 +5493,7 @@ async fn handle_inbound(
                 line = reply_rx.recv() => {
                     match line {
                         Some(line) => {
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound").await.is_err() {
+                            if pace_line_then(&obs_budget, &observer_w, line.as_bytes()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -4791,7 +5525,7 @@ async fn handle_inbound(
                                 }
                                 inv_left = inv_left.saturating_sub(line.len());
                             }
-                            if emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound").await.is_err() {
+                            if pace_line_then(&obs_budget, &observer_w, line.as_bytes()).await && emit_or_shed(&mut writer, probe, line.as_bytes(), &remote_w, "inbound", lean_w.load(std::sync::atomic::Ordering::Relaxed)).await.is_err() {
                                 shed_w.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -4862,6 +5596,16 @@ async fn handle_inbound(
                 }
             }
         }
+        if let WireMsg::Hello { capabilities, .. } = &msg {
+            lean_in.store(
+                fd_pl::crypto::lean_tx_gossip_enabled()
+                    && fd_pl::crypto::peer_has_lean_tx_gossip(capabilities),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if zstd_on && fd_pl::wire_zstd::peer_has(capabilities) {
+                peer_zstd.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if !inbound_registered {
             if let WireMsg::Hello { id, .. } = &msg {
                 if we_dial(my_id, id) {
@@ -4875,6 +5619,8 @@ async fn handle_inbound(
                     break;
                 }
                 seen_id = id.clone();
+                let seat = shared.node.lock().validators.contains_key(id);
+                observer.store(!seat && !local_client, std::sync::atomic::Ordering::Relaxed);
                 shared.close_inbound_seat(id);
                 shared.inbound.lock().push(InboundSink {
                     id: id.clone(),
@@ -4885,10 +5631,19 @@ async fn handle_inbound(
                 inbound_registered = true;
             }
         }
+        if observer.load(std::sync::atomic::Ordering::Relaxed)
+            && is_observer_serve_request(&msg)
+            && observer_refuse_now(observer_global_budget(), std::time::Instant::now())
+        {
+            // 2.11.10: drop before anything is built, pieced or encoded.
+            OBSERVER_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         let was_hello = matches!(msg, WireMsg::Hello { .. });
         let replies = dispatch_wire(&shared, msg, Some(&fanout), true, false);
         for r in replies {
-            let out = serde_json::to_string(&r)? + "\n";
+            // Lean before piecing: a pieced reply is not rewritten later.
+            let out = r.to_wire_line(lean_in.load(std::sync::atomic::Ordering::Relaxed))?;
             let pieces = shared.pieces_for(&seen_id, &out);
             if is_catchup_reply(&r) {
                 if !reply_send_pieced(&catch_reply_tx, out, pieces) {
@@ -5176,11 +5931,24 @@ fn serve_snap_chunk(shared: &Shared, sha256: &str, index: u32) -> Result<WireMsg
 /// One NeedSnapshot must finish the transfer; stop-and-wait died on WAN.
 fn dispatch_wire(
     shared: &Shared,
-    msg: WireMsg,
+    mut msg: WireMsg,
     fanout: Option<&Arc<Vec<PeerOut>>>,
     relay_state: bool,
     from_admin: bool,
 ) -> Vec<WireMsg> {
+    // Lean tx gossip carries `b64:` sigs; everything past this point
+    // (mempool, body fill, relay, pack) sees the same hex the sender held.
+    match msg.normalize_gossip_tx_sigs() {
+        Ok(0) => {}
+        Ok(dropped) => warn!(
+            "lean tx gossip from {}: dropped {dropped} tx(s) with non-canonical b64 sig",
+            shared.wire_from.lock()
+        ),
+        Err(e) => {
+            warn!("{e} from {}", shared.wire_from.lock());
+            return vec![WireMsg::Err { msg: e }];
+        }
+    }
     let push = matches!(msg, WireMsg::NeedSnapshot {});
     let mut out = Vec::new();
     if let Some(r) = process_msg(shared, msg, fanout, relay_state, from_admin) {
@@ -5278,10 +6046,12 @@ fn process_msg(
         WireMsg::LedgerBodyById { ledger } => {
             let height = ledger.height;
             let n_ids = ledger.tx_ids.len();
+            let packer = ledger.packer.clone();
             let mut n = shared.node.lock();
             let me = n.id.clone();
             match n.assemble_body_by_id(ledger) {
                 Ok(ledger) => {
+                    CompactRelayStats::bump(&shared.cr.rebuilt, 1);
                     info!("body-ids seat={me} h={height} n={n_ids} have={n_ids} miss=0");
                     WireMsg::ProposeLedger {
                         ledger,
@@ -5294,13 +6064,35 @@ fn process_msg(
                         "body-ids seat={me} h={height} n={n_ids} have={} miss={miss} pull",
                         n_ids.saturating_sub(miss)
                     );
+                    if height <= n.tip_height {
+                        return None;
+                    }
+                    // 2.11.19: a few missing txs are usually still in flight on
+                    // the tx plane; wait briefly (adaptive) before pulling.
+                    let wait = shared.compact_wait_ms;
+                    if wait > 0 && n.compact_should_wait(miss, n_ids) && !n.compact_waiting.contains_key(&hash) {
+                        n.park_compact(&hash, unix_ms().saturating_add(wait));
+                        n.note_want_body(height, &hash);
+                        n.last_want_body_ms = n.now_ms.saturating_add(wait + 600);
+                        CompactRelayStats::bump(&shared.cr.waited, 1);
+                        info!("body-ids seat={me} h={height} n={n_ids} have={} miss={miss} wait={wait}ms", n_ids - miss);
+                        return None;
+                    }
+                    CompactRelayStats::bump(&shared.cr.pulled, 1);
+                    // If the id pulls do not finish the body, the periodic
+                    // full-body pull takes over after ~800 ms.
+                    n.note_want_body(height, &hash);
+                    n.last_want_body_ms = n.now_ms.saturating_add(600);
                     drop(n);
                     let ask = WireMsg::NeedTxsByIds {
                         ledger_hash: hash,
                         tx_ids,
                     };
+                    // 2.11.19: ask the sender (reply below), the packer and one
+                    // more seat, not the archive first.
                     if let Some(f) = fanout {
-                        shared.fan_body_pull(f, &ask);
+                        let from = shared.wire_from.lock().clone();
+                        shared.fan_ids_pull(f, &ask, &packer, &from);
                     }
                     return Some(ask);
                 }
@@ -5311,6 +6103,7 @@ fn process_msg(
             let me = n.id.clone();
             match n.supply_body_txs(&ledger_hash, txs) {
                 Some(ledger) => {
+                    CompactRelayStats::bump(&shared.cr.rebuilt, 1);
                     info!(
                         "body-ids seat={me} h={} filled-from-pull",
                         ledger.height
@@ -5321,9 +6114,16 @@ fn process_msg(
                     }
                 }
                 None => {
-                    info!("body-ids seat={me} hash={ledger_hash} full-body-fallback");
-                    drop(n);
-                    return Some(WireMsg::NeedLedgerBody { ledger_hash });
+                    // 2.11.19: a reply for a finished body is ignored; a
+                    // partial one waits for the other pulls. The full-body
+                    // pull (counted as `fallback`) runs from the ticker only
+                    // if the shell is still open ~800 ms after it arrived.
+                    if n.has_body_shell(&ledger_hash) {
+                        CompactRelayStats::bump(&shared.cr.partial, 1);
+                    } else {
+                        CompactRelayStats::bump(&shared.cr.late, 1);
+                    }
+                    return None;
                 }
             }
         }
@@ -5347,8 +6147,17 @@ fn process_msg(
             archive,
             snap_height,
             release_version,
-            capabilities: _, // gated earlier via HelloSession::check
+            capabilities, // gated earlier via HelloSession::check
         } => {
+            // 2.11.18: remember whether this seat can take compact bodies.
+            {
+                let mut cp = shared.compact_peers.lock();
+                if fd_pl::utc_header::peer_has_compact_body(&capabilities) {
+                    cp.insert(id.clone());
+                } else {
+                    cp.remove(&id);
+                }
+            }
             // Live bond-in: Hello only advertises keys (+ tip). Bonded seats come
             // from genesis register or Bond ledger txs — never free-register from wire.
             // Lock order: snap_pull before node (ticker holds them that way).
@@ -5500,28 +6309,39 @@ fn process_msg(
             }
             if want_txs {
                 if let Some(f) = fanout {
+                    let (missing, nb) = {
+                        let n = shared.node.lock();
+                        (n.gap_needs(), n.need_txs_batch())
+                    };
                     shared.fan_need_txs(
                         f,
-                        &WireMsg::NeedTxs {
-                            max_count: fd_pl::Node::NEED_TXS_BATCH as u64,
-                        },
+                        &WireMsg::need_txs(nb as u64, missing),
                     );
                 }
             }
             None
         }
-        WireMsg::NeedTxs { max_count } => {
+        WireMsg::NeedTxs { max_count, missing } => {
             let mut n = shared.node.lock();
             // While lagging, prefer catch-up replies over TxsBatch on the wire.
             if n.still_lagging() {
                 return None;
             }
-            let batch = n.serve_need_txs(max_count as usize);
+            let asked = missing.len();
+            let (batch, filled) = n.serve_need_txs_for(max_count as usize, &missing);
+            let log = n.should_log_need_txs();
             drop(n);
+            if log {
+                info!(
+                    "NeedTxs serve n={} gap_filled={} missing_asked={}",
+                    batch.len(),
+                    filled,
+                    asked
+                );
+            }
             if batch.is_empty() {
                 None
             } else {
-                debug!("NeedTxs serve n={}", batch.len());
                 Some(WireMsg::TxsBatch { txs: batch })
             }
         }
@@ -5543,7 +6363,7 @@ fn process_msg(
             let n = shared.node.lock();
             let txs: Vec<_> = ids
                 .iter()
-                .filter_map(|id| n.mempool.get(id).cloned())
+                .filter_map(|id| n.mempool.get_tx(id))
                 .take(32)
                 .collect();
             drop(n);
@@ -6035,15 +6855,8 @@ fn process_msg(
         }
         WireMsg::NeedTxsByIds { ledger_hash, tx_ids } => {
             let n = shared.node.lock();
-            let Some(ledger) = n.ledger_body(&ledger_hash) else {
-                return None;
-            };
-            let want: std::collections::BTreeSet<&str> = tx_ids.iter().map(|s| s.as_str()).collect();
-            let txs: Vec<_> = ledger
-                .txs
-                .into_iter()
-                .filter(|t| want.contains(t.tx_id.as_str()))
-                .collect();
+            // 2.11.19: any peer answers, from the body or its mempool.
+            let txs = n.txs_for_ids(&ledger_hash, &tx_ids);
             if txs.is_empty() {
                 None
             } else {
@@ -7201,6 +8014,14 @@ fn health_body(shared: &Shared, fanout: Option<&Arc<Vec<PeerOut>>>, warnings: u3
         c.insert("blocks_per_min_spark".into(), serde_json::json!(spark));
         c.insert("tip_advanced_age_ms".into(), serde_json::json!(adv_age));
     }
+    if let Some(o) = body.as_object_mut() {
+        let mut cr = shared.cr.json();
+        if let Some(m) = cr.as_object_mut() {
+            m.insert("on".into(), shared.compact_body_relay.into());
+            m.insert("peers".into(), shared.compact_peers.lock().len().into());
+        }
+        o.insert("compact_relay".into(), cr);
+    }
     let outbound: Vec<String> = fanout
         .map(|f| {
             f.iter()
@@ -7329,7 +8150,75 @@ mod inbound_ack_tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
-    fn test_shared(id: &str) -> Arc<Shared> {
+    /// Lean tx gossip lands in the pool as the sender's exact hex
+    /// tx; a non-canonical `b64:` sig is refused before anything sees it.
+    #[test]
+    fn lean_tx_gossip_is_normalised_at_dispatch() {
+        let shared = test_shared("v1");
+        let nid = shared.node.lock().cfg.network_id;
+        let mut uk = crate::KeyRing::default();
+        for acct in ["alice", "bob", "carol"] {
+            let _ = uk.generate_id(acct);
+        }
+        {
+            let mut n = shared.node.lock();
+            n.cfg.min_fee = 0;
+            n.cfg.fee_escalate = false;
+            for acct in ["alice", "bob", "carol"] {
+                let _ = n.keys.insert_public(acct, &uk.public_hex(acct).unwrap());
+                let mut a = n.state.get(acct);
+                a.balance = 50_000;
+                n.state.accounts.insert(acct.into(), a);
+            }
+        }
+        let seq = |n: &fd_pl::Node, a: &str| n.state.get(a).sequence;
+        let (tx_a, tx_b, tx_c) = {
+            let n = shared.node.lock();
+            (
+                fd_pl::Tx::sign_with(&uk, "alice", seq(&n, "alice"), "bob", 10, 2, nid).unwrap(),
+                fd_pl::Tx::sign_with(&uk, "bob", seq(&n, "bob"), "alice", 10, 2, nid).unwrap(),
+                fd_pl::Tx::sign_with(&uk, "carol", seq(&n, "carol"), "alice", 10, 2, nid).unwrap(),
+            )
+        };
+        // Lean SubmitTx, as a lean-capable peer's writer would send it.
+        let lean = WireMsg::SubmitTx { tx: tx_a.clone() }.to_wire_line(true).unwrap();
+        assert!(lean.contains("\"signature\":\"b64:"));
+        let msg: WireMsg = serde_json::from_str(lean.trim_end()).unwrap();
+        let _ = dispatch_wire(&shared, msg, None, false, false);
+        assert_eq!(shared.node.lock().mempool.get_tx(&tx_a.tx_id), Some(tx_a.clone()));
+        // Lean TxsBatch.
+        let lean = WireMsg::TxsBatch { txs: vec![tx_b.clone()] }.to_wire_line(true).unwrap();
+        let msg: WireMsg = serde_json::from_str(lean.trim_end()).unwrap();
+        let _ = dispatch_wire(&shared, msg, None, false, false);
+        assert_eq!(shared.node.lock().mempool.get_tx(&tx_b.tx_id), Some(tx_b.clone()));
+        // Non-canonical lean sig: refused, pool unchanged.
+        let mut bad = tx_c.clone();
+        let l = fd_pl::crypto::gossip_lean_sig(&bad.signature).unwrap();
+        bad.signature = format!("{}\n", l);
+        let replies = dispatch_wire(&shared, WireMsg::SubmitTx { tx: bad }, None, false, false);
+        assert!(matches!(&replies[..], [WireMsg::Err { msg }] if msg.contains("non-canonical")));
+        assert!(shared.node.lock().mempool.get(&tx_c.tx_id).is_none());
+        // Replies to a NeedMempoolTxs: hex for an old session, lean for a new one,
+        // and both decode to the same txs.
+        let replies = dispatch_wire(
+            &shared,
+            WireMsg::NeedMempoolTxs { ids: vec![tx_a.tx_id.clone(), tx_b.tx_id.clone()] },
+            None,
+            false,
+            false,
+        );
+        let [reply] = &replies[..] else { panic!("{replies:?}") };
+        let old = reply.to_wire_line(false).unwrap();
+        let new = reply.to_wire_line(true).unwrap();
+        assert!(!old.contains("b64:") && new.contains("b64:") && new.len() < old.len());
+        let mut back: WireMsg = serde_json::from_str(new.trim_end()).unwrap();
+        back.normalize_gossip_tx_sigs().unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap() + "\n", old);
+        // The writer-side rewrite of the queued hex line is the same lean line.
+        assert_eq!(fd_pl::lean_tx_gossip_line(old.as_bytes()).as_deref(), Some(new.as_str()));
+    }
+
+    pub(super) fn test_shared(id: &str) -> Arc<Shared> {
         let mut cfg = ChainConfig::default();
         cfg.network_id = 1;
         let mut keys = crate::KeyRing::default();
@@ -7344,10 +8233,16 @@ mod inbound_ack_tests {
         }
         Arc::new(Shared {
             node: parking_lot::Mutex::new(node),
+            seal_wake: tokio::sync::Notify::new(),
+            prepack_busy: std::sync::atomic::AtomicBool::new(false),
             inbound: parking_lot::Mutex::new(Vec::new()),
             hub_peer_idxs: Vec::new(),
             is_hub: true,
             is_archive: false,
+            compact_body_relay: false,
+            compact_wait_ms: 0,
+            compact_peers: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            cr: CompactRelayStats::default(),
             snapshot_out: PathBuf::from("/tmp/falcon-test-snap.bin"),
             snap_meta: parking_lot::Mutex::new(None),
             snap_publish: parking_lot::Mutex::new(()),
@@ -7378,6 +8273,56 @@ mod inbound_ack_tests {
             gap_dish: parking_lot::Mutex::new(0),
             gap_walk: parking_lot::Mutex::new((0, String::new())),
         })
+    }
+
+    /// 2.11.13 regression: restarted v6 (every peer dials it) queued every
+    /// NeedLedgers into yielded outbound lanes and never caught up.
+    #[test]
+    fn catchup_pull_goes_to_live_inbound_when_our_dial_yielded() {
+        let sh = test_shared("v6");
+        sh.node.lock().validators.get_mut("v9").unwrap().last_advertised_tip = Some(50);
+        let mk_out = || {
+            let (cons, _a) = byte_tx(64, 1 << 20);
+            let (txq, _b) = byte_tx(64, 1 << 20);
+            let (bodyq, _c) = byte_tx(64, 1 << 20);
+            let (catchq, rx) = byte_tx(64, 1 << 20);
+            let p = PeerOut {
+                cons,
+                txq,
+                bodyq,
+                catchq,
+                peer_id: Arc::new(parking_lot::Mutex::new("v9".into())),
+                large_out: Arc::new(LargeGate::new()),
+            };
+            (p, rx, _a, _b, _c)
+        };
+        let pull = WireMsg::NeedLedgers { from_height: 1, max_count: 64 };
+        // No inbound session: the outbound lane is the route (unchanged).
+        let (p, mut out_rx, _a, _b, _c) = mk_out();
+        let fanout = Arc::new(vec![p]);
+        sh.fan_catchup(&fanout, &pull);
+        assert!(out_rx.try_recv().is_ok(), "outbound lane used without inbound");
+        // v9 dials us (live inbound): the pull must use that session, not
+        // the yielded outbound lane nobody drains.
+        let (p, mut out_rx, _a2, _b2, _c2) = mk_out();
+        let fanout = Arc::new(vec![p]);
+        let (in_tx, mut in_rx) = byte_tx(64, 1 << 20);
+        sh.inbound.lock().push(InboundSink {
+            id: "v9".into(),
+            tx: in_tx,
+            close: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            large_out: Arc::new(LargeGate::new()),
+        });
+        *sh.ledger_slow.lock() = fd_pl::catchup_slow::LedgerSlowList::default();
+        sh.fan_catchup(&fanout, &pull);
+        let got = in_rx.try_recv().expect("pull sent on the live inbound session");
+        assert_eq!(serde_json::to_value(serde_json::from_str::<WireMsg>(got.trim()).unwrap()).unwrap(), serde_json::to_value(&pull).unwrap());
+        assert!(out_rx.try_recv().is_err(), "nothing queued on the yielded lane");
+        // A closed inbound session falls back to the outbound lane.
+        sh.inbound.lock()[0].close.store(true, std::sync::atomic::Ordering::Relaxed);
+        *sh.ledger_slow.lock() = fd_pl::catchup_slow::LedgerSlowList::default();
+        sh.fan_catchup(&fanout, &pull);
+        assert!(out_rx.try_recv().is_ok());
     }
 
     fn big_line() -> String {
@@ -7487,6 +8432,243 @@ mod inbound_ack_tests {
         assert_eq!(should_log_reply_dropped(11_000, &last, &sup), Some(4));
         assert_eq!(should_log_reply_dropped(11_001, &last, &sup), None);
         assert_eq!(should_log_reply_dropped(21_000, &last, &sup), Some(1));
+    }
+
+    /// 2.11.8 <-> 2.11.6 interop: with zstd-stream-v1 at its default (on) and
+    /// lean tx gossip on (default), a peer whose Hello carries exactly the
+    /// 2.11.6 capability set (`utc-header-v5` only) gets byte-plain NDJSON
+    /// with hex tx signatures, and its hex tx gossip is accepted unchanged.
+    #[tokio::test]
+    async fn inbound_session_2_11_6_peer_interop_plain_hex() {
+        let _g = fd_pl::wire_zstd::WIRE_ZSTD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("FPL_WIRE_ZSTD").ok();
+        std::env::remove_var("FPL_WIRE_ZSTD"); // default-on
+        let shared = test_shared("v99");
+        let fanout = Arc::new(Vec::new());
+        let nid = shared.node.lock().cfg.network_id;
+        let mut uk = crate::KeyRing::default();
+        for acct in ["alice", "bob"] {
+            let _ = uk.generate_id(acct);
+        }
+        {
+            let mut n = shared.node.lock();
+            n.cfg.min_fee = 0;
+            n.cfg.fee_escalate = false;
+            for acct in ["alice", "bob"] {
+                let _ = n.keys.insert_public(acct, &uk.public_hex(acct).unwrap());
+                let mut a = n.state.get(acct);
+                a.balance = 50_000;
+                n.state.accounts.insert(acct.into(), a);
+            }
+        }
+        let (tx_a, tx_b) = {
+            let n = shared.node.lock();
+            (
+                fd_pl::Tx::sign_with(&uk, "alice", n.state.get("alice").sequence, "bob", 10, 2, nid).unwrap(),
+                fd_pl::Tx::sign_with(&uk, "bob", n.state.get("bob").sequence, "alice", 10, 2, nid).unwrap(),
+            )
+        };
+        let _ = dispatch_wire(&shared, WireMsg::SubmitTx { tx: tx_a.clone() }, None, false, false);
+        assert_eq!(shared.node.lock().mempool.get_tx(&tx_a.tx_id), Some(tx_a.clone()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, mut cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut lines = BufReader::new(cr).lines();
+        let srv_hello: WireMsg = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let WireMsg::Hello { capabilities, .. } = srv_hello else { panic!("hello") };
+        // 2.11.8 (zstd default on) advertises both new tokens; 2.11.6 only looks for utc-header-v5.
+        assert!(fd_pl::wire_zstd::peer_has(&capabilities));
+        assert!(fd_pl::crypto::peer_has_lean_tx_gossip(&capabilities));
+        assert!(fd_pl::utc_header::peer_has_utc_header_v5(&capabilities));
+        let old_hello = WireMsg::Hello {
+            id: "v9".into(),
+            public_key: String::new(),
+            validators: BTreeMap::new(),
+            publics: BTreeMap::new(),
+            tip_height: 0,
+            tip_hash: String::new(),
+            is_hub: false,
+            mempool_len: 0,
+            product_version: PRODUCT_VERSION.into(),
+            hello_network_id: 1,
+            archive: false,
+            snap_height: 0,
+            release_version: "2.11.6".into(),
+            capabilities: vec![fd_pl::utc_header::CAP_UTC_HEADER_V5.into()],
+        };
+        let mut out = serde_json::to_string(&old_hello).unwrap() + "\n";
+        // Hex tx gossip exactly as 2.11.6 sends it.
+        out += &(serde_json::to_string(&WireMsg::SubmitTx { tx: tx_b.clone() }).unwrap() + "\n");
+        out += &(serde_json::to_string(&WireMsg::NeedMempoolTxs { ids: vec![tx_a.tx_id.clone()] }).unwrap() + "\n");
+        out += &(serde_json::to_string(&WireMsg::StatusReq { include_accounts: false, brief: true }).unwrap() + "\n");
+        cw.write_all(out.as_bytes()).await.unwrap();
+        let mut got_tx_a = false;
+        loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("reply in time")
+                .unwrap()
+                .expect("open session");
+            assert!(!line.starts_with('#'), "2.11.6 peer must never see the zstd marker: {line}");
+            assert!(!line.contains("b64:"), "2.11.6 peer must only see hex sigs");
+            let msg: WireMsg = serde_json::from_str(&line).expect("plain JSON line");
+            if line.contains(&tx_a.tx_id) {
+                assert!(line.contains(&tx_a.signature), "hex sig carried verbatim");
+                got_tx_a = true;
+            }
+            if matches!(msg, WireMsg::Status { .. }) {
+                break;
+            }
+        }
+        assert!(got_tx_a, "NeedMempoolTxs answered to the old peer");
+        assert_eq!(shared.node.lock().mempool.get_tx(&tx_b.tx_id), Some(tx_b.clone()));
+        drop(cw);
+        let _ = srv.await;
+        match prev {
+            Some(v) => std::env::set_var("FPL_WIRE_ZSTD", v),
+            None => std::env::remove_var("FPL_WIRE_ZSTD"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_session_zstd_stream_new_and_old_peers() {
+        // Explicit FPL_WIRE_ZSTD=1 still enables advertise/send.
+        let _g = fd_pl::wire_zstd::WIRE_ZSTD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("FPL_WIRE_ZSTD").ok();
+        std::env::set_var("FPL_WIRE_ZSTD", "1");
+        let shared = test_shared("v99");
+        let fanout = Arc::new(Vec::new());
+        let hello = |caps: Vec<String>| WireMsg::Hello {
+            id: "v9".into(),
+            public_key: String::new(),
+            validators: BTreeMap::new(),
+            publics: BTreeMap::new(),
+            tip_height: 0,
+            tip_hash: String::new(),
+            is_hub: false,
+            mempool_len: 0,
+            product_version: PRODUCT_VERSION.into(),
+            hello_network_id: 1,
+            archive: false,
+            snap_height: 0,
+            release_version: String::new(),
+            capabilities: caps,
+        };
+        let status_req = serde_json::to_string(&WireMsg::StatusReq { include_accounts: false, brief: true }).unwrap() + "\n";
+
+        // (a) New peer: both sides advertise, both directions switch to frames.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut rd = fd_pl::wire_zstd::LineReader::new(cr, true);
+        let peer_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut wr = fd_pl::wire_zstd::ZWriter::new(cw, peer_ok.clone(), 3);
+        let srv_hello: WireMsg = serde_json::from_str(&rd.next_line().await.unwrap().unwrap()).unwrap();
+        let WireMsg::Hello { capabilities, .. } = srv_hello else { panic!("hello") };
+        assert!(fd_pl::wire_zstd::peer_has(&capabilities), "server advertises when enabled");
+        let my_hello = serde_json::to_string(&hello(vec![fd_pl::wire_zstd::CAP_ZSTD_STREAM_V1.into()])).unwrap() + "\n";
+        wr.write_all(my_hello.as_bytes()).await.unwrap();
+        peer_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+        wr.write_all(status_req.as_bytes()).await.unwrap();
+        assert!(wr.compressed());
+        let reply: WireMsg = serde_json::from_str(&rd.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(matches!(reply, WireMsg::Status { .. }), "got {reply:?}");
+        assert!(rd.compressed(), "server reply came as zstd frames");
+        drop(wr);
+        let _ = srv.await;
+
+        // (b) Old peer: no capability. Server output stays plain JSON lines.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, mut cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut lines = BufReader::new(cr).lines();
+        let _srv_hello = lines.next_line().await.unwrap().unwrap();
+        cw.write_all((serde_json::to_string(&hello(Vec::new())).unwrap() + "\n").as_bytes()).await.unwrap();
+        cw.write_all(status_req.as_bytes()).await.unwrap();
+        let line = lines.next_line().await.unwrap().unwrap();
+        assert!(!line.starts_with('#'), "old peer must never see the marker");
+        let reply: WireMsg = serde_json::from_str(&line).unwrap();
+        assert!(matches!(reply, WireMsg::Status { .. }), "got {reply:?}");
+        drop(cw);
+        let _ = srv.await;
+        match prev {
+            Some(v) => std::env::set_var("FPL_WIRE_ZSTD", v),
+            None => std::env::remove_var("FPL_WIRE_ZSTD"),
+        }
+    }
+
+    /// Explicit FPL_WIRE_ZSTD=0: this node does not advertise zstd-stream-v1,
+    /// and even a peer that offers the capability gets plain NDJSON (no marker).
+    #[tokio::test]
+    async fn inbound_session_zstd_stream_explicit_off() {
+        let _g = fd_pl::wire_zstd::WIRE_ZSTD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("FPL_WIRE_ZSTD").ok();
+        std::env::set_var("FPL_WIRE_ZSTD", "0");
+        let shared = test_shared("v99");
+        let fanout = Arc::new(Vec::new());
+        let hello = |caps: Vec<String>| WireMsg::Hello {
+            id: "v9".into(),
+            public_key: String::new(),
+            validators: BTreeMap::new(),
+            publics: BTreeMap::new(),
+            tip_height: 0,
+            tip_hash: String::new(),
+            is_hub: false,
+            mempool_len: 0,
+            product_version: PRODUCT_VERSION.into(),
+            hello_network_id: 1,
+            archive: false,
+            snap_height: 0,
+            release_version: String::new(),
+            capabilities: caps,
+        };
+        let status_req = serde_json::to_string(&WireMsg::StatusReq { include_accounts: false, brief: true }).unwrap() + "\n";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, mut cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut lines = BufReader::new(cr).lines();
+        let srv_hello: WireMsg = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let WireMsg::Hello { capabilities, .. } = srv_hello else { panic!("hello") };
+        assert!(!fd_pl::wire_zstd::peer_has(&capabilities), "FPL_WIRE_ZSTD=0 must not advertise");
+        let my_hello = serde_json::to_string(&hello(vec![fd_pl::wire_zstd::CAP_ZSTD_STREAM_V1.into()])).unwrap() + "\n";
+        cw.write_all(my_hello.as_bytes()).await.unwrap();
+        cw.write_all(status_req.as_bytes()).await.unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("reply in time")
+            .unwrap()
+            .expect("open session");
+        assert!(!line.starts_with('#'), "explicit-off must never emit the zstd marker: {line}");
+        let reply: WireMsg = serde_json::from_str(&line).expect("plain JSON line");
+        assert!(matches!(reply, WireMsg::Status { .. }), "got {reply:?}");
+        drop(cw);
+        let _ = srv.await;
+        match prev {
+            Some(v) => std::env::set_var("FPL_WIRE_ZSTD", v),
+            None => std::env::remove_var("FPL_WIRE_ZSTD"),
+        }
     }
 
     #[tokio::test]
@@ -7757,5 +8939,1032 @@ mod inbound_ack_tests {
             assert!(sealed.txs.is_empty());
             assert!(n.mempool.is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod zstd_drop_tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::AtomicBool;
+
+    fn noise_line(seed: u64, n: usize) -> String {
+        // Incompressible-ish payload so the kernel buffer actually fills.
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let d: String = (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from(b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[(x % 62) as usize])
+            })
+            .collect();
+        format!("{{\"type\":\"fill_probe\",\"seed\":{seed},\"d\":\"{d}\"}}\n")
+    }
+
+    /// 2.11.9: on a compressed session whose peer stopped reading, an optional
+    /// line must be dropped with the zstd stream intact (as on a plain
+    /// session), not shed. 2.11.7 encoded first and then reset the socket.
+    #[tokio::test]
+    async fn compressed_stalled_optional_line_drops_without_shed() {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+        let cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (srv, _) = ln.accept().await.unwrap();
+        // Live seats stall with ~260-345 KB unsent (under PIPE_SHED_BYTES):
+        // keep the kernel buffers that small so the test hits the same branch.
+        for (fd, opt) in [(cli.as_raw_fd(), libc::SO_SNDBUF), (srv.as_raw_fd(), libc::SO_RCVBUF)] {
+            let v: libc::c_int = 96 * 1024;
+            unsafe {
+                libc::setsockopt(fd, libc::SOL_SOCKET, opt, &v as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+            }
+        }
+        let probe = unsafe { libc::dup(cli.as_raw_fd()) };
+        let (_cr, cw) = cli.into_split();
+        let mut w: ZWire = fd_pl::wire_zstd::ZWriter::new(cw, Arc::new(AtomicBool::new(true)), 1);
+        assert!(w.will_compress());
+        let mut sent: Vec<String> = Vec::new();
+        let mut dropped = false;
+        for i in 0..20000u64 {
+            let line = noise_line(i, 2 * 1024);
+            assert!(!line_must_send(line.as_bytes()) && line.len() <= LARGE_LINE);
+            match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                Ok(()) => sent.push(line),
+                Err(WriteEnd::Dropped { .. }) => {
+                    dropped = true;
+                    break;
+                }
+                Err(WriteEnd::Shed { which, .. }) => {
+                    panic!("compressed optional line shed ({which}) after {} lines", sent.len())
+                }
+            }
+        }
+        assert!(dropped, "peer never stopped reading?");
+        assert!(tcp_unsent(probe).unwrap_or(0) < PIPE_SHED_BYTES);
+        // The stream is intact: drain, then one more line still decodes.
+        let after = noise_line(99_999, 512);
+        let mut rd = fd_pl::wire_zstd::LineReader::new(srv, true);
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while let Ok(Ok(Some(l))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), rd.next_line()).await
+            {
+                let done = l.contains("\"seed\":99999");
+                got.push(l);
+                if done {
+                    break;
+                }
+            }
+            got
+        });
+        let mut ok = false;
+        for _ in 0..200 {
+            match write_or_shed(&mut w, probe, after.as_bytes()).await {
+                Ok(()) => {
+                    ok = true;
+                    break;
+                }
+                Err(WriteEnd::Dropped { .. }) => continue,
+                Err(WriteEnd::Shed { which, .. }) => panic!("shed after drain ({which})"),
+            }
+        }
+        assert!(ok, "line after drain never sent");
+        let got = reader.await.unwrap();
+        assert_eq!(got.len(), sent.len() + 1, "every sent line decodes, nothing torn");
+        for (g, s) in got.iter().zip(sent.iter()) {
+            assert_eq!(g.as_str(), s.trim_end());
+        }
+        assert_eq!(got.last().unwrap().as_str(), after.trim_end());
+        unsafe { libc::close(probe) };
+    }
+
+    // ---- 2.11.9 torn-shed fix -------------------------------------------
+
+    fn set_buf(fd: std::os::unix::io::RawFd, opt: libc::c_int, v: libc::c_int) {
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, opt, &v as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        }
+    }
+
+    /// Connected pair. `snd`: fixed SO_SNDBUF on the writer (None = kernel
+    /// autotuning, which lets the backlog pass PIPE_SHED_BYTES on loopback).
+    async fn pair(snd: Option<libc::c_int>, rcv: libc::c_int, zstd: bool) -> (ZWire, std::os::unix::io::RawFd, tokio::net::TcpStream) {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = ln.local_addr().unwrap();
+        let cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (srv, _) = ln.accept().await.unwrap();
+        if let Some(v) = snd {
+            set_buf(cli.as_raw_fd(), libc::SO_SNDBUF, v);
+        }
+        set_buf(srv.as_raw_fd(), libc::SO_RCVBUF, rcv);
+        let probe = unsafe { libc::dup(cli.as_raw_fd()) };
+        let (_cr, cw) = cli.into_split();
+        let w: ZWire = fd_pl::wire_zstd::ZWriter::new(cw, Arc::new(AtomicBool::new(zstd)), 1);
+        (w, probe, srv)
+    }
+
+    fn typed_line(kind: &str, seed: u64, n: usize) -> String {
+        let l = noise_line(seed, n);
+        l.replacen("fill_probe", kind, 1)
+    }
+
+    /// Reader that sleeps `pause`, then decodes every line until the sentinel.
+    fn slow_reader(srv: tokio::net::TcpStream, zstd: bool, pause: std::time::Duration) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            tokio::time::sleep(pause).await;
+            let mut rd = fd_pl::wire_zstd::LineReader::new(srv, zstd);
+            let mut got = Vec::new();
+            while let Ok(Ok(Some(l))) = tokio::time::timeout(std::time::Duration::from_secs(10), rd.next_line()).await {
+                let done = l.contains("\"seed\":99999,");
+                got.push(l);
+                if done {
+                    break;
+                }
+            }
+            got
+        })
+    }
+
+    /// A peer pauses reading for longer than PIPE_SHED_HOLD while an optional
+    /// line is half written. 2.11.8 shed the session ("torn"); 2.11.9 keeps
+    /// the partial frame, finishes it when the peer reads again, and every
+    /// line decodes in order.
+    async fn torn_optional_line_finishes(zstd: bool) {
+        let (mut w, probe, srv) = pair(Some(96 * 1024), 96 * 1024, zstd).await;
+        let reader = slow_reader(srv, zstd, std::time::Duration::from_millis(3500));
+        let mut sent = Vec::new();
+        let mut torn_and_finished = false;
+        for i in 0..64u64 {
+            // Bigger than both kernel buffers even after zstd, so it tears.
+            let line = noise_line(i, 400 * 1024);
+            assert!(!line_must_send(line.as_bytes()));
+            let t0 = tokio::time::Instant::now();
+            match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                Ok(()) => {
+                    sent.push(line);
+                    if t0.elapsed() > PIPE_SHED_HOLD {
+                        torn_and_finished = true;
+                        break;
+                    }
+                }
+                Err(WriteEnd::Dropped { .. }) => {}
+                Err(WriteEnd::Shed { which, .. }) => {
+                    panic!("optional line shed ({which}) after {} lines (zstd={zstd})", sent.len())
+                }
+            }
+        }
+        assert!(torn_and_finished, "no line was held across the reader pause (zstd={zstd})");
+        let last = noise_line(99_999, 256);
+        write_or_shed(&mut w, probe, last.as_bytes()).await.unwrap_or_else(|_| panic!("sentinel"));
+        let got = reader.await.unwrap();
+        assert_eq!(got.len(), sent.len() + 1, "every sent line decodes, nothing torn (zstd={zstd})");
+        for (g, s) in got.iter().zip(sent.iter()) {
+            assert_eq!(g.as_str(), s.trim_end());
+        }
+        unsafe { libc::close(probe) };
+    }
+
+    #[tokio::test]
+    async fn compressed_torn_optional_line_finishes_without_shed() {
+        torn_optional_line_finishes(true).await;
+    }
+
+    #[tokio::test]
+    async fn plain_torn_optional_line_finishes_without_shed() {
+        torn_optional_line_finishes(false).await;
+    }
+
+    /// The kernel backlog is over PIPE_SHED_BYTES and the peer is not reading.
+    /// 2.11.8 shed the session ("send") after PIPE_SHED_HOLD; 2.11.9 drops the
+    /// optional line at once and the stream stays intact.
+    async fn backlog_drops_optional(zstd: bool) {
+        let (mut w, probe, srv) = pair(None, 64 * 1024, zstd).await;
+        let mut sent = Vec::new();
+        let mut i = 0u64;
+        // Fill with optional lines until the kernel will take no more.
+        let dropped_at = loop {
+            assert!(i < 2000, "never filled");
+            let line = noise_line(i, 48 * 1024);
+            i += 1;
+            let t0 = tokio::time::Instant::now();
+            match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                Ok(()) => sent.push(line),
+                Err(WriteEnd::Dropped { unsent }) => {
+                    if unsent > PIPE_SHED_BYTES {
+                        break t0.elapsed();
+                    }
+                }
+                Err(WriteEnd::Shed { which, .. }) => panic!("shed ({which}) while filling, zstd={zstd}"),
+            }
+        };
+        let backlog = tcp_unsent(probe).unwrap_or(0);
+        assert!(backlog > PIPE_SHED_BYTES, "backlog {backlog}");
+        // More optional lines: each one drops immediately, no shed.
+        for j in 0..20u64 {
+            let t0 = tokio::time::Instant::now();
+            match write_or_shed(&mut w, probe, typed_line("tx_inv", 50_000 + j, 2048).as_bytes()).await {
+                Err(WriteEnd::Dropped { .. }) => assert!(t0.elapsed() < std::time::Duration::from_millis(500)),
+                Ok(()) => panic!("wrote into a full pipe"),
+                Err(WriteEnd::Shed { which, .. }) => panic!("backlog shed ({which}), zstd={zstd}"),
+            }
+        }
+        let _ = dropped_at;
+        // Peer reads again: the stream is intact.
+        let reader = slow_reader(srv, zstd, std::time::Duration::ZERO);
+        let last = noise_line(99_999, 256);
+        let mut ok = false;
+        for _ in 0..400 {
+            match write_or_shed(&mut w, probe, last.as_bytes()).await {
+                Ok(()) => {
+                    ok = true;
+                    break;
+                }
+                Err(WriteEnd::Dropped { .. }) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                Err(WriteEnd::Shed { which, .. }) => panic!("shed after drain ({which})"),
+            }
+        }
+        assert!(ok);
+        let got = reader.await.unwrap();
+        assert_eq!(got.len(), sent.len() + 1);
+        unsafe { libc::close(probe) };
+    }
+
+    #[tokio::test]
+    async fn compressed_backlog_over_shed_bytes_drops_optional_without_shed() {
+        backlog_drops_optional(true).await;
+    }
+
+    #[tokio::test]
+    async fn plain_backlog_over_shed_bytes_drops_optional_without_shed() {
+        backlog_drops_optional(false).await;
+    }
+
+    /// Fill the pipe of a peer that never reads (raw, so no frame is split).
+    fn fill_raw(probe: std::os::unix::io::RawFd) {
+        let chunk = vec![b'x'; 64 * 1024];
+        loop {
+            let n = unsafe { libc::send(probe, chunk.as_ptr() as *const libc::c_void, chunk.len(), libc::MSG_DONTWAIT) };
+            if n <= 0 {
+                break;
+            }
+        }
+    }
+
+    /// A must-send line to a peer that never reads still sheds the session,
+    /// after PIPE_STUCK_HOLD (2.11.8: PIPE_SHED_HOLD).
+    #[tokio::test]
+    async fn must_send_still_sheds_after_the_hold() {
+        let (mut w, probe, _srv) = pair(Some(96 * 1024), 96 * 1024, false).await;
+        fill_raw(probe);
+        let line = typed_line("propose_ledger", 7, 8 * 1024);
+        assert!(line_must_send(line.as_bytes()));
+        let t0 = tokio::time::Instant::now();
+        match write_or_shed(&mut w, probe, line.as_bytes()).await {
+            Err(WriteEnd::Shed { which, .. }) => {
+                let e = t0.elapsed();
+                assert!(e >= PIPE_STUCK_HOLD && e < PIPE_STUCK_HOLD + std::time::Duration::from_secs(3), "shed after {e:?} ({which})");
+                assert!(PIPE_STUCK_HOLD >= std::time::Duration::from_secs(8));
+            }
+            Ok(()) => panic!("wrote a must-send line into a dead pipe"),
+            Err(WriteEnd::Dropped { .. }) => panic!("must-send line dropped"),
+        }
+        unsafe { libc::close(probe) };
+    }
+
+    /// A must-send line survives a 4 s reader pause (2.11.8 shed it at 2 s).
+    #[tokio::test]
+    async fn compressed_must_send_survives_short_reader_pause() {
+        let (mut w, probe, srv) = pair(Some(96 * 1024), 96 * 1024, true).await;
+        let reader = slow_reader(srv, true, std::time::Duration::from_secs(4));
+        let mut sent = Vec::new();
+        let mut held = false;
+        for i in 0..64u64 {
+            let line = typed_line("propose_ledger", i, 400 * 1024);
+            let t0 = tokio::time::Instant::now();
+            match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                Ok(()) => {
+                    sent.push(line);
+                    if t0.elapsed() > std::time::Duration::from_secs(3) {
+                        held = true;
+                        break;
+                    }
+                }
+                Err(WriteEnd::Dropped { .. }) => panic!("must-send dropped"),
+                Err(WriteEnd::Shed { which, .. }) => panic!("must-send shed ({which}) during a 4 s pause"),
+            }
+        }
+        assert!(held);
+        write_or_shed(&mut w, probe, noise_line(99_999, 256).as_bytes()).await.unwrap_or_else(|_| panic!("sentinel"));
+        let got = reader.await.unwrap();
+        assert_eq!(got.len(), sent.len() + 1);
+        unsafe { libc::close(probe) };
+    }
+
+    /// Throttled-reader soak (manual: `cargo test ... throttled_reader_soak --
+    /// --ignored --nocapture`). One compressed session, ~40 optional tx lines/s (SOAK_TX_BYTES each)
+    /// plus a must-send 70 KB body every 4 s, to a reader that reads for 1 s
+    /// and then pauses SOAK_PAUSE_MS (default 4 s; a busy 2-vCPU seat applying a block). A shed costs
+    /// BLACKHOLE_SECS and a fresh session, as live. Prints sheds and delivery.
+    #[tokio::test]
+    #[ignore]
+    async fn throttled_reader_soak() {
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let secs = env("SOAK_SECS", 60);
+        let pause_ms = env("SOAK_PAUSE_MS", 4000);
+        let tx_bytes = env("SOAK_TX_BYTES", 6144) as usize;
+        let body_ms = env("SOAK_BODY_MS", 4000);
+        let body_bytes = env("SOAK_BODY_BYTES", 70 * 1024) as usize;
+        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let (mut sheds, mut torn, mut body, mut dropped, mut sent, mut bodies) = (0, 0, 0, 0u64, 0u64, 0u64);
+        let delivered = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut seq = 0u64;
+        'session: while tokio::time::Instant::now() < end {
+            // Live stalls sit at ~260-420 KB unsent: cap the kernel buffers to match.
+            let (mut w, probe, srv) = pair(Some(160 * 1024), 64 * 1024, true).await;
+            let d = delivered.clone();
+            let rd = tokio::spawn(async move {
+                let mut rd = fd_pl::wire_zstd::LineReader::new(srv, true);
+                // next_line is not cancel-safe, so no timeout around it: read
+                // whole lines for 1 s, then stop reading for pause_ms.
+                let mut t = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                loop {
+                    match rd.next_line().await {
+                        Ok(Some(_)) => {
+                            d.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        _ => return,
+                    }
+                    if tokio::time::Instant::now() >= t {
+                        tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+                        t = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                    }
+                }
+            });
+            let mut next_body = tokio::time::Instant::now();
+            while tokio::time::Instant::now() < end {
+                seq += 1;
+                let line = if tokio::time::Instant::now() >= next_body {
+                    next_body += std::time::Duration::from_millis(body_ms);
+                    bodies += 1;
+                    typed_line("ledger_body", seq, body_bytes)
+                } else {
+                    typed_line("submit_tx", seq, tx_bytes)
+                };
+                match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                    Ok(()) => sent += 1,
+                    Err(WriteEnd::Dropped { .. }) => dropped += 1,
+                    Err(WriteEnd::Shed { which, .. }) => {
+                        sheds += 1;
+                        if which == "torn" {
+                            torn += 1;
+                        }
+                        if which == "body" {
+                            body += 1;
+                        }
+                        hard_reset(probe);
+                        unsafe { libc::close(probe) };
+                        rd.abort();
+                        tokio::time::sleep(std::time::Duration::from_secs(BLACKHOLE_SECS)).await;
+                        continue 'session;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            unsafe { libc::close(probe) };
+            rd.abort();
+        }
+        eprintln!(
+            "SOAK {secs}s pause {pause_ms} ms tx {tx_bytes} B body {body_bytes} B/{body_ms} ms: sheds {sheds} (torn {torn}, body {body}), lines written {sent}, dropped {dropped}, bodies queued {bodies}, delivered {}",
+            delivered.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+}
+
+#[cfg(test)]
+mod send_budget_tests {
+    //! 2.11.10 Phase 1: non-seat upload budgets, votes-first outbound lanes,
+    //! and the 8 s grace on `pipe_stuck`.
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn upload_budget_charges_bursts_then_paces() {
+        let b = UploadBudget::new(100 * 1024);
+        let t0 = Instant::now();
+        assert_eq!(b.take_at(100 * 1024, t0), Duration::ZERO, "one second of burst");
+        let w = b.take_at(50 * 1024, t0);
+        assert!((w.as_secs_f64() - 0.5).abs() < 0.01, "{w:?}");
+        assert!((b.debt_at(t0).as_secs_f64() - 0.5).abs() < 0.01);
+        assert_eq!(b.debt_at(t0 + Duration::from_secs(1)), Duration::ZERO, "refilled");
+        let unlimited = UploadBudget::new(0);
+        assert_eq!(unlimited.take_at(usize::MAX / 2, t0), Duration::ZERO);
+        assert_eq!(unlimited.debt_at(t0), Duration::ZERO);
+    }
+
+    #[test]
+    fn observer_catchup_is_refused_only_in_debt() {
+        let b = UploadBudget::new(64 * 1024);
+        let t0 = Instant::now();
+        assert!(!observer_refuse_now(&b, t0));
+        b.take_at(64 * 1024 + 64 * 1024 * 3, t0); // 3 s in debt
+        assert!(observer_refuse_now(&b, t0));
+        assert!(!observer_refuse_now(&b, t0 + Duration::from_secs(3)), "debt paid back");
+        assert!(is_observer_serve_request(&WireMsg::NeedLedgers { from_height: 1, max_count: 8 }));
+        assert!(is_observer_serve_request(&WireMsg::NeedSnapshot {}));
+        assert!(!is_observer_serve_request(&WireMsg::Ok { msg: String::new() }));
+    }
+
+    #[tokio::test]
+    async fn seats_are_never_paced() {
+        let sess = UploadBudget::new(1024); // 1 KB/s: any pacing would be obvious
+        let seat = AtomicBool::new(false);
+        let t = tokio::time::Instant::now();
+        for _ in 0..8 {
+            pace_observer(&sess, &seat, 64 * 1024).await;
+        }
+        assert!(t.elapsed() < Duration::from_millis(50));
+        let obs = AtomicBool::new(true);
+        let t = tokio::time::Instant::now();
+        pace_observer(&sess, &obs, 64 * 1024).await; // burst
+        pace_observer(&sess, &obs, 512).await; // 0.5 s debt
+        assert!(t.elapsed() >= Duration::from_millis(400), "{:?}", t.elapsed());
+    }
+
+    /// 2.11.9 shed a session whose send queue sat over PIPE_SHED_BYTES for
+    /// PIPE_SHED_HOLD (2 s), while write_or_shed already gave a stuck line
+    /// PIPE_STUCK_HOLD (8 s). Fails on 2.11.9.
+    #[tokio::test]
+    async fn full_send_queue_gets_the_stuck_hold_not_two_seconds() {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cli = tokio::net::TcpStream::connect(ln.local_addr().unwrap()).await.unwrap();
+        let (srv, _) = ln.accept().await.unwrap();
+        // Kernel autotuning on the sender (no SO_SNDBUF) lets loopback hold >1 MB;
+        // a small receive buffer and no reader keep it there.
+        set_buf(srv.as_raw_fd(), libc::SO_RCVBUF, 64 * 1024);
+        let fd = cli.as_raw_fd();
+        let chunk = vec![b'x'; 64 * 1024];
+        let t = Instant::now();
+        // Fill, let the receive window settle, top up again.
+        for _ in 0..4 {
+            while tcp_unsent(fd).unwrap_or(0) <= PIPE_SHED_BYTES + 256 * 1024 && t.elapsed() < Duration::from_secs(10) {
+                match cli.try_write(&chunk) {
+                    Ok(_) => {}
+                    Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let unsent = tcp_unsent(fd).unwrap_or(0);
+        assert!(unsent > PIPE_SHED_BYTES, "could not build a >1 MB send queue on loopback ({unsent})");
+        let (mut hs, mut lu, mut lr) = (None, 0usize, 0usize);
+        let (mut hs2, mut lu2, mut lr2) = (None, 0usize, 0usize);
+        let mut old_shed_at = None;
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(3500) {
+            assert!(pipe_stuck(fd, &mut hs, &mut lu, &mut lr).is_none(), "shed after {:?} (2 s hold)", t.elapsed());
+            if old_shed_at.is_none() && pipe_stuck_for(fd, &mut hs2, &mut lu2, &mut lr2, PIPE_SHED_HOLD).is_some() {
+                old_shed_at = Some(t.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(old_shed_at.is_some(), "the 2.11.9 hold would have shed this queue");
+        drop(srv);
+    }
+
+    // ---- shared-uplink soak (v1 model) ----------------------------------
+
+    fn soak_line(kind: &str, t_ms: u64, n: usize, seed: u64) -> String {
+        // 80% random base62 + 20% filler: zstd takes ~40% off, as measured
+        // live on lean blocks (-41.4%).
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let half = n * 4 / 5;
+        let mut d = String::with_capacity(n);
+        for _ in 0..half {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            d.push(char::from(b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[(x % 62) as usize]));
+        }
+        d.extend(std::iter::repeat('a').take(n - half));
+        format!("{{\"type\":\"{kind}\",\"t\":{t_ms},\"d\":\"{d}\"}}\n")
+    }
+
+    fn line_t(l: &str) -> Option<u64> {
+        let i = l.find("\"t\":")? + 4;
+        let j = l[i..].find(',')? + i;
+        l[i..j].parse().ok()
+    }
+
+    fn set_buf(fd: std::os::unix::io::RawFd, opt: libc::c_int, v: libc::c_int) {
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, opt, &v as *const _ as *const libc::c_void, 4);
+        }
+    }
+
+    #[derive(Default)]
+    struct SoakStats {
+        votes_sent: AtomicU64,
+        votes_got: AtomicU64,
+        tx_sent: AtomicU64,
+        tx_got: AtomicU64,
+        bodies_got: AtomicU64,
+        obs_bytes: AtomicU64,
+        sheds: AtomicU64,
+        shed_torn: AtomicU64,
+        shed_body: AtomicU64,
+        shed_send: AtomicU64,
+        dropped: AtomicU64,
+        refused: AtomicU64,
+        vote_lat: parking_lot::Mutex<Vec<u64>>,
+        body_lat: parking_lot::Mutex<Vec<u64>>,
+    }
+
+    /// writer -> [loopback] -> uplink proxy (shared token bucket) -> [loopback] -> reader
+    async fn uplink_link(
+        up: Arc<UploadBudget>,
+    ) -> (tokio::net::tcp::OwnedWriteHalf, std::os::unix::io::RawFd, tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let w = tokio::net::TcpStream::connect(l1.local_addr().unwrap()).await.unwrap();
+        let (pin, _) = l1.accept().await.unwrap();
+        let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut pout = tokio::net::TcpStream::connect(l2.local_addr().unwrap()).await.unwrap();
+        let (r, _) = l2.accept().await.unwrap();
+        // Live v1 seat links sat at 5-340 KB send-q. SOAK_SNDBUF=0 leaves the
+        // kernel autotuning (live default, up to tcp_wmem max).
+        let snd = std::env::var("SOAK_SNDBUF").ok().and_then(|v| v.parse::<i32>().ok()).unwrap_or(256 * 1024);
+        if snd > 0 {
+            set_buf(w.as_raw_fd(), libc::SO_SNDBUF, snd);
+        }
+        set_buf(pin.as_raw_fd(), libc::SO_RCVBUF, 32 * 1024);
+        let proxy = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut pin = pin;
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                let n = match pin.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                let wait = up.take(n);
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                // Shared uplink stall (Wi-Fi / home router): nothing moves.
+                let stall = uplink_stall_left();
+                if !stall.is_zero() {
+                    tokio::time::sleep(stall).await;
+                }
+                if pout.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let probe = unsafe { libc::dup(w.as_raw_fd()) };
+        let (_wr, ww) = w.into_split();
+        std::mem::forget(_wr);
+        (ww, probe, r, proxy)
+    }
+
+    /// SOAK_STALL_MS of no uplink every SOAK_STALL_EVERY_MS (default none).
+    fn uplink_stall_left() -> Duration {
+        static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let ms = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let (stall, every) = (ms("SOAK_STALL_MS"), ms("SOAK_STALL_EVERY_MS"));
+        if stall == 0 || every == 0 {
+            return Duration::ZERO;
+        }
+        let t = T0.get_or_init(Instant::now).elapsed().as_millis() as u64 % every;
+        if t >= every - stall {
+            Duration::from_millis(every - t)
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    struct Lanes {
+        cons: mpsc::Receiver<String>,
+        catch: mpsc::Receiver<String>,
+        body: mpsc::Receiver<String>,
+        tx: mpsc::Receiver<String>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn soak_link(
+        new: bool,
+        observer: bool,
+        zstd: bool,
+        mut lanes: Lanes,
+        up: Arc<UploadBudget>,
+        obs_global: Arc<UploadBudget>,
+        st: Arc<SoakStats>,
+        base: Instant,
+        end: tokio::time::Instant,
+    ) {
+        let sess = UploadBudget::new(OBSERVER_SESSION_KBPS_DEFAULT * 1024);
+        let is_obs = AtomicBool::new(observer);
+        'session: while tokio::time::Instant::now() < end {
+            let (ww, probe, r, proxy) = uplink_link(up.clone()).await;
+            let mut w: ZWire = fd_pl::wire_zstd::ZWriter::new(ww, Arc::new(AtomicBool::new(zstd)), fd_pl::wire_zstd::DEFAULT_LEVEL);
+            let st_r = st.clone();
+            let pause_ms = std::env::var("SOAK_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0u64);
+            let every_ms = std::env::var("SOAK_PAUSE_EVERY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000u64);
+            let rd = tokio::spawn(async move {
+                let mut rd = fd_pl::wire_zstd::LineReader::new(r, zstd);
+                let mut next_pause = tokio::time::Instant::now() + Duration::from_millis(every_ms);
+                while let Ok(Some(l)) = rd.next_line().await {
+                    // A 2-vCPU seat applying a block stops reading for a while.
+                    if !observer && pause_ms > 0 && tokio::time::Instant::now() >= next_pause {
+                        tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+                        next_pause = tokio::time::Instant::now() + Duration::from_millis(every_ms);
+                    }
+                    let now = base.elapsed().as_millis() as u64;
+                    if observer {
+                        st_r.obs_bytes.fetch_add(l.len() as u64, Relaxed);
+                        continue;
+                    }
+                    let t = line_t(&l).unwrap_or(now);
+                    if l.starts_with("{\"type\":\"ledger_ok\"") {
+                        st_r.votes_got.fetch_add(1, Relaxed);
+                        st_r.vote_lat.lock().push(now.saturating_sub(t));
+                    } else if l.starts_with("{\"type\":\"submit_tx\"") {
+                        st_r.tx_got.fetch_add(1, Relaxed);
+                    } else if l.starts_with("{\"type\":\"ledger_body\"") {
+                        st_r.bodies_got.fetch_add(1, Relaxed);
+                        st_r.body_lat.lock().push(now.saturating_sub(t));
+                    }
+                }
+            });
+            let (mut hs, mut lu, mut lr) = (None, 0usize, 0usize);
+            let hold = if new { PIPE_STUCK_HOLD } else { PIPE_SHED_HOLD };
+            let shed = |which: &str, st: &SoakStats| {
+                st.sheds.fetch_add(1, Relaxed);
+                match which {
+                    "torn" => st.shed_torn.fetch_add(1, Relaxed),
+                    "body" => st.shed_body.fetch_add(1, Relaxed),
+                    _ => st.shed_send.fetch_add(1, Relaxed),
+                };
+            };
+            while tokio::time::Instant::now() < end {
+                if let Some((which, _, _)) = pipe_stuck_for(probe, &mut hs, &mut lu, &mut lr, hold) {
+                    shed(which, &st);
+                } else {
+                    let line = if new {
+                        tokio::select! {
+                            biased;
+                            Some(l) = lanes.cons.recv() => l,
+                            Some(l) = lanes.catch.recv() => l,
+                            Some(l) = lanes.body.recv() => l,
+                            Some(l) = lanes.tx.recv() => l,
+                            _ = tokio::time::sleep(Duration::from_millis(200)) => continue,
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            Some(l) = lanes.catch.recv() => l,
+                            Some(l) = lanes.cons.recv() => l,
+                            Some(l) = lanes.body.recv() => l,
+                            Some(l) = lanes.tx.recv() => l,
+                            _ = tokio::time::sleep(Duration::from_millis(200)) => continue,
+                        }
+                    };
+                    if new {
+                        pace_observer(&sess, &is_obs, line.len()).await;
+                        // pace_observer charges the process-wide budget; the soak's own
+                        // global budget stands in for it so runs stay independent.
+                        if observer {
+                            let wt = obs_global.take(line.len());
+                            if !wt.is_zero() {
+                                tokio::time::sleep(wt).await;
+                            }
+                        }
+                    }
+                    match write_or_shed(&mut w, probe, line.as_bytes()).await {
+                        Ok(()) => continue,
+                        Err(WriteEnd::Dropped { .. }) => {
+                            st.dropped.fetch_add(1, Relaxed);
+                            continue;
+                        }
+                        Err(WriteEnd::Shed { which, .. }) => shed(which, &st),
+                    }
+                }
+                // Shed: RST, blackhole, lose the tx and body queues (as live).
+                hard_reset(probe);
+                unsafe { libc::close(probe) };
+                rd.abort();
+                proxy.abort();
+                while lanes.tx.try_recv().is_ok() {}
+                while lanes.body.try_recv().is_ok() {}
+                tokio::time::sleep(Duration::from_secs(BLACKHOLE_SECS)).await;
+                continue 'session;
+            }
+            unsafe { libc::close(probe) };
+            rd.abort();
+            proxy.abort();
+        }
+    }
+
+    fn pct(v: &mut [u64], p: f64) -> u64 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        v[((v.len() as f64 - 1.0) * p).round() as usize]
+    }
+
+    /// v1 model (manual): `SOAK_MODE=old|new cargo test -p fd-pl --bin falcon-pl-node
+    /// uplink_fanout_soak -- --ignored --nocapture`. SOAK_SEATS zstd seat links
+    /// (votes 4/s, 20 tx/s x SOAK_TX_BYTES (8 KB), a 120 KB body every 12 s, a
+    /// 63-piece LedgersBatch every SOAK_CATCH_MS (10 s); ~320 kB/s per seat) and SOAK_OBS plain outside pullers (48 KB piece
+    /// lines as fast as they are taken, like the 21.8 MB / 20 s session on v1)
+    /// share one SOAK_UPLINK_KBPS uplink (v1 measured ~3,900 kB/s on Wi-Fi).
+    /// old = 2.11.9 (catch-up ahead of votes, 2 s pipe_stuck, no budgets).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn uplink_fanout_soak() {
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let new = std::env::var("SOAK_MODE").map(|v| v != "old").unwrap_or(true);
+        let secs = env("SOAK_SECS", 120);
+        let seats = env("SOAK_SEATS", 6);
+        let nobs = env("SOAK_OBS", 3);
+        let uplink = env("SOAK_UPLINK_KBPS", 3900);
+        // Live v1 sent ~2.0 MB/s to 5 seats (~400 kB/s each): 20 tx/s x 8 KB
+        // plus a 1.5 MB pieced LedgersBatch every 10 s plus bodies and votes.
+        let tx_bytes = env("SOAK_TX_BYTES", 8192) as usize;
+        let catch_ticks = env("SOAK_CATCH_MS", 10_000) / 50;
+        let up = Arc::new(UploadBudget::new(uplink * 1024));
+        let obs_global = Arc::new(UploadBudget::new(OBSERVER_UPLOAD_KBPS_DEFAULT * 1024));
+        let st = Arc::new(SoakStats::default());
+        let base = Instant::now();
+        let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+        let mut tasks = Vec::new();
+        for i in 0..(seats + nobs) {
+            let observer = i >= seats;
+            let (ctx, crx) = mpsc::channel::<String>(512);
+            let (atx, arx) = mpsc::channel::<String>(128);
+            let (btx, brx) = mpsc::channel::<String>(32);
+            let (ttx, trx) = mpsc::channel::<String>(512);
+            let lanes = Lanes { cons: crx, catch: arx, body: brx, tx: trx };
+            tasks.push(tokio::spawn(soak_link(new, observer, !observer, lanes, up.clone(), obs_global.clone(), st.clone(), base, end)));
+            let st_g = st.clone();
+            let og = obs_global.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut seq = i as u64 * 1_000_000;
+                let mut tick = 0u64;
+                while tokio::time::Instant::now() < end {
+                    let now = base.elapsed().as_millis() as u64;
+                    seq += 1;
+                    if observer {
+                        // A joiner re-asks as soon as it has room; 2.11.10 refuses
+                        // while the shared observer budget is >1 s in debt.
+                        if new && observer_refuse_now(&og, Instant::now()) {
+                            st_g.refused.fetch_add(1, Relaxed);
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        let l = format!("{{\"type\":\"piece\",\"pid\":{seq},\"t\":{now},\"d\":\"{}\"}}\n", &soak_line("x", now, 47 * 1024, seq)[30..]);
+                        if atx.send(l).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    tick += 1;
+                    if tick % 5 == 0 {
+                        st_g.votes_sent.fetch_add(1, Relaxed);
+                        let _ = ctx.try_send(soak_line("ledger_ok", now, 900, seq));
+                    }
+                    st_g.tx_sent.fetch_add(1, Relaxed);
+                    let _ = ttx.try_send(soak_line("submit_tx", now, tx_bytes, seq));
+                    if tick % 240 == 0 {
+                        let _ = btx.try_send(soak_line("ledger_body", now, 120 * 1024, seq));
+                    }
+                    if tick % catch_ticks == (i as u64 * 37) % catch_ticks {
+                        for k in 0..63u64 {
+                            let l = format!("{{\"type\":\"piece\",\"pid\":{},\"t\":{now},\"d\":\"{}\"}}\n", seq * 100 + k, &soak_line("x", now, 23 * 1024, seq + k)[30..]);
+                            let _ = atx.try_send(l);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }));
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+        let mut vl = st.vote_lat.lock().clone();
+        let mut bl = st.body_lat.lock().clone();
+        let vs = st.votes_sent.load(Relaxed).max(1);
+        eprintln!(
+            "UPLINK-SOAK mode={} secs={secs} pause={}ms seats={seats} obs={nobs} uplink={uplink}kB/s: votes delivered {}/{} ({:.1}%) lat p50 {} ms p99 {} ms max {} ms | tx delivered {}/{} ({:.1}%) | bodies {} lat p50 {} ms p99 {} ms | sheds {} (torn {}, body {}, send {}) dropped {} | observer {:.0} kB/s refused {}",
+            if new { "new" } else { "old" },
+            std::env::var("SOAK_PAUSE_MS").unwrap_or_else(|_| "0".into()),
+            st.votes_got.load(Relaxed),
+            vs,
+            100.0 * st.votes_got.load(Relaxed) as f64 / vs as f64,
+            pct(&mut vl, 0.5),
+            pct(&mut vl, 0.99),
+            vl.last().copied().unwrap_or(0),
+            st.tx_got.load(Relaxed),
+            st.tx_sent.load(Relaxed),
+            100.0 * st.tx_got.load(Relaxed) as f64 / st.tx_sent.load(Relaxed).max(1) as f64,
+            st.bodies_got.load(Relaxed),
+            pct(&mut bl, 0.5),
+            pct(&mut bl, 0.99),
+            st.sheds.load(Relaxed),
+            st.shed_torn.load(Relaxed),
+            st.shed_body.load(Relaxed),
+            st.shed_send.load(Relaxed),
+            st.dropped.load(Relaxed),
+            st.obs_bytes.load(Relaxed) as f64 / 1024.0 / secs as f64,
+            st.refused.load(Relaxed),
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_rpc_tests {
+    //! 2.11.11: the node's own loopback clients (ctl, the autoupgrade health
+    //! check) are never paced as non-seats, and a query reply on a real
+    //! non-seat session is not queued behind the shared observer debt.
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// spn, 21 Nov: 2.11.10 paced `falcon-pl-ctl status` (no Hello) as a
+    /// non-seat, so the Status reply waited out the shared observer debt and
+    /// the installer's 120 s health check never got an answer. Fails on 2.11.10.
+    #[tokio::test]
+    async fn loopback_status_is_not_held_by_observer_debt() {
+        let g = observer_global_budget();
+        if g.rate == 0 {
+            return; // FPL_OBSERVER_UPLOAD_KBPS=0: nothing is paced
+        }
+        let shared = super::inbound_ack_tests::test_shared("v99");
+        let fanout = Arc::new(Vec::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sh, f) = (shared.clone(), fanout.clone());
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = handle_inbound(sock, sh, f, "v99").await;
+        });
+        let (cr, mut cw) = TcpStream::connect(addr).await.unwrap().into_split();
+        let mut lines = BufReader::new(cr).lines();
+        let _srv_hello = lines.next_line().await.unwrap().unwrap();
+        // Outsiders have the shared budget 4 s in debt.
+        g.take(g.burst as usize + (g.rate as usize) * 4);
+        let t = Instant::now();
+        let req = serde_json::to_string(&WireMsg::StatusReq { include_accounts: false, brief: true }).unwrap() + "\n";
+        cw.write_all(req.as_bytes()).await.unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("status within 10 s")
+            .unwrap()
+            .unwrap();
+        let took = t.elapsed();
+        assert!(matches!(serde_json::from_str::<WireMsg>(&line).unwrap(), WireMsg::Status { .. }));
+        assert!(took < Duration::from_millis(1500), "loopback status waited {took:?} behind observer debt");
+        drop(cw);
+        let _ = srv.await;
+    }
+
+    #[test]
+    fn loopback_remotes_are_local_clients() {
+        assert!(remote_is_loopback("127.0.0.1:40000"));
+        assert!(remote_is_loopback("127.0.0.2:40000"));
+        assert!(remote_is_loopback("[::1]:40000"));
+        assert!(remote_is_loopback("[::ffff:127.0.0.1]:40000"));
+        // The seed relay reaches seats over the tailnet; public peers are public.
+        assert!(!remote_is_loopback("100.96.215.37:3333"));
+        assert!(!remote_is_loopback("88.198.67.189:51000"));
+        assert!(!remote_is_loopback(""));
+    }
+
+    #[tokio::test]
+    async fn observer_query_reply_skips_the_shared_debt_bulk_does_not() {
+        let sess = UploadBudget::new(256 * 1024);
+        let global = UploadBudget::new(64 * 1024);
+        global.take(64 * 1024 + 64 * 1024 * 2); // 2 s in debt
+        let obs = AtomicBool::new(true);
+        for q in [
+            serde_json::to_string(&WireMsg::Ok { msg: "x".into() }).unwrap(),
+            serde_json::to_string(&WireMsg::Err { msg: "x".into() }).unwrap(),
+            r#"{"type":"status","body":{}}"#.to_string(),
+            r#"{"type":"health","body":{}}"#.to_string(),
+        ] {
+            assert!(is_query_reply_line(q.as_bytes()), "{q}");
+            let t = tokio::time::Instant::now();
+            pace_line_with(&sess, &global, &obs, q.as_bytes()).await;
+            assert!(t.elapsed() < Duration::from_millis(100), "{q} waited {:?}", t.elapsed());
+        }
+        let bulk = serde_json::to_string(&WireMsg::NeedSnapshot {}).unwrap();
+        assert!(!is_query_reply_line(bulk.as_bytes()));
+        assert!(!is_query_reply_line(br#"{"type":"ledgers_batch","ledgers":[]}"#));
+        assert!(!is_query_reply_line(br#"{"type":"piece","pid":1}"#));
+        let t = tokio::time::Instant::now();
+        pace_line_with(&sess, &global, &obs, br#"{"type":"ledgers_batch","ledgers":[]}"#).await;
+        assert!(t.elapsed() >= Duration::from_millis(1500), "bulk still waits on the shared budget: {:?}", t.elapsed());
+        // A seat (or loopback client) is never paced.
+        let seat = AtomicBool::new(false);
+        let t = tokio::time::Instant::now();
+        pace_line_with(&sess, &global, &seat, br#"{"type":"ledgers_batch","ledgers":[]}"#).await;
+        assert!(t.elapsed() < Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod timing_default_tests {
+    //! 2.11.13 (b): seat timing defaults need no per-seat flags.
+    use super::*;
+
+    fn profile(key: &str) -> u64 {
+        let env = include_str!("../../scripts/network-2300.env");
+        env.lines()
+            .find_map(|l| l.strip_prefix(&format!("{key}=")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{key} in network-2300.env"))
+    }
+
+    #[test]
+    fn cli_defaults_are_the_tested_live_values() {
+        let a = Args::try_parse_from(["falcon-pl-node", "--id", "v1"]).unwrap();
+        assert_eq!(a.pack_budget_ms, 5_000);
+        assert_eq!(a.progress_timeout_ms, 4_000);
+        assert_eq!(a.max_txs, 400); // 2.11.15
+        assert_eq!(a.snapshot_interval_ms, 300_000);
+    }
+
+    #[test]
+    fn network_profile_matches_cli_defaults() {
+        assert_eq!(profile("PACK_BUDGET_MS"), DEFAULT_PACK_BUDGET_MS);
+        assert_eq!(profile("PROGRESS_TIMEOUT_MS"), DEFAULT_PROGRESS_TIMEOUT_MS);
+        assert_eq!(profile("MAX_TXS") as usize, DEFAULT_MAX_TXS);
+        assert_eq!(profile("SNAPSHOT_INTERVAL_MS"), DEFAULT_SNAPSHOT_INTERVAL_MS);
+    }
+
+    #[test]
+    fn defaults_fit_round0_timeouts() {
+        let n = fd_pl::Node::new(
+            "v1",
+            fd_pl::ChainConfig {
+                pack_budget_ms: DEFAULT_PACK_BUDGET_MS,
+                progress_timeout_ms: DEFAULT_PROGRESS_TIMEOUT_MS,
+                ..Default::default()
+            },
+            fd_pl::crypto::KeyRing::new(fd_pl::crypto::CryptoScheme::HmacDev),
+            &[],
+        );
+        // Hold + pack + slack inside the round-0 silence timeout peers
+        // apply to a live builder.
+        let round0 = n.live_pack_timeout_ms() * 2;
+        assert!(n.hold_cap_ms() + DEFAULT_PACK_BUDGET_MS + fd_pl::Node::LIVE_PACK_SLACK_MS <= round0);
+        assert_eq!(n.proposal_timeout_ms(), 16_000);
+    }
+}
+
+#[cfg(test)]
+mod tokio_worker_tests {
+    //! 2.11.13 (c): worker floor of 4; TOKIO_WORKER_THREADS still overrides.
+    use super::*;
+
+    #[test]
+    fn floor_of_four_on_small_boxes() {
+        assert_eq!(tokio_workers(None, 1), 4);
+        assert_eq!(tokio_workers(None, 2), 4);
+        assert_eq!(tokio_workers(None, 4), 4);
+        assert_eq!(tokio_workers(None, 32), 32);
+    }
+
+    #[test]
+    fn env_override_wins_when_valid() {
+        assert_eq!(tokio_workers(Some("6"), 2), 6);
+        assert_eq!(tokio_workers(Some(" 2 "), 32), 2);
+        assert_eq!(tokio_workers(Some("0"), 2), 4, "0 is not a valid count");
+        assert_eq!(tokio_workers(Some("lots"), 2), 4);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_timer_tests {
+    //! 2.11.13 (d): a stalled snapshot loop runs once, not once per missed tick.
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missed_snapshot_ticks_are_skipped_not_burst() {
+        let mut tick = snapshot_ticker(40);
+        tick.tick().await; // first tick is immediate
+        std::thread::sleep(Duration::from_millis(300)); // ~7 missed ticks
+        tick.tick().await; // the one catch-up run
+        let t = Instant::now();
+        tick.tick().await;
+        assert!(
+            t.elapsed() >= Duration::from_millis(15),
+            "next run waits for the schedule (burst would fire immediately): {:?}",
+            t.elapsed()
+        );
     }
 }

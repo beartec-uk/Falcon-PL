@@ -100,6 +100,7 @@ fn rlp_exec(number: u64, parent: [u8; 32], receipts: [u8; 32], timestamp: u64) -
         parent_hash: hex::encode(parent),
         receipts_root: hex::encode(receipts),
         rlp_hex: hex::encode(&rlp),
+        timestamp: 0,
     }
 }
 
@@ -1774,4 +1775,220 @@ fn peer_batch_pre_activation_v3_deposit_is_not_kept_or_relayed() {
     assert!(ids(n.serve_need_txs(64)).contains(&v3.tx_id));
     let mut m = fresh_node(1);
     assert_eq!(m.absorb_txs(&[v3.clone(), pay.clone()]), 2);
+}
+
+// ---- 2.11.13 bridge slim (E): compact exec headers ----
+
+/// Deposit block 50 (receipt `built`), then 51..=`head` up to the LC head;
+/// every header carries `ts`.
+fn deposit_chain(built: &Built, head: u64, ts: u64) -> Vec<EthExecHeader> {
+    let mut out = vec![rlp_exec(50, [9u8; 32], built.receipts_root, ts)];
+    for n in 51..=head {
+        let parent = crate::eth_ssz::parse32(&out.last().unwrap().hash).unwrap();
+        out.push(rlp_exec(n, parent, [7u8; 32], ts));
+    }
+    out
+}
+
+fn install_chain(n: &mut Node, chain: &[EthExecHeader]) {
+    let head = chain.last().unwrap();
+    n.bridge.eth_lc = Some(lc_at(head.number, &head.hash, &head.receipts_root));
+    let m = n.bridge.eth_exec_headers.make_mut();
+    for h in chain {
+        m.insert(h.number, h.clone());
+    }
+}
+
+#[test]
+fn slim_conversion_is_deterministic_idempotent_and_keeps_links() {
+    let built = build_receipt(&[]);
+    let chain = deposit_chain(&built, 60, HEAD_TS + 7);
+    let mut a = fresh_node(1);
+    install_chain(&mut a, &chain);
+    let before = serde_json::to_vec(&a.bridge).unwrap();
+    assert!(!String::from_utf8_lossy(&before).contains("bridge_slim"));
+    assert!(!String::from_utf8_lossy(&before).contains("\"timestamp\""));
+    let mut b = a.bridge.clone();
+    let mut c: BridgeState = serde_json::from_slice(&before).unwrap();
+    assert!(b.bridge_slim_convert());
+    assert!(c.bridge_slim_convert());
+    let after = serde_json::to_vec(&b).unwrap();
+    assert_eq!(after, serde_json::to_vec(&c).unwrap(), "same bytes from a clone and a reparse");
+    assert!(!b.bridge_slim_convert(), "second run is a no-op");
+    assert_eq!(serde_json::to_vec(&b).unwrap(), after, "idempotent");
+    assert_eq!(
+        crate::exec_map::sha256_hex_split(&b),
+        crate::crypto::sha256_hex(&after),
+        "split root over the compact map equals the plain root"
+    );
+    for h in chain.iter() {
+        let s = &b.eth_exec_headers[&h.number];
+        assert!(s.rlp_hex.is_empty());
+        assert_eq!(s.timestamp, HEAD_TS + 7);
+        assert_eq!((&s.hash, &s.parent_hash, &s.receipts_root), (&h.hash, &h.parent_hash, &h.receipts_root));
+    }
+    assert!(after.len() * 2 < before.len(), "compact map is far smaller");
+    // The source bridge is untouched (copy-on-write).
+    assert_eq!(serde_json::to_vec(&a.bridge).unwrap(), before);
+}
+
+#[test]
+fn v3_mint_and_refund_verify_the_same_after_conversion() {
+    for (log_ts, refund) in [
+        (HEAD_TS - ETH_V3_DEPOSIT_EXPIRY_SECS, false),
+        (HEAD_TS - ETH_V3_DEPOSIT_EXPIRY_SECS - 1, true),
+    ] {
+        let id = [5u8; 32];
+        let dest = crate::btc_spv::dest_id20("sally");
+        let built = build_receipt(&[v3_log(&id, &SENDER, &dest, &[0u8; 20], 3_000, log_ts)]);
+        let chain = deposit_chain(&built, 54, HEAD_TS);
+        let mk = || {
+            let mut n = fresh_node(1);
+            n.eth_v3_bridge = Some(BRIDGE);
+            install_chain(&mut n, &chain);
+            n
+        };
+        let mut pre = mk();
+        let mut post = mk();
+        assert!(post.bridge.bridge_slim_convert());
+        let proof = proof_of(&chain[0], &built);
+        pre.eth_v3_deposit("ETH", &hex::encode(id), "sally", &proof).unwrap();
+        post.eth_v3_deposit("ETH", &hex::encode(id), "sally", &proof).unwrap();
+        assert_eq!(
+            pre.bridge.eth_v3_resolution(&hex::encode(id)),
+            post.bridge.eth_v3_resolution(&hex::encode(id))
+        );
+        assert_eq!(pre.defi.asset_bal("sally", "ETH"), post.defi.asset_bal("sally", "ETH"));
+        assert_eq!(post.defi.asset_bal("sally", "ETH") == 0, refund);
+        // A wrong block hash / broken link is still refused after conversion.
+        let mut bad = proof.clone();
+        bad.block_hash = "11".repeat(32);
+        let mut post2 = fresh_node(1);
+        post2.eth_v3_bridge = Some(BRIDGE);
+        install_chain(&mut post2, &chain);
+        post2.bridge.bridge_slim_convert();
+        assert!(post2.eth_v3_deposit("ETH", &hex::encode([6u8; 32]), "sally", &bad).is_err());
+        let mut broken = post2.bridge.clone();
+        broken.eth_exec_headers.make_mut().get_mut(&52).unwrap().parent_hash = "22".repeat(32);
+        post2.bridge = broken;
+        let e = post2.eth_v3_deposit("ETH", &hex::encode(id), "sally", &proof).unwrap_err();
+        assert!(e.contains("parent mismatch"), "{e}");
+    }
+}
+
+#[test]
+fn inserts_after_conversion_are_verified_then_compacted() {
+    let built = build_receipt(&[]);
+    let chain = deposit_chain(&built, 56, HEAD_TS);
+    let mut n = fresh_node(1);
+    install_chain(&mut n, &chain[..5]);
+    let mut b = n.bridge.clone();
+    // Pre-slim: a submitted timestamp is ignored (older parsers drop it).
+    let mut extra = chain[5].clone();
+    extra.timestamp = 99;
+    b.eth_lc.as_mut().unwrap().execution_block_hash = chain[5].hash.clone();
+    b.eth_lc.as_mut().unwrap().execution_number = 55;
+    b.eth_add_exec_headers(vec![extra]).unwrap();
+    assert_eq!(b.eth_exec_headers[&55].timestamp, 0);
+    assert!(!b.eth_exec_headers[&55].rlp_hex.is_empty());
+    // Post-slim: the RLP is still required and verified, then dropped.
+    b.bridge_slim_convert();
+    let mut tampered = chain[6].clone();
+    tampered.receipts_root = "33".repeat(32);
+    b.eth_lc.as_mut().unwrap().execution_block_hash = chain[6].hash.clone();
+    b.eth_lc.as_mut().unwrap().execution_number = 56;
+    assert!(b.eth_add_exec_headers(vec![tampered]).is_err());
+    let mut no_rlp = chain[6].clone();
+    no_rlp.rlp_hex.clear();
+    assert!(b.eth_add_exec_headers(vec![no_rlp]).is_err(), "compact form is never accepted on the wire");
+    b.eth_add_exec_headers(vec![chain[6].clone()]).unwrap();
+    let s = &b.eth_exec_headers[&56];
+    assert!(s.rlp_hex.is_empty());
+    assert_eq!(s.timestamp, HEAD_TS);
+}
+
+#[test]
+fn replay_across_slim_activation_agrees() {
+    let id = [9u8; 32];
+    let dest = crate::btc_spv::dest_id20("sally");
+    let built = build_receipt(&[v3_log(&id, &SENDER, &dest, &[0u8; 20], 2_500, HEAD_TS)]);
+    let chain = deposit_chain(&built, 58, HEAD_TS);
+    let proof = proof_of(&chain[0], &built);
+    let ids = ["v1", "v2", "v3"];
+    let mut off = Network::bootstrap(&ids, 1000, &users(), cfg());
+    let mut net = Network::bootstrap(&ids, 1000, &users(), cfg());
+    for (nw, slim) in [(&mut off, u64::MAX), (&mut net, 3u64)] {
+        for n in nw.nodes.values_mut() {
+            n.ensure_faucet();
+            n.eth_v3_from_height = 1;
+            n.eth_v3_bridge = Some(BRIDGE);
+            n.bridge_slim_from_height = slim;
+            install_chain(n, &chain);
+        }
+        nw.pong_all();
+    }
+    // Below the activation: byte-identical to a node that never activates.
+    let mut snap2 = None;
+    for h in 1..=2u64 {
+        off.payment("bob", "carol", 1, 1).unwrap();
+        off.seal_next_height().unwrap();
+        net.payment("bob", "carol", 1, 1).unwrap();
+        net.seal_next_height().unwrap();
+        let (o, n) = (&off.nodes["v1"], &net.nodes["v1"]);
+        assert_eq!(o.tip_hash, n.tip_hash, "h={h}");
+        assert_eq!(o.commitment_root(), n.commitment_root(), "h={h}");
+        assert_eq!(
+            crate::exec_map::to_vec_split(&o.to_snapshot()).unwrap()
+                .len(),
+            crate::exec_map::to_vec_split(&n.to_snapshot()).unwrap().len(),
+        );
+        assert!(!n.bridge.bridge_slim);
+        if h == 2 {
+            snap2 = Some(n.to_snapshot());
+        }
+    }
+    // Across it: every seat converts in the same block and agrees.
+    for _ in 3..=4u64 {
+        net.payment("bob", "carol", 1, 1).unwrap();
+        net.seal_next_height().unwrap();
+    }
+    roots_agree(&net);
+    assert!(net.nodes["v1"].bridge.bridge_slim);
+    assert!(net.nodes["v1"].bridge.eth_exec_headers.values().all(|h| h.rlp_hex.is_empty()));
+    // A mint after the conversion verifies on every seat.
+    let tx = sign(
+        &net,
+        "alice",
+        1,
+        TxBody::EthV3Deposit {
+            asset: "ETH".into(),
+            deposit_id: hex::encode(id),
+            credit_to: "sally".into(),
+            proof: proof.clone(),
+        },
+    );
+    submit_all(&mut net, &tx);
+    net.seal_next_height().unwrap();
+    roots_agree(&net);
+    assert_eq!(net.nodes["v1"].defi.asset_bal("sally", "ETH"), 2_500);
+    // A node restored from the pre-activation snapshot replays 3..=tip and
+    // lands on the same state (converts at 3 like everyone else).
+    let dir = std::env::temp_dir().join(format!("fpl-slim-replay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("h2.json");
+    Node::write_snapshot_checked(&path, snap2.as_ref().unwrap(), &|_, _| Ok(())).unwrap();
+    let v1 = &net.nodes["v1"];
+    let mut r = Node::load_snapshot(&path, v1.keys.clone()).unwrap();
+    r.eth_v3_from_height = 1;
+    r.eth_v3_bridge = Some(BRIDGE);
+    r.bridge_slim_from_height = 3;
+    assert_eq!(r.tip_height, 2);
+    let tail: Vec<Ledger> = v1.chain.iter().filter(|l| l.height > 2).cloned().collect();
+    for l in &tail {
+        r.ingest_ledger_catchup(l).unwrap();
+    }
+    assert_eq!(r.tip_height, v1.tip_height);
+    assert_eq!(r.tip_hash, v1.tip_hash);
+    assert_eq!(r.commitment_root(), v1.commitment_root());
+    let _ = std::fs::remove_dir_all(&dir);
 }

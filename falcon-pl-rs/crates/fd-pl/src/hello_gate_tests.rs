@@ -83,7 +83,7 @@ fn live(n: &Node, id: &str) -> bool {
 #[test]
 fn predicate_before_gloas_accepts_any_2_9_x() {
     // 2.11.0 still accepts the whole legacy 2.9.x line plus its own 2.11.x.
-    for v in ["", "2.9.0", "2.9.59", "2.9.60", "2.9.61", "2.11.0", "2.11.7"] {
+    for v in ["", "2.9.0", "2.9.59", "2.9.60", "2.9.61", "2.11.0", "2.11.7", "2.11.8", "2.11.9", "2.11.10", "2.11.11", "2.11.12", "2.11.13"] {
         assert!(hello_version_compatible_at(v, false), "{v:?} pre-H");
     }
     for v in ["3.0.0", "2.8.99", "2.8.0", "2.10.0", "2.12.0", "2.90.1", "2.9", "2.10", "2.10.07", "2.9.060", "junk"] {
@@ -176,7 +176,7 @@ fn pong_without_accepted_hello_is_dropped() {
     assert!(!live(&n, "v2"));
     // Non-Hello/Pong traffic (ctl: Status, SubmitTx, ...) is not gated.
     let mut gate = HelloSession::default();
-    let other = WireMsg::NeedTxs { max_count: 1 };
+    let other = WireMsg::NeedTxs { max_count: 1, missing: vec![] };
     assert!(!HelloSession::needs_check(&other));
     assert_eq!(gate.check(&n, &other), HelloGate::Pass);
 }

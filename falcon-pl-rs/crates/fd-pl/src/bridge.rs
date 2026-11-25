@@ -38,6 +38,15 @@ pub const HEADER_RETAIN_SECS: u64 = 14 * 24 * 60 * 60;
 /// Safety cap if a difficulty-1 sprint runs the whole retention window.
 /// 500k headers is about six days at one block per second.
 pub const HEADER_HARD_CAP: usize = 500_000;
+/// 2.11.13 bridge slim: BTC rail header cap from the activation height on
+/// (replaces [`HEADER_HARD_CAP`] for that rail; vault-pinned heights extra).
+/// 32,768 headers is ~14 MB of state, and at least ~227 days at 10 min blocks
+/// (~9 h in a one-block-per-second difficulty-1 sprint).
+pub const SLIM_HEADER_CAP: usize = 32_768;
+/// 2.11.13 bridge slim: headers the superseded testnet3 rail (`btc`) keeps at
+/// the activation (two retarget periods: tip/parent continuity, last real
+/// bits, reorg depth), plus every height pinned by a vault UTXO.
+pub const SLIM_LEGACY_BTC_KEEP: usize = 4_032;
 
 /// Rolling window of ETH execution headers kept behind the light-client head
 /// (~7 days at a 12s slot). Headers with `number < eth_exec_prune_floor` are dropped.
@@ -262,6 +271,37 @@ pub const BTC_FORK_MAX: usize = 144;
 /// v2.10.1: a pending fork this many headers behind a heavier main tip is dropped.
 pub const BTC_FORK_STALE_N: u64 = 6;
 
+/// Most-work rail: side headers deeper than this below the tip are dropped
+/// (and a new side header must fork within it). One day of blocks.
+pub const BTC_SIDE_DEPTH: u64 = 144;
+/// Most-work rail: hard cap on stored side headers.
+pub const BTC_SIDE_MAX: usize = 1024;
+
+/// Contextual rules the most-work rail enforces (testnet4 by default; tests
+/// use a regtest-style limit so headers can be mined in microseconds).
+#[derive(Debug, Clone, Copy)]
+pub struct BtcHeaderRules {
+    pub pow_limit_bits: u32,
+}
+
+impl BtcHeaderRules {
+    pub const TESTNET4: BtcHeaderRules = BtcHeaderRules { pow_limit_bits: btc_spv::POW_LIMIT_BITS };
+}
+
+/// Most-work rail context for one header.
+///
+/// `utc_now_secs` is the clock for Bitcoin's 2-hour future limit. FPL chain
+/// time (`sealed_at_ms`) counts from genesis and is not UTC, so it cannot be
+/// used. Consensus (block apply) passes the parent ledger's attested
+/// `sealed_utc_ms` once the UTC header (`utc_header`, `H_utc`) is armed, and
+/// `None` until then (no consensus future check). Mempool admission passes
+/// the seat's OS wall clock, so honest packers never pack a header more than
+/// 2 h ahead even before `H_utc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MostWork {
+    pub utc_now_secs: Option<u64>,
+}
+
 fn header_work(h: &RailHeader) -> u128 {
     btc_spv::parse_header_hex(&h.raw)
         .map(|p| btc_spv::header_work_bits(p.bits))
@@ -278,8 +318,9 @@ pub struct RailState {
     pub tip_merkle_root: String,
     pub total_minted: u64,
     pub total_burned: u64,
-    /// height -> header
-    pub headers: BTreeMap<u64, RailHeader>,
+    /// height -> header. 2.11.13: copy-on-write with a cached JSON encoding
+    /// (same bytes as the `BTreeMap`; mutate via `make_mut()`).
+    pub headers: crate::exec_map::RailHeaderMap,
     /// spent external txids (deposits)
     pub spent_deposits: BTreeSet<String>,
     /// open withdraw notes: note_id -> (amount, external_to, from)
@@ -356,6 +397,18 @@ pub struct RailState {
     /// is byte-identical to 2.10.0 until then.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub btc_fork_alt: Vec<RailHeader>,
+    /// BTC4 most-work rail (`btc4_most_work_from_height`): every valid side
+    /// header within [`BTC_SIDE_DEPTH`] of the tip, keyed by lowercase display
+    /// hash. Replaces the two fixed `btc_fork` / `btc_fork_alt` slots, so any
+    /// number of equal-work branches can be held at once. Always empty (and not
+    /// serialized) before activation, so the commitment is unchanged until then.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub btc_side: BTreeMap<String, RailHeader>,
+    /// 2.11.13 bridge slim: header cap set at the activation
+    /// ([`SLIM_HEADER_CAP`]); `0` = [`HEADER_HARD_CAP`]. Omitted while zero,
+    /// so the commitment is unchanged before the activation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub header_cap: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -401,7 +454,7 @@ impl RailState {
             tip_merkle_root: String::new(),
             total_minted: 0,
             total_burned: 0,
-            headers: BTreeMap::new(),
+            headers: Default::default(),
             spent_deposits: BTreeSet::new(),
             withdrawals: BTreeMap::new(),
             vault_utxos: Vec::new(),
@@ -424,6 +477,8 @@ impl RailState {
             bitvm2_instance_spk: None,
             btc_fork: Vec::new(),
             btc_fork_alt: Vec::new(),
+            btc_side: BTreeMap::new(),
+            header_cap: 0,
         }
     }
 
@@ -514,6 +569,434 @@ impl RailState {
         let fork_fix = fork_fix && self.asset == RAIL_BTC4;
         let slot_fix = slot_fix && fork_fix;
         self.submit_btc_header_strict(h, fork_fix, slot_fix)
+    }
+
+    /// BTC4 most-work rail (`btc4_most_work_from_height`) on top of
+    /// [`Self::submit_header_ex3`]. `most_work = Some(..)` switches the BTC4
+    /// rail to [`Self::submit_btc_header_most_work`] with testnet4 rules;
+    /// `None` is exactly the pre-activation behaviour. See [`MostWork`] for
+    /// which clock the 2-hour future limit uses.
+    pub fn submit_header_ex4(
+        &mut self,
+        h: RailHeader,
+        strict: bool,
+        fork_fix: bool,
+        slot_fix: bool,
+        most_work: Option<MostWork>,
+    ) -> Result<bool, String> {
+        if let Some(mw) = most_work {
+            if strict && self.asset == RAIL_BTC4 {
+                return self.submit_btc_header_most_work(h, mw.utc_now_secs, BtcHeaderRules::TESTNET4);
+            }
+        }
+        self.submit_header_ex3(h, strict, fork_fix, slot_fix)
+    }
+
+    fn btc_side_key(hash: &str) -> String {
+        hash.trim().to_ascii_lowercase()
+    }
+
+    /// Header `(height, hash)` on the main chain or in the side store.
+    fn btc_mw_get(&self, height: u64, hash: &str) -> Option<&RailHeader> {
+        if let Some(m) = self.headers.get(&height) {
+            if btc_spv::hex_eq(&m.hash, hash) {
+                return Some(m);
+            }
+        }
+        self.btc_side
+            .get(&Self::btc_side_key(hash))
+            .filter(|s| s.height == height)
+    }
+
+    fn btc_mw_on_main(&self, height: u64, hash: &str) -> bool {
+        self.headers
+            .get(&height)
+            .map(|m| btc_spv::hex_eq(&m.hash, hash))
+            .unwrap_or(false)
+    }
+
+    /// Up to `n` headers from `(height, hash)` back (inclusive), newest first.
+    fn btc_mw_ancestors(&self, height: u64, hash: &str, n: usize) -> Vec<(u64, btc_spv::ParsedHeader)> {
+        let mut out = Vec::with_capacity(n.min(64));
+        let mut cur = (height, hash.to_string());
+        while out.len() < n && cur.0 > 0 {
+            let Some(hh) = self.btc_mw_get(cur.0, &cur.1) else { break };
+            let Ok(p) = btc_spv::parse_header_hex(&hh.raw) else { break };
+            cur = (cur.0 - 1, p.prev_display.clone());
+            out.push((hh.height, p));
+        }
+        out
+    }
+
+    /// Required nBits for a child of `parent` at `child_height` (Core
+    /// `GetNextWorkRequired`, testnet4: min-difficulty after > 20 minutes,
+    /// BIP94 retarget from the first header of the period).
+    fn btc_mw_required_bits(
+        &self,
+        parent_height: u64,
+        parent: &btc_spv::ParsedHeader,
+        child_height: u64,
+        child_time: u32,
+        rules: BtcHeaderRules,
+    ) -> Result<u32, String> {
+        let lim = rules.pow_limit_bits;
+        if child_height % btc_spv::DIFF_INTERVAL != 0 {
+            if child_time as u64 > parent.timestamp as u64 + 2 * btc_spv::POW_TARGET_SPACING as u64 {
+                return Ok(lim);
+            }
+            // Last header that is a retarget or not min-difficulty.
+            let mut h = parent_height;
+            let mut p = parent.clone();
+            loop {
+                if h % btc_spv::DIFF_INTERVAL == 0 || p.bits != lim {
+                    return Ok(p.bits);
+                }
+                match self
+                    .btc_mw_get(h - 1, &p.prev_display)
+                    .and_then(|x| btc_spv::parse_header_hex(&x.raw).ok())
+                {
+                    Some(q) => {
+                        h -= 1;
+                        p = q;
+                    }
+                    // Walked past stored history (fresh anchor only): use
+                    // the rail's tracked last non-min-diff nBits.
+                    None if self.last_real_bits != 0 => return Ok(self.last_real_bits),
+                    None => return Err("BTC bits: no stored non-min-difficulty ancestor".into()),
+                }
+            }
+        }
+        // Retarget: the first header of the closing period is child - 2016.
+        let first_h = child_height - btc_spv::DIFF_INTERVAL;
+        let mut h = parent_height;
+        let mut p = parent.clone();
+        while h > first_h {
+            match self
+                .btc_mw_get(h - 1, &p.prev_display)
+                .and_then(|x| btc_spv::parse_header_hex(&x.raw).ok())
+            {
+                Some(q) => {
+                    h -= 1;
+                    p = q;
+                }
+                None => {
+                    return Err(format!(
+                        "BTC retarget at {child_height}: period start {first_h} is not stored"
+                    ))
+                }
+            }
+        }
+        btc_spv::retarget_bip94(p.bits, p.timestamp, parent.timestamp, lim)
+            .ok_or_else(|| "BTC retarget: invalid nBits in period".to_string())
+    }
+
+    /// Bitcoin Core contextual header checks for testnet4: version, pow
+    /// limit, median-time-past, 2-hour future limit, BIP94 timewarp and the
+    /// exact required nBits.
+    fn btc_mw_check_context(
+        &self,
+        height: u64,
+        parsed: &btc_spv::ParsedHeader,
+        parent_height: u64,
+        parent: &btc_spv::ParsedHeader,
+        utc_now_secs: Option<u64>,
+        rules: BtcHeaderRules,
+    ) -> Result<(), String> {
+        if parsed.version < btc_spv::MIN_HEADER_VERSION {
+            return Err(format!("BTC header version {} below 4 (bad-version)", parsed.version));
+        }
+        if !btc_spv::bits_within_pow_limit(parsed.bits, rules.pow_limit_bits) {
+            return Err(format!("BTC header nBits {:08x} outside the pow limit (bad-diffbits)", parsed.bits));
+        }
+        let times: Vec<u32> = self
+            .btc_mw_ancestors(parent_height, &parent.hash_display, btc_spv::MEDIAN_TIME_SPAN)
+            .iter()
+            .map(|(_, p)| p.timestamp)
+            .collect();
+        // Core always has the full window; a freshly anchored rail does not,
+        // and a partial median is not Core's rule, so wait for 11 ancestors.
+        let mtp = if times.len() == btc_spv::MEDIAN_TIME_SPAN { btc_spv::median_time_past(&times) } else { None };
+        if let Some(mtp) = mtp {
+            if parsed.timestamp <= mtp {
+                return Err(format!(
+                    "BTC header time {} not after median time past {} (time-too-old)",
+                    parsed.timestamp, mtp
+                ));
+            }
+        }
+        if let Some(now) = utc_now_secs {
+            if parsed.timestamp as u64 > now.saturating_add(btc_spv::MAX_FUTURE_BLOCK_TIME_SECS) {
+                return Err(format!(
+                    "BTC header time {} more than 2h after UTC {} (time-too-new)",
+                    parsed.timestamp, now
+                ));
+            }
+        }
+        if height % btc_spv::DIFF_INTERVAL == 0
+            && parsed.timestamp < parent.timestamp.saturating_sub(btc_spv::MAX_TIMEWARP_SECS)
+        {
+            return Err(format!(
+                "BTC header time {} more than 600s before parent {} at a retarget (time-timewarp-attack)",
+                parsed.timestamp, parent.timestamp
+            ));
+        }
+        let want = self.btc_mw_required_bits(parent_height, parent, height, parsed.timestamp, rules)?;
+        if parsed.bits != want {
+            return Err(format!(
+                "BTC bits {:08x} != required {:08x} at {} (bad-diffbits)",
+                parsed.bits, want, height
+            ));
+        }
+        Ok(())
+    }
+
+    /// One-time move of the two legacy fork slots into the side store.
+    fn btc_mw_migrate_slots(&mut self) {
+        if self.btc_fork.is_empty() && self.btc_fork_alt.is_empty() {
+            return;
+        }
+        let mut v = std::mem::take(&mut self.btc_fork);
+        v.extend(std::mem::take(&mut self.btc_fork_alt));
+        for f in v {
+            if !self.btc_mw_on_main(f.height, &f.hash) {
+                self.btc_side.insert(Self::btc_side_key(&f.hash), f);
+            }
+        }
+    }
+
+    /// Side headers from `(height, hash)` back to (excluding) the first main
+    /// ancestor, oldest first, plus that fork height. `None` if disconnected.
+    fn btc_mw_branch(&self, height: u64, hash: &str) -> Option<(u64, Vec<RailHeader>)> {
+        let mut out = Vec::new();
+        let mut cur = (height, Self::btc_side_key(hash));
+        loop {
+            if self.btc_mw_on_main(cur.0, &cur.1) {
+                out.reverse();
+                return Some((cur.0, out));
+            }
+            let s = self.btc_side.get(&cur.1).filter(|s| s.height == cur.0)?;
+            if cur.0 == 0 {
+                return None;
+            }
+            out.push(s.clone());
+            cur = (cur.0 - 1, Self::btc_side_key(&s.parent_hash));
+        }
+    }
+
+    fn btc_mw_branch_work(v: &[RailHeader]) -> u128 {
+        v.iter().map(header_work).fold(0, u128::saturating_add)
+    }
+
+    /// Drop side headers more than [`BTC_SIDE_DEPTH`] below the tip and any
+    /// side header whose parent is no longer stored.
+    fn btc_mw_prune_side(&mut self) {
+        let tip = self.tip_height;
+        self.btc_side.retain(|_, s| s.height.saturating_add(BTC_SIDE_DEPTH) > tip);
+        loop {
+            let orphans: Vec<String> = self
+                .btc_side
+                .iter()
+                .filter(|(_, s)| s.height == 0 || self.btc_mw_get(s.height - 1, &s.parent_hash).is_none())
+                .map(|(k, _)| k.clone())
+                .collect();
+            if orphans.is_empty() {
+                break;
+            }
+            for k in orphans {
+                self.btc_side.remove(&k);
+            }
+        }
+    }
+
+    /// Store a validated side header. When full, evict the lowest-work leaf
+    /// (ties: lowest height, then greatest hash) if the newcomer's branch has
+    /// at least that much work; otherwise refuse.
+    fn btc_mw_insert_side(&mut self, h: RailHeader) -> Result<(), String> {
+        if self.btc_side.len() >= BTC_SIDE_MAX {
+            self.btc_mw_prune_side();
+        }
+        if self.btc_side.len() >= BTC_SIDE_MAX {
+            let parents: BTreeSet<String> =
+                self.btc_side.values().map(|s| Self::btc_side_key(&s.parent_hash)).collect();
+            let mut victim: Option<(u128, u64, String)> = None;
+            for (k, s) in &self.btc_side {
+                if parents.contains(k) {
+                    continue;
+                }
+                let w = self
+                    .btc_mw_branch(s.height, &s.hash)
+                    .map(|(_, b)| Self::btc_mw_branch_work(&b))
+                    .unwrap_or(0);
+                let better = match &victim {
+                    None => true,
+                    Some((vw, vh, vk)) => (w, s.height) < (*vw, *vh) || ((w, s.height) == (*vw, *vh) && k > vk),
+                };
+                if better {
+                    victim = Some((w, s.height, k.clone()));
+                }
+            }
+            let parent_branch = self
+                .btc_mw_branch(h.height - 1, &h.parent_hash)
+                .map(|(_, b)| Self::btc_mw_branch_work(&b))
+                .unwrap_or(0);
+            let mine = parent_branch.saturating_add(header_work(&h));
+            match victim {
+                Some((vw, _, vk)) if mine >= vw => {
+                    self.btc_side.remove(&vk);
+                }
+                _ => return Err("BTC side header store full".into()),
+            }
+        }
+        self.btc_side.insert(Self::btc_side_key(&h.hash), h);
+        Ok(())
+    }
+
+    /// Reorg onto the branch ending at `h` iff its work from the fork point
+    /// is strictly greater than the main suffix it replaces. Equal work keeps
+    /// the current main chain (first-seen). Returns whether the tip moved.
+    fn btc_mw_try_reorg(&mut self, h: &RailHeader) -> Result<bool, String> {
+        let (fork_h, branch) = self
+            .btc_mw_branch(h.height, &h.hash)
+            .ok_or("BTC side branch disconnected")?;
+        if branch.is_empty() {
+            return Ok(false);
+        }
+        let bw = Self::btc_mw_branch_work(&branch);
+        if bw <= self.btc_main_work_from(fork_h + 1) {
+            return Ok(false);
+        }
+        // Old main suffix becomes a side branch (it may win back later).
+        let old: Vec<u64> = self.headers.range(fork_h + 1..).map(|(k, _)| *k).collect();
+        for k in old {
+            if let Some(o) = self.headers.make_mut().remove(&k) {
+                self.btc_side.insert(Self::btc_side_key(&o.hash), o);
+            }
+        }
+        for b in branch {
+            self.btc_side.remove(&Self::btc_side_key(&b.hash));
+            self.tip_height = b.height;
+            self.tip_hash = b.hash.clone();
+            self.tip_merkle_root = b.merkle_root.clone();
+            self.headers.make_mut().insert(b.height, b);
+        }
+        let lrb = self.btc_last_real_bits(self.tip_height, 0);
+        if lrb != 0 {
+            self.last_real_bits = lrb;
+        }
+        self.btc_fork.clear();
+        self.btc_fork_alt.clear();
+        self.prune_btc_headers();
+        Ok(true)
+    }
+
+    /// BTC4 most-work rail. Every valid header whose parent is stored (main
+    /// chain or side store) is kept; the rail follows the branch with the
+    /// most cumulative work. Tie-break on equal work: **first-seen** — the
+    /// main chain stays where it is until a branch has strictly more work
+    /// (Bitcoin Core's rule; FPL ledger order makes "first" identical on
+    /// every seat). Any number of equal-work branches can wait side by side,
+    /// so the 161859-style split cannot jam the rail. Headers also pass
+    /// Bitcoin Core's testnet4 contextual checks (see
+    /// [`Self::btc_mw_check_context`]).
+    pub(crate) fn submit_btc_header_most_work(
+        &mut self,
+        mut h: RailHeader,
+        utc_now_secs: Option<u64>,
+        rules: BtcHeaderRules,
+    ) -> Result<bool, String> {
+        if h.raw.is_empty() {
+            return Err("BTC rail requires 80-byte Bitcoin header".into());
+        }
+        let parsed = btc_spv::parse_header_hex(&h.raw)?;
+        if !btc_spv::bits_within_pow_limit(parsed.bits, rules.pow_limit_bits) {
+            return Err(format!("BTC header nBits {:08x} outside the pow limit (bad-diffbits)", parsed.bits));
+        }
+        if !btc_spv::hash_meets_target(&parsed.hash_internal, parsed.bits) {
+            return Err("BTC header does not meet target".into());
+        }
+        h.hash = parsed.hash_display.clone();
+        h.parent_hash = parsed.prev_display.clone();
+        h.merkle_root = parsed.merkle_display.clone();
+        h.raw = parsed.raw_hex.clone();
+
+        let tip_is_fixture = self.tip_height > 0
+            && self
+                .headers
+                .get(&self.tip_height)
+                .map(|t| t.raw.is_empty())
+                .unwrap_or(true);
+        if self.tip_height == 0 || tip_is_fixture {
+            // Anchoring rules are unchanged.
+            return self.submit_btc_header(h).map(|_| true);
+        }
+        self.btc_mw_migrate_slots();
+        if h.height == 0 {
+            return Err("header height 0".into());
+        }
+        if self.btc_mw_on_main(h.height, &h.hash) {
+            return Err(format!("BTC duplicate header at {}", h.height));
+        }
+        if self.btc_side.contains_key(&Self::btc_side_key(&h.hash)) {
+            return Err(format!("BTC duplicate header at {} (side branch)", h.height));
+        }
+        let ph = h.height - 1;
+        let parent = self.btc_mw_get(ph, &h.parent_hash).cloned().ok_or_else(|| {
+            format!(
+                "BTC header parent mismatch: parent {} of {} is not stored (main or side)",
+                h.parent_hash, h.height
+            )
+        })?;
+        let parent_p = btc_spv::parse_header_hex(&parent.raw)?;
+        let extends_tip = ph == self.tip_height && self.btc_mw_on_main(ph, &h.parent_hash);
+        if !extends_tip && h.height.saturating_add(BTC_SIDE_DEPTH) <= self.tip_height {
+            return Err(format!(
+                "BTC side header at {} is more than {} below tip {}",
+                h.height, BTC_SIDE_DEPTH, self.tip_height
+            ));
+        }
+        self.btc_mw_check_context(h.height, &parsed, ph, &parent_p, utc_now_secs, rules)?;
+        if extends_tip {
+            if parsed.bits != btc_spv::POW_LIMIT_BITS {
+                self.last_real_bits = parsed.bits;
+            }
+            self.commit_header(h, false)?;
+            self.btc_mw_prune_side();
+            return Ok(true);
+        }
+        self.btc_mw_insert_side(h.clone())?;
+        let moved = self.btc_mw_try_reorg(&h)?;
+        self.btc_mw_prune_side();
+        Ok(moved)
+    }
+
+    /// Status only (non-consensus): side-store summary, best tips first.
+    pub fn btc_side_summary(&self) -> Option<serde_json::Value> {
+        if self.btc_side.is_empty() {
+            return None;
+        }
+        let parents: BTreeSet<String> =
+            self.btc_side.values().map(|s| Self::btc_side_key(&s.parent_hash)).collect();
+        let mut tips: Vec<(u128, u64, String, u64, usize)> = self
+            .btc_side
+            .iter()
+            .filter(|(k, _)| !parents.contains(*k))
+            .filter_map(|(_, s)| {
+                let (fh, b) = self.btc_mw_branch(s.height, &s.hash)?;
+                Some((Self::btc_mw_branch_work(&b), s.height, s.hash.clone(), fh, b.len()))
+            })
+            .collect();
+        tips.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        Some(serde_json::json!({
+            "len": self.btc_side.len(),
+            "tips": tips.iter().take(8).map(|(w, ht, hs, fh, n)| serde_json::json!({
+                "tip_height": ht,
+                "tip_hash": hs,
+                "fork_height": fh,
+                "len": n,
+                "work": w.to_string(),
+                "main_work": self.btc_main_work_from(fh + 1).to_string(),
+            })).collect::<Vec<_>>(),
+        }))
     }
 
     fn submit_btc_header_strict(&mut self, mut h: RailHeader, fork_fix: bool, slot_fix: bool) -> Result<bool, String> {
@@ -775,7 +1258,7 @@ impl RailState {
             self.tip_merkle_root.clone(),
             self.last_real_bits,
         );
-        self.headers.retain(|k, _| *k < start);
+        self.headers.make_mut().retain(|k, _| *k < start);
         self.tip_height = ancestor.height;
         self.tip_hash = ancestor.hash.clone();
         self.tip_merkle_root = ancestor.merkle_root.clone();
@@ -825,7 +1308,7 @@ impl RailState {
                     return Err("BTC header does not match frozen checkpoint".into());
                 }
             }
-            self.headers.clear();
+            self.headers.make_mut().clear();
             return self.commit_header(h, true);
         }
 
@@ -855,7 +1338,7 @@ impl RailState {
                 return Err("BTC bits do not follow parent / testnet min-diff".into());
             }
             let cut = h.height;
-            self.headers.retain(|k, _| *k < cut);
+            self.headers.make_mut().retain(|k, _| *k < cut);
             self.tip_height = ancestor.height;
             self.tip_hash = ancestor.hash;
             self.tip_merkle_root = ancestor.merkle_root;
@@ -953,7 +1436,7 @@ impl RailState {
         self.tip_height = h.height;
         self.tip_hash = h.hash.clone();
         self.tip_merkle_root = h.merkle_root.clone();
-        self.headers.insert(h.height, h);
+        self.headers.make_mut().insert(h.height, h);
         self.prune_btc_headers();
         Ok(())
     }
@@ -986,11 +1469,16 @@ impl RailState {
             .unwrap_or(0);
         let cutoff = tip_ts.saturating_sub(HEADER_RETAIN_SECS);
         // Sprint cap first: drop the oldest non-vault header.
-        while self.headers.len() > HEADER_HARD_CAP {
+        let hard_cap = if self.header_cap > 0 {
+            self.header_cap as usize
+        } else {
+            HEADER_HARD_CAP
+        };
+        while self.headers.len() > hard_cap {
             let Some(k) = self.headers.keys().copied().find(|hgt| !keep.contains(hgt)) else {
                 break;
             };
-            self.headers.remove(&k);
+            self.headers.make_mut().remove(&k);
         }
         // Then drop only headers older than the claim window, and never below
         // HEADER_HISTORY. A deposit from a few days ago stays claimable.
@@ -1004,7 +1492,31 @@ impl RailState {
             }) else {
                 break;
             };
-            self.headers.remove(&k);
+            self.headers.make_mut().remove(&k);
+        }
+    }
+
+    /// 2.11.13 bridge slim (activation, once): set the post-activation cap,
+    /// keep the newest `keep` headers and, below them, only heights pinned by
+    /// a vault UTXO, the checkpoint or the tip. Deterministic (key order).
+    pub fn slim_btc_headers(&mut self, keep: usize) {
+        self.header_cap = SLIM_HEADER_CAP as u64;
+        let mut pinned = vault::vault_header_heights(&self.vault_utxos);
+        if let Some((h, _)) = &self.btc_checkpoint {
+            pinned.insert(*h);
+        }
+        pinned.insert(self.tip_height);
+        if keep == 0 || self.headers.len() <= keep {
+            return;
+        }
+        // Newest `keep` keys stay; below them only pinned heights stay.
+        let Some(floor) = self.headers.keys().rev().nth(keep - 1).copied() else {
+            return;
+        };
+        if self.headers.range(..floor).any(|(k, _)| !pinned.contains(k)) {
+            self.headers
+                .make_mut()
+                .retain(|k, _| *k >= floor || pinned.contains(k));
         }
     }
 
@@ -1076,7 +1588,7 @@ impl RailState {
             if self.headers.contains_key(ht) {
                 return Err(format!("backfill height {ht} already stored"));
             }
-            self.headers.insert(
+            self.headers.make_mut().insert(
                 *ht,
                 RailHeader {
                     height: *ht,
@@ -2215,6 +2727,16 @@ pub struct BridgeState {
     /// refused before the bridge height). Part of the state root once used.
     #[serde(default, skip_serializing_if = "crate::operator_registry::OperatorRegistry::is_empty")]
     pub operators: crate::operator_registry::OperatorRegistry,
+    /// 2.11.13 bridge slim: set by [`Self::bridge_slim_convert`] at the
+    /// activation height. From then on stored ETH exec headers are compact
+    /// and BTC rails carry [`RailState::header_cap`]. Omitted while false, so
+    /// the commitment is unchanged before the activation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bridge_slim: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// One resolved V3 deposit. Mint credits an FPL account and writes no claim
@@ -2415,6 +2937,41 @@ impl BridgeState {
         }
     }
 
+    /// 2.11.13 bridge slim (D+E). CONSENSUS, called from the per-ledger hook
+    /// (pack, verify, commit) from the activation height on; a no-op once
+    /// [`Self::bridge_slim`] is set, so it runs exactly once per chain:
+    /// * E: every stored ETH exec header is compacted to (number, hash,
+    ///   parent, receipts_root, timestamp); later inserts compact after
+    ///   their RLP is verified.
+    /// * D: the superseded testnet3 rail (`btc`) keeps its newest
+    ///   [`SLIM_LEGACY_BTC_KEEP`] headers plus vault-pinned heights; every BTC
+    ///   rail gets the [`SLIM_HEADER_CAP`] cap.
+    ///
+    /// Returns whether it converted.
+    pub fn bridge_slim_convert(&mut self) -> bool {
+        if self.bridge_slim {
+            return false;
+        }
+        self.bridge_slim = true;
+        if self.eth_exec_headers.values().any(|h| !h.rlp_hex.is_empty()) {
+            for h in self.eth_exec_headers.make_mut().values_mut() {
+                crate::eth_exec::compact_exec_header(h);
+            }
+        }
+        for (name, r) in self.rails.iter_mut() {
+            if !r.is_btc() {
+                continue;
+            }
+            let keep = if name == RAIL_BTC {
+                SLIM_LEGACY_BTC_KEEP
+            } else {
+                SLIM_HEADER_CAP
+            };
+            r.slim_btc_headers(keep);
+        }
+        true
+    }
+
     /// One-off V1 close. `active` is `Node::eth_v3_at(height)`.
     ///
     /// Called from the same per-ledger hook as [`Self::prune_eth_exec_headers`]
@@ -2546,6 +3103,12 @@ impl BridgeState {
         if headers.is_empty() {
             return Err("no headers".into());
         }
+        // 2.11.13: the timestamp is derived from the verified RLP when a
+        // stored header is compacted. A submitted value is ignored, exactly
+        // as older nodes' parsers drop the unknown field.
+        for h in headers.iter_mut() {
+            h.timestamp = 0;
+        }
         for h in &headers {
             crate::eth_exec::verify_exec_header_rlp(h)?;
         }
@@ -2598,8 +3161,12 @@ impl BridgeState {
         if !ends_at_lc && !connects_up && !connects_down {
             return Err("headers neither reach LC head nor connect to stored chain".into());
         }
+        let slim = self.bridge_slim;
         let map = self.eth_exec_headers.make_mut();
-        for h in headers {
+        for mut h in headers {
+            if slim {
+                crate::eth_exec::compact_exec_header(&mut h);
+            }
             map.insert(h.number, h);
         }
         Ok(())
@@ -2649,7 +3216,10 @@ impl BridgeState {
                 "no execution header at {dep_n} — submit EthExecHeaders first"
             ));
         }
-        let dep_hdr = crate::eth_exec::verify_ancestry(&chain, &lc.execution_block_hash, dep_n)?;
+        // 2.11.13: compacted headers (RLP verified on insert) are checked by
+        // their stored links; identical to `verify_ancestry` before slim.
+        let dep_hdr =
+            crate::eth_exec::verify_ancestry_stored(&chain, &lc.execution_block_hash, dep_n)?;
         if !proof.block_hash.is_empty() && !crate::btc_spv::hex_eq(&proof.block_hash, &dep_hdr.hash)
         {
             return Err("block_hash mismatch".into());
@@ -2663,11 +3233,12 @@ impl BridgeState {
             &proof.merkle_path,
             &receipt,
         )?;
-        let head_rlp = chain
-            .last()
-            .map(|h| h.rlp_hex.as_str())
-            .unwrap_or("");
-        let lc_head_time = Self::eth_lc_head_unix_time(lc, head_rlp);
+        let lc_head_time = match chain.last() {
+            // 2.11.13 compact head: timestamp decoded from the verified RLP.
+            Some(h) if h.rlp_hex.is_empty() && h.timestamp != 0 => h.timestamp,
+            Some(h) => Self::eth_lc_head_unix_time(lc, &h.rlp_hex),
+            None => Self::eth_lc_head_unix_time(lc, ""),
+        };
         Ok((receipt, dep_number, lc_head_time))
     }
 
@@ -3044,6 +3615,7 @@ mod tests {
             parent_hash: hex::encode(parent),
             receipts_root: hex::encode(receipts),
             rlp_hex: hex::encode(&rlp),
+            timestamp: 0,
         }
     }
 
@@ -3147,7 +3719,7 @@ mod tests {
         });
         // commit many headers; height 1 must remain because of the UTXO
         for i in 1..300u64 {
-            r.headers.insert(
+            r.headers.make_mut().insert(
                 i,
                 RailHeader {
                     height: i,
@@ -3506,7 +4078,7 @@ mod tests {
         for h in 200..=205u64 {
             let mut hdr = RailHeader::fixture(h, format!("{h:064x}"), format!("{:064x}", h - 1), if h == 200 { root_display.clone() } else { "00".repeat(32) });
             hdr.raw = "00".repeat(80);
-            rail.headers.insert(h, hdr);
+            rail.headers.make_mut().insert(h, hdr);
         }
         rail.tip_height = 205;
         let ckpt_h = 127u64;
@@ -3721,5 +4293,173 @@ mod tests {
         }, &vkb, 200).is_err());
         // Claim not awaiting attest.
         assert!(run(&|f| f.rail.bitvm2_claims.get_mut(&f.note).unwrap().status = crate::bitvm2_exit::Bitvm2Status::Disproved, &vkb, 200).is_err());
+    }
+}
+
+#[cfg(test)]
+mod slim_tests {
+    //! 2.11.13 bridge slim (D: BTC rails) and the bounded-growth simulations.
+    use super::*;
+
+    /// 80-byte header hex with `time` at bytes 68..72 (all other bytes zero).
+    fn raw_at(time: u32) -> String {
+        let mut b = [0u8; 80];
+        b[68..72].copy_from_slice(&time.to_le_bytes());
+        hex::encode(b)
+    }
+
+    fn hdr(h: u64, time: u32) -> RailHeader {
+        let mut x = RailHeader::fixture(h, format!("{h:064x}"), format!("{:064x}", h.saturating_sub(1)), "00".repeat(32));
+        x.raw = raw_at(time);
+        x
+    }
+
+    fn rail_with(asset: &str, from: u64, to: u64) -> RailState {
+        let mut r = RailState::new(asset);
+        {
+            let m = r.headers.make_mut();
+            for h in from..=to {
+                m.insert(h, hdr(h, 1_000_000_000 + (h % 1_000_000) as u32 * 600));
+            }
+        }
+        r.tip_height = to;
+        r.tip_hash = format!("{to:064x}");
+        r
+    }
+
+    #[test]
+    fn legacy_rail_keeps_newest_plus_vault_pins_and_pending_withdrawals_survive() {
+        let mut b = BridgeState::with_genesis_rails();
+        let mut r = rail_with(RAIL_BTC, 5_127_316, 5_140_000);
+        // The live audit: three vault UTXOs pinned to old heights, one open
+        // dest-locked claim and two refunded BitVM2 claims (no header refs).
+        for (h, sats) in [(5_127_316u64, 100_000u64), (5_127_613, 180_385), (5_127_675, 88_985)] {
+            r.vault_utxos.push(crate::vault::VaultUtxo { txid: format!("{h:064x}"), vout: 0, sats, height: h });
+        }
+        r.withdrawals.insert("bac114a2e2edc941".into(), (50_000, "tb1qdest".into(), "dave".into()));
+        b.rails.insert(RAIL_BTC.into(), r);
+        let mut r4 = rail_with(RAIL_BTC4, 100_000, 107_852);
+        r4.btc_checkpoint = Some((100_000, format!("{:064x}", 100_000)));
+        b.rails.insert(RAIL_BTC4.into(), r4);
+        let before4 = serde_json::to_vec(&b.rails[RAIL_BTC4].headers).unwrap();
+        let mut c = b.clone();
+        assert!(b.bridge_slim_convert());
+        assert!(c.bridge_slim_convert());
+        assert_eq!(serde_json::to_vec(&b).unwrap(), serde_json::to_vec(&c).unwrap());
+        let r = &b.rails[RAIL_BTC];
+        assert_eq!(r.headers.len(), SLIM_LEGACY_BTC_KEEP + 3);
+        for h in [5_127_316u64, 5_127_613, 5_127_675, 5_140_000] {
+            assert!(r.headers.contains_key(&h), "{h} kept");
+        }
+        assert_eq!(*r.headers.keys().nth(3).unwrap(), 5_140_000 - SLIM_LEGACY_BTC_KEEP as u64 + 1);
+        assert_eq!(r.header_cap, SLIM_HEADER_CAP as u64);
+        assert_eq!(r.withdrawals.len(), 1, "withdrawals untouched");
+        assert_eq!(r.btc_header_floor(), 5_140_000 - SLIM_LEGACY_BTC_KEEP as u64 + 1);
+        // BTC4 (7,853 headers) is below the cap: unchanged headers, cap set.
+        assert_eq!(serde_json::to_vec(&b.rails[RAIL_BTC4].headers).unwrap(), before4);
+        assert_eq!(b.rails[RAIL_BTC4].header_cap, SLIM_HEADER_CAP as u64);
+        // Idempotent.
+        let once = serde_json::to_vec(&b).unwrap();
+        assert!(!b.bridge_slim_convert());
+        assert_eq!(serde_json::to_vec(&b).unwrap(), once);
+    }
+
+    #[test]
+    fn pre_activation_rail_bytes_unchanged() {
+        let r = rail_with(RAIL_BTC4, 1, 50);
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("header_cap").is_none());
+        let b = BridgeState::with_genesis_rails();
+        let v = serde_json::to_value(&b).unwrap();
+        assert!(v.get("bridge_slim").is_none());
+    }
+
+    /// Bounded growth, BTC: a difficulty-1 sprint (one header per second,
+    /// every header inside the 14-day window) used to stop only at
+    /// HEADER_HARD_CAP (500k, ~217 MB JSON). After slim it stops at
+    /// SLIM_HEADER_CAP plus vault pins.
+    #[test]
+    fn btc4_sprint_is_capped_after_slim() {
+        let mut r = RailState::new(RAIL_BTC4);
+        r.header_cap = SLIM_HEADER_CAP as u64;
+        r.vault_utxos.push(crate::vault::VaultUtxo { txid: "aa".repeat(32), vout: 0, sats: 1, height: 1 });
+        let mut max_len = 0;
+        // Prune every 512 inserts (the scan per prune is O(n) in debug).
+        for h in 1..=(SLIM_HEADER_CAP as u64 + 8_000) {
+            r.headers.make_mut().insert(h, hdr(h, 1_800_000_000 + h as u32));
+            r.tip_height = h;
+            if h % 512 == 0 {
+                r.prune_btc_headers();
+                max_len = max_len.max(r.headers.len());
+            }
+        }
+        r.prune_btc_headers();
+        assert_eq!(max_len, SLIM_HEADER_CAP);
+        assert_eq!(r.headers.len(), SLIM_HEADER_CAP);
+        assert!(r.headers.contains_key(&1), "vault pin survives");
+        let bytes = serde_json::to_vec(&r.headers).unwrap().len();
+        eprintln!("SIM btc4 sprint steady headers={} json_bytes={bytes}", r.headers.len());
+        // Normal 10-minute blocks: the 14-day window (~2,016) is under the
+        // HEADER_HISTORY floor, so the steady state is 16,384 headers.
+        let mut r = RailState::new(RAIL_BTC4);
+        r.header_cap = SLIM_HEADER_CAP as u64;
+        for h in 1..=(HEADER_HISTORY as u64 + 5_000) {
+            r.headers.make_mut().insert(h, hdr(h, 1_800_000_000 + h as u32 * 600));
+            r.tip_height = h;
+            if h % 512 == 0 {
+                r.prune_btc_headers();
+            }
+        }
+        r.prune_btc_headers();
+        assert_eq!(r.headers.len(), HEADER_HISTORY);
+        let bytes = serde_json::to_vec(&r.headers).unwrap().len();
+        eprintln!("SIM btc4 10min steady headers={} json_bytes={bytes}", r.headers.len());
+    }
+
+    /// Bounded growth, ETH: the LC head moves one block at a time for 1.5
+    /// windows; the compact map stays at WINDOW + 1 headers.
+    #[test]
+    fn eth_compact_window_is_bounded() {
+        let mut b = BridgeState::with_genesis_rails();
+        b.bridge_slim = true;
+        b.eth_lc = Some(crate::eth_lc::EthLcState {
+            genesis_validators_root: String::new(),
+            finalized_slot: 0,
+            finalized_beacon_root: String::new(),
+            execution_block_hash: String::new(),
+            execution_number: 0,
+            receipts_root: String::new(),
+            period: 0,
+            current_agg_pk: String::new(),
+            current_pks: vec![],
+            next_agg_pk: String::new(),
+            next_pks: vec![],
+        });
+        let total = ETH_EXEC_HEADER_WINDOW + ETH_EXEC_HEADER_WINDOW / 2;
+        let start = 12_000_000u64;
+        let mut max_len = 0usize;
+        for i in 0..total {
+            let n = start + i;
+            b.eth_exec_headers.make_mut().insert(
+                n,
+                crate::eth_exec::EthExecHeader {
+                    number: n,
+                    hash: format!("{:064x}", n + 1),
+                    parent_hash: format!("{n:064x}"),
+                    receipts_root: format!("{:064x}", n * 7),
+                    rlp_hex: String::new(),
+                    timestamp: 1_790_000_000 + i * 12,
+                },
+            );
+            b.eth_lc.as_mut().unwrap().execution_number = n;
+            if i % 64 == 0 || i + 1 == total {
+                b.prune_eth_exec_headers(true);
+                max_len = max_len.max(b.eth_exec_headers.len());
+            }
+        }
+        assert_eq!(b.eth_exec_headers.len() as u64, ETH_EXEC_HEADER_WINDOW + 1);
+        assert!(max_len as u64 <= ETH_EXEC_HEADER_WINDOW + 65);
+        let bytes = serde_json::to_vec(&b.eth_exec_headers).unwrap().len();
+        eprintln!("SIM eth compact steady headers={} json_bytes={bytes}", b.eth_exec_headers.len());
     }
 }

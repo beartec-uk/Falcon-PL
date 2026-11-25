@@ -103,6 +103,114 @@ impl Node {
     /// Rounds of vote history retained per open height.
     pub const ROUND_HISTORY: usize = 32;
 
+    /// 2.11.13 (f): the redraw is entered at this round: one full rotation
+    /// of the base committee (6 view-changes) has produced nothing.
+    pub const REDRAW_AFTER_ROUNDS: u64 = 6;
+    /// 2.11.13 (f): rounds past the redraw entry a committed block's
+    /// `current_committee` is matched against (catch-up / lagging commit).
+    pub const REDRAW_SEARCH_ROUNDS: u64 = 48;
+
+    /// 2.11.13 (f) CONSENSUS (gated by `redraw_from_height`): the redraw
+    /// can apply at `height` (round-scoped, committee-sized heights only).
+    pub fn redraw_active_at(&self, height: u64) -> bool {
+        height >= self.redraw_from_height
+            && self.cfg.committee_size > 0
+            && self.vote_rounds_at(height)
+    }
+
+    /// `round` at the open `height` is a redraw round.
+    pub fn in_redraw_round(&self, height: u64, round: u64) -> bool {
+        round >= Self::REDRAW_AFTER_ROUNDS
+            && round != Self::RECERT_ROUND
+            && self.redraw_active_at(height)
+    }
+
+    /// A ViewChange for `round` at `height` would move this seat from the
+    /// base committee into the redraw: needs the bonded-set quorum.
+    pub fn is_redraw_entry(&self, height: u64, round: u64) -> bool {
+        self.vote_rounds_at(height)
+            && self.in_redraw_round(height, round)
+            && self.height_view_round < Self::REDRAW_AFTER_ROUNDS
+    }
+
+    /// Bonded-set quorum for entering the redraw: more than 2/3 of bonded
+    /// seats (7 of 10). Seats that signed an OK at the height do not vote
+    /// it, so it can never coexist with a 4-of-6 commit in a base round
+    /// (7 + 4 > 10).
+    pub fn redraw_quorum(&self) -> usize {
+        let n = self.bonded_ids().len();
+        n.saturating_mul(2) / 3 + 1
+    }
+
+    /// The redrawn committee for `round` at the open height. Deterministic
+    /// from the tip: seats outside the base committee first, then base seats,
+    /// each ordered by `sha256(seed|id)`, truncated to `committee_size`. The
+    /// seed changes every `committee_size` rounds so a redraw that also
+    /// stalls is redrawn again.
+    pub fn redraw_committee(&self, round: u64) -> Vec<String> {
+        let height = self.tip_height.saturating_add(1);
+        let base = self.base_lottery_order();
+        let size = self.cfg.committee_size.max(1);
+        let epoch = round.saturating_sub(Self::REDRAW_AFTER_ROUNDS) / size as u64;
+        let seed = crate::sha256_hex(
+            format!(
+                "redraw|v1|{}|{}|{}|{}",
+                self.cfg.network_id, height, self.tip_hash, epoch
+            )
+            .as_bytes(),
+        );
+        let key = |id: &String| crate::sha256_hex(format!("{seed}|{id}").as_bytes());
+        let base_set: BTreeSet<&String> = base.iter().collect();
+        let mut outside: Vec<String> = self
+            .bonded_ids()
+            .into_iter()
+            .filter(|id| !base_set.contains(id))
+            .collect();
+        let mut inside: Vec<String> = base.clone();
+        outside.sort_by_key(key);
+        inside.sort_by_key(key);
+        outside.extend(inside);
+        outside.truncate(size);
+        outside
+    }
+
+    /// A block whose `current_committee` is a redraw committee for some
+    /// round of the bounded search window (catch-up, or a seat that saw the
+    /// commit QC before the round). Live staging is still pinned to this
+    /// seat's own round by `validate_proposal_seats`; the commit still needs
+    /// 4 of that committee's signatures in the cert.
+    pub(crate) fn redraw_committee_claim_ok(&self, ledger: &Ledger) -> bool {
+        if !self.redraw_active_at(ledger.height)
+            || ledger.height != self.tip_height.saturating_add(1)
+            || !ledger.current_committee.iter().any(|id| id == &ledger.packer)
+        {
+            return false;
+        }
+        let size = self.cfg.committee_size.max(1) as u64;
+        let first = Self::REDRAW_AFTER_ROUNDS;
+        let last = first.saturating_add(Self::REDRAW_SEARCH_ROUNDS);
+        let mut r = first;
+        while r < last {
+            if self.redraw_committee(r) == ledger.current_committee {
+                return true;
+            }
+            r = r.saturating_add(size);
+        }
+        false
+    }
+
+    /// This seat signed an OK at `height` in a pre-redraw round.
+    pub fn signed_ok_before_redraw(&self, height: u64) -> bool {
+        self.round_votes
+            .get(&height)
+            .map(|m| {
+                m.iter().any(|(r, v)| {
+                    *r < Self::REDRAW_AFTER_ROUNDS && v.contains_key(&self.id)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Round-scoped votes (v2.10.0) are active at `height`: at/after
     /// `vote_rounds_from_height` and outside the pause window (v2.9.48).
     pub fn vote_rounds_at(&self, height: u64) -> bool {
@@ -410,6 +518,10 @@ impl Node {
         if height <= self.tip_height {
             return Err(format!("h={height} already committed"));
         }
+        // 2.11.13 (f): after voting the redraw, never OK a base round here.
+        if self.redraw_vc_cast_at == height && round < Self::REDRAW_AFTER_ROUNDS {
+            return Err(format!("voted committee redraw at h={height}"));
+        }
         if let Some((h, _)) = self
             .round_votes
             .get(&height)
@@ -510,7 +622,14 @@ impl Node {
         if self.schedule_height != height {
             self.freeze_open_height_schedule();
         }
-        let qc = self.qc_voters();
+        // 2.11.13 (f): entering the redraw counts every bonded seat and
+        // needs the bonded-set quorum, not 4 of the (stalled) committee.
+        let entry = self.is_redraw_entry(height, round);
+        let (qc, need) = if entry {
+            (self.bonded_ids().into_iter().collect::<Vec<_>>(), self.redraw_quorum())
+        } else {
+            (self.qc_voters(), self.commit_votes_needed())
+        };
         let voters = self
             .view_change_votes
             .entry(height)
@@ -522,7 +641,7 @@ impl Node {
             .iter()
             .filter(|id| qc.is_empty() || qc.iter().any(|c| c == *id))
             .count();
-        if n >= self.commit_votes_needed() {
+        if n >= need {
             self.apply_round_advance(height, round);
             return (true, fresh);
         }
@@ -561,7 +680,12 @@ impl Node {
     /// QC for (`height`, `round`). Only a full quorum is kept; a partial set
     /// is never evidence.
     fn capture_applied_round_qc(&mut self, height: u64, round: u64) {
-        let qc = self.qc_voters();
+        let entry = self.is_redraw_entry(height, round);
+        let (qc, need) = if entry {
+            (self.bonded_ids().into_iter().collect::<Vec<_>>(), self.redraw_quorum())
+        } else {
+            (self.qc_voters(), self.commit_votes_needed())
+        };
         let votes: BTreeMap<String, String> = self
             .vc_vote_sigs
             .get(&height)
@@ -573,7 +697,7 @@ impl Node {
                     .collect()
             })
             .unwrap_or_default();
-        if votes.len() >= self.commit_votes_needed() {
+        if votes.len() >= need {
             self.applied_round_qc = Some(AppliedRoundQc {
                 height,
                 tip_hash: self.tip_hash.clone(),
@@ -714,11 +838,13 @@ impl Node {
             return;
         }
         let prev = self.height_view_round;
-        self.height_view_round = round;
         // 2.11.4 (h=891419): keep the signed votes that formed this QC before
         // the per-round tallies are dropped, so a seat that missed them can
-        // still be shown the QC (see `stalled_round_regossip`).
+        // still be shown the QC (see `stalled_round_regossip`). Captured
+        // before the round moves so a redraw-entry QC is read with the
+        // bonded-set rule (2.11.13).
         self.capture_applied_round_qc(height, round);
+        self.height_view_round = round;
         if let Some(m) = self.view_change_votes.get_mut(&height) {
             m.retain(|r, _| *r > round);
         }
@@ -913,15 +1039,60 @@ impl Node {
             .as_ref()
             .map(|p| p.height == height)
             .unwrap_or(false);
+        let self_pass = self.packer_should_self_pass(height);
+        let r = self.height_view_round;
+        // Follow is work: the packer already signed that this round cannot
+        // pack. Followers often have an empty local pool (the missing heads
+        // sit on other entry seats) and must still vote the existing VC path
+        // without waiting the silence timeout.
+        let follow = self.following_packer_self_pass(height, r.saturating_add(1));
+        // 2.11.17: the proposer is provably behind (fresh tip ad). Liveness
+        // timing only; the vote below is the same signed ViewChange.
+        let lag_fast = self.lagging_leader_fast_vc(height);
         let work = pending_here
             || self.network_has_pack_work()
             || self.mempool_poisoned()
-            || !self.open_bodies.is_empty();
+            || !self.open_bodies.is_empty()
+            || self_pass
+            || follow;
         if !work {
             // Load-driven chain: no txs ⇒ no round clock, no cursor walk.
             return None;
         }
-        let r = self.height_view_round;
+        // 2.11.13 (f) CONSENSUS (gated): the base committee has had the time
+        // of a full rotation of view-changes and the height is still open.
+        // Any bonded seat that has not signed an OK at this height votes to
+        // enter the redraw round (bonded-set quorum).
+        if self.redraw_active_at(height) && r < Self::REDRAW_AFTER_ROUNDS {
+            let start = self.height_open_ms.max(self.work_seen_since_ms);
+            let stalled = self.now_ms.saturating_sub(start);
+            let after = self
+                .proposal_timeout_ms()
+                .saturating_mul(Self::REDRAW_AFTER_ROUNDS);
+            let me = self.id.clone();
+            if stalled >= after
+                && self.bonded_ids().contains(&me)
+                && !self.signed_ok_before_redraw(height)
+            {
+                let target = Self::REDRAW_AFTER_ROUNDS;
+                let already = self
+                    .view_change_votes
+                    .get(&height)
+                    .and_then(|m| m.get(&target))
+                    .map(|s| s.contains(&me))
+                    .unwrap_or(false);
+                let interval = self.cfg.progress_timeout_ms.max(1_000);
+                if already && self.now_ms.saturating_sub(self.last_view_change_vote_ms) < interval {
+                    return None;
+                }
+                self.redraw_vc_cast_at = height;
+                let tip = self.tip_hash.clone();
+                let sig = self.sign_vc_vote(height, &tip, target);
+                self.last_view_change_vote_ms = self.now_ms;
+                let _ = self.vote_view_change_ex(height, &tip, target, &me, &sig);
+                return Some((height, tip, target));
+            }
+        }
         let split = self.round_split_dead(height, r);
         if split && self.stall.is_none() {
             self.stall = Some(ConsensusStall::SplitVote { height, round: r });
@@ -933,9 +1104,13 @@ impl Node {
         } else {
             self.round_silence_timeout_ms(r)
         };
-        if !split && elapsed < timeout {
+        // 2.11.12: packer self-pass (or a follower seeing that signed VC)
+        // skips the silence timeout. 4-of-6 is unchanged. A 2.11.11 peer
+        // never sets `follow` and still waits the full silence window.
+        if !split && !self_pass && !follow && !lag_fast && elapsed < timeout {
             return None;
         }
+        let fast_only = lag_fast && !split && !self_pass && !follow && elapsed < timeout;
         let target = r.saturating_add(1);
         let me = self.id.clone();
         // Only committee seats vote rounds; others follow the QC.
@@ -956,8 +1131,71 @@ impl Node {
         let tip = self.tip_hash.clone();
         let sig = self.sign_vc_vote(height, &tip, target);
         self.last_view_change_vote_ms = self.now_ms;
+        self.last_vc_fast = fast_only;
+        if fast_only {
+            self.fast_vc_votes = self.fast_vc_votes.saturating_add(1);
+        }
         let _ = self.vote_view_change_ex(height, &tip, target, &me, &sig);
         Some((height, tip, target))
+    }
+
+    /// 2.11.17: may this seat vote the open round forward early because the
+    /// round proposer is behind? Liveness timing only. True only when all hold:
+    /// - the knob is on (`lagging_leader_vc_ms > 0`) and the height is round-scoped;
+    /// - this seat is not itself behind a peer (`!still_lagging()`);
+    /// - no body is staged or cached for the height (a proposal in flight
+    ///   keeps the normal round timeout);
+    /// - the proposer is another seat, pong-fresh (an offline seat keeps the
+    ///   existing unavailable timeout), and its latest tip ad arrived after
+    ///   this round opened;
+    /// - that ad is >= 2 behind our tip and `lagging_leader_vc_ms` has passed,
+    ///   or it is 1 behind, arrived >= `lagging_leader_vc_ms` into the round,
+    ///   and 3 x `lagging_leader_vc_ms` has passed.
+    /// A newer ad at our tip clears it. The 4-of-6 quorum still decides.
+    pub fn lagging_leader_fast_vc(&self, height: u64) -> bool {
+        let g = self.lagging_leader_vc_ms;
+        if g == 0 || !self.vote_rounds_at(height) || height != self.tip_height.saturating_add(1) {
+            return false;
+        }
+        if self.still_lagging() {
+            return false;
+        }
+        let pending_here = self
+            .pending_proposal
+            .as_ref()
+            .map(|p| p.height == height)
+            .unwrap_or(false);
+        if pending_here || self.open_bodies.values().any(|b| b.height == height) {
+            return false;
+        }
+        let Some(proposer) = self.round_proposer(self.height_view_round) else {
+            return false;
+        };
+        if proposer == self.id {
+            return false;
+        }
+        let Some(v) = self.validators.get(&proposer) else {
+            return false;
+        };
+        if !v.pong_fresh(self.now_ms, self.cfg.pong_window_ms) {
+            return false;
+        }
+        let Some(t) = v.last_advertised_tip else {
+            return false;
+        };
+        let ad_ms = self.tip_ad_at_ms.get(&proposer).copied().unwrap_or(0);
+        let start = self.round_open_ms.max(self.height_open_ms);
+        if ad_ms < start || start == 0 {
+            return false;
+        }
+        let elapsed = self.now_ms.saturating_sub(start);
+        if t.saturating_add(2) <= self.tip_height {
+            return elapsed >= g;
+        }
+        if t < self.tip_height {
+            return ad_ms.saturating_sub(start) >= g && elapsed >= g.saturating_mul(3);
+        }
+        false
     }
 
     // ------------------------------------------------------------------

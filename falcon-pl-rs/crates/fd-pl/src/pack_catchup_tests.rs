@@ -637,6 +637,7 @@ fn exec_hdr(i: u64) -> crate::eth_exec::EthExecHeader {
         parent_hash: format!("{:064x}", i),
         receipts_root: "00".repeat(32),
         rlp_hex: "f9".repeat(300),
+        timestamp: 0,
     }
 }
 
