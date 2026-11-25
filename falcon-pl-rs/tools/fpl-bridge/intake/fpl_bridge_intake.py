@@ -928,6 +928,94 @@ def step(r):
     return False
 
 
+# ---- BTC4 rail-lag alert (item 5; built on the #48 outbox) ----
+# Discord alert when the FPL BTC4 header rail is more than RAIL_LAG_BLOCKS behind
+# the Testnet4 tip for RAIL_LAG_SECS. One alert per episode (re-alert every
+# STALL_REALERT_SECS while it lasts), one "caught up" line when it clears.
+# Unknown readings (ctl or esplora down) neither start nor clear an episode.
+RAIL_LAG_ASSET = E("FPL_RAIL_LAG_ASSET", "BTC4")
+RAIL_LAG_BLOCKS = _env_int("FPL_RAIL_LAG_BLOCKS", 6)        # 0 disables
+RAIL_LAG_SECS = _env_int("FPL_RAIL_LAG_SECS", 30 * 60)
+RAIL_LAG_CHECK_SECS = _env_int("FPL_RAIL_LAG_CHECK_SECS", 60)
+
+
+def rail_tip_height(asset=RAIL_LAG_ASSET):
+    """FPL rail tip from `falcon-pl-ctl status`, or None."""
+    st = falcon_ctl_status()
+    root = st.get("body") if isinstance(st.get("body"), dict) else st
+    for rail in (root or {}).get("rails") or []:
+        if isinstance(rail, dict) and rail.get("asset") == asset:
+            try:
+                return int(rail["tip_height"])
+            except (KeyError, TypeError, ValueError):
+                return None
+    return None
+
+
+def btc_tip_height():
+    """Testnet4 tip from esplora, or None."""
+    try:
+        return int(esplora("blocks/tip/height"))
+    except Exception:
+        return None
+
+
+class RailLagWatch:
+    def __init__(self, rail_tip=None, btc_tip=None, clock=None, post=None,
+                 blocks=None, secs=None, realert=None, check_every=None):
+        self.rail_tip = rail_tip or rail_tip_height
+        self.btc_tip = btc_tip or btc_tip_height
+        self.clock = clock or time.time
+        self._post = post  # default resolved at send time (OUTBOX)
+        self.blocks = RAIL_LAG_BLOCKS if blocks is None else blocks
+        self.secs = RAIL_LAG_SECS if secs is None else secs
+        self.realert = STALL_REALERT_SECS if realert is None else realert
+        self.check_every = RAIL_LAG_CHECK_SECS if check_every is None else check_every
+        self.since = None          # first time the lag was seen over the limit
+        self.alerted_at = None     # last alert time in this episode
+        self.last_check = None
+
+    def post(self, line):
+        (self._post or OUTBOX.put)(line)
+
+    def check(self, force=False):
+        """Returns the alert/recovery line it posted, or None."""
+        if self.blocks <= 0:
+            return None
+        now = self.clock()
+        if not force and self.last_check is not None and now - self.last_check < self.check_every:
+            return None
+        self.last_check = now
+        rail, btc = self.rail_tip(), self.btc_tip()
+        if rail is None or btc is None:
+            return None
+        lag = btc - rail
+        if lag <= self.blocks:
+            line = None
+            if self.alerted_at is not None:
+                line = f"✅ {RAIL_LAG_ASSET} header rail caught up: {rail} (Testnet4 {btc})."
+                log("ALERT rail_lag_clear", RAIL_LAG_ASSET, line)
+                self.post(line)
+            self.since = self.alerted_at = None
+            return line
+        if self.since is None:
+            self.since = now
+            log("rail lag", RAIL_LAG_ASSET, f"rail={rail} testnet4={btc} lag={lag}; watching")
+        if now - self.since < self.secs:
+            return None
+        if self.alerted_at is not None and now - self.alerted_at < self.realert:
+            return None
+        self.alerted_at = now
+        line = (f"⚠️ {RAIL_LAG_ASSET} header rail is {lag} blocks behind Testnet4 "
+                f"(rail {rail}, Testnet4 {btc}) for {human_age(now - self.since)}. Check the header submitter.")
+        log("ALERT rail_lag", RAIL_LAG_ASSET, line)
+        self.post(line)
+        return line
+
+
+RAIL_LAG = RailLagWatch()
+
+
 def worker_pass(now=None):
     """One pass over live requests: supervision (liveness, timeouts) then the normal step.
     Each request is re-read under LOCK so an HTTP handler's concurrent change is never
@@ -958,6 +1046,10 @@ def worker_pass(now=None):
 def worker():
     while True:
         worker_pass()
+        try:
+            RAIL_LAG.check()
+        except Exception as e:  # never let the lag watch stop the intake loop
+            log("rail lag check failed:", type(e).__name__)
         time.sleep(15)
 
 
