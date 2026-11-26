@@ -41,6 +41,6 @@ events_path = "/var/lib/fpl-gateway/billing-events.jsonl"
 
 [market_data]
 enabled = false
-url = "http://100.96.215.37:8787"
+url = "http://100.96.215.37:9478"
 token_env = "FPL_GATEWAY_MARKET_TOKEN"
 timeout_ms = 5000

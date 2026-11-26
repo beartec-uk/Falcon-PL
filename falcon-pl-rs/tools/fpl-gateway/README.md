@@ -65,7 +65,7 @@ Cloud users get tip height, version, and a slim rails summary only.
 ```toml
 [market_data]
 enabled = true
-url = "http://100.96.215.37:8787"
+url = "http://100.96.215.37:9478"
 token_env = "FPL_GATEWAY_MARKET_TOKEN"
 timeout_ms = 5000
 ```
