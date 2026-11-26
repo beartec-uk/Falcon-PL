@@ -168,7 +168,12 @@ def acct(c, w):
 
 
 def top(ob):
-    """(best_bid, best_ask) raw ints, or a reason string if the book is unusable."""
+    """(best_bid, best_ask) raw ints, or a reason string if the book is unusable.
+
+    Either side may be None on a one-sided book. The taker can still sell into
+    bids when there are no asks, or buy asks when there are no bids. A missing
+    side used to idle the ETH taker for hours after makers ran out of inventory.
+    """
     if not isinstance(ob, dict):
         return "malformed"
     bids, asks = ob.get("bids"), ob.get("asks")
@@ -176,16 +181,12 @@ def top(ob):
         return "malformed"
     if not bids and not asks:
         return "empty book"
-    if not asks:
-        return "no asks"
-    if not bids:
-        return "no bids"
     try:
-        bid = max(price_raw_from_obj(b) for b in bids)
-        ask = min(price_raw_from_obj(a) for a in asks)
+        bid = max(price_raw_from_obj(b) for b in bids) if bids else None
+        ask = min(price_raw_from_obj(a) for a in asks) if asks else None
     except Exception:
         return "malformed"
-    if bid <= 0 or ask <= 0:
+    if (bid is not None and bid <= 0) or (ask is not None and ask <= 0):
         return "malformed"
     return bid, ask
 
@@ -199,23 +200,40 @@ def ref_price(c, now):
 
 
 def decide(c, bid, ask, now, bal, rnd):
-    """Pick (side, px, amt, mid, ref) or None. bal=(fpl, base_raw)."""
+    """Pick (side, px, amt, mid, ref) or None. bal=(fpl, base_raw).
+
+    bid or ask may be None when the book is one-sided. In that case the only
+    tradeable side is used (sell into bids, or buy the asks).
+    """
+    if bid is None and ask is None:
+        return None
     base_raw = Decimal(resolve_base_raw(c))
     fpl_raw = Decimal(int(c.get("FPL_RAW_PER_FPL", "1")))
     fee_buf = int(c.get("FEE_BUFFER_FPL", "100"))
     ref = ref_price(c, now)
-    mid = (Decimal(int(bid)) + Decimal(int(ask))) / Decimal(2)
-    bias = Decimal(str(c["BIAS"]))
-    pbuy = float(bias if mid < ref else (Decimal(1) - bias))
-    side = "buy" if rnd.random() < pbuy else "sell"
+    if bid is not None and ask is not None:
+        mid = (Decimal(int(bid)) + Decimal(int(ask))) / Decimal(2)
+        bias = Decimal(str(c["BIAS"]))
+        pbuy = float(bias if mid < ref else (Decimal(1) - bias))
+        side = "buy" if rnd.random() < pbuy else "sell"
+    elif ask is not None:
+        mid = Decimal(int(ask))
+        side = "buy"
+    else:
+        mid = Decimal(int(bid))
+        side = "sell"
     q = Decimal(str(rnd.uniform(float(c["QUOTE_MIN_FPL"]), float(c["QUOTE_MAX_FPL"]))))
     walk = Decimal(1) + Decimal(str(c["CROSS_BPS"])) / Decimal(10000)
 
     def calc(s):
         if s == "buy":
+            if ask is None:
+                return 0, 0
             px_dec = Decimal(int(ask)) * walk
             px_int = int((px_dec * fpl_raw).to_integral_value(rounding=ROUND_HALF_UP))
         else:
+            if bid is None:
+                return 0, 0
             px_dec = Decimal(int(bid)) / walk
             px_int = int((px_dec * fpl_raw).to_integral_value(rounding=ROUND_DOWN))
         if px_int <= 0:

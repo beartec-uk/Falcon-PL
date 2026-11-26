@@ -74,8 +74,56 @@ class TestPairGenericDecimal(unittest.TestCase):
             mmtaker.top({"bids": [{"price": {"raw": "4180000"}}], "asks": [{"price": {"raw": "4200000"}}]}),
             (4180000, 4200000),
         )
-        self.assertEqual(mmtaker.top({"bids": [], "asks": [{"price": 85}]}), "no bids")
-        self.assertEqual(mmtaker.top({"bids": [{"price": 80}], "asks": []}), "no asks")
+        self.assertEqual(mmtaker.top({"bids": [], "asks": [{"price": 85}]}), (None, 85))
+        self.assertEqual(mmtaker.top({"bids": [{"price": 80}], "asks": []}), (80, None))
+        self.assertEqual(mmtaker.top({"bids": [], "asks": []}), "empty book")
+
+    def _taker_cfg(self):
+        return {
+            "PAIR": "ETH-FPL",
+            "BASE_ASSET": "ETH",
+            "BASE_DECIMALS": "18",
+            "FPL_RAW_PER_FPL": "1",
+            "BAND_LO": "48000",
+            "BAND_HI": "52000",
+            "PERIOD_S": "21600",
+            "BIAS": "0.5",
+            "QUOTE_MIN_FPL": "500",
+            "QUOTE_MAX_FPL": "500",
+            "CROSS_BPS": "15",
+            "FEE_BUFFER_FPL": "50",
+        }
+
+    def test_mmtaker_sells_into_bids_when_there_are_no_asks(self):
+        # Enough ETH to sell; FPL is irrelevant for the sell path.
+        bal = (50, 10 ** 18)
+        res = mmtaker.decide(self._taker_cfg(), 49500, None, 0, bal, random.Random(1))
+        self.assertIsNotNone(res)
+        side, px, amt, mid, ref = res
+        self.assertEqual(side, "sell")
+        self.assertEqual(mid, Decimal(49500))
+        self.assertGreater(amt, 10 ** 15)
+        # CROSS_BPS 15: sell price is bid / 1.0015, rounded down
+        self.assertLess(px, 49500)
+        self.assertGreater(px, 49400)
+
+    def test_mmtaker_buys_asks_when_there_are_no_bids(self):
+        bal = (10000, 0)
+        res = mmtaker.decide(self._taker_cfg(), None, 50500, 0, bal, random.Random(1))
+        self.assertIsNotNone(res)
+        side, px, amt, mid, ref = res
+        self.assertEqual(side, "buy")
+        self.assertEqual(mid, Decimal(50500))
+        self.assertGreater(amt, 10 ** 15)
+        self.assertGreater(px, 50500)
+
+    def test_mmtaker_skips_one_sided_book_without_inventory_for_that_side(self):
+        # No ETH to sell into bids, and no asks to buy.
+        res = mmtaker.decide(self._taker_cfg(), 49500, None, 0, (10000, 0), random.Random(1))
+        self.assertIsNone(res)
+        # No FPL to buy asks, and no bids to sell.
+        res = mmtaker.decide(self._taker_cfg(), None, 50500, 0, (0, 10 ** 18), random.Random(1))
+        self.assertIsNone(res)
 
     def test_mm_tick_reads_via_cloud_rpc_and_writes_via_ctl(self):
         cfg = {
