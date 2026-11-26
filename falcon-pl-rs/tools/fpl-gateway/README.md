@@ -32,12 +32,15 @@ One read = 1 unit; `fpl_submitTx` = 5 units. Quotas reset on the 1st of each mon
 
 | Method | Node message | Params |
 |---|---|---|
-| `fpl_status` | `status_req` (always `brief`, never accounts) | none |
+| `fpl_status` | `status_req` then slimmed (tip, version, rails only; never the account or AMM dump) | none |
 | `fpl_health` | `health_req` | `warnings` (max 64) |
 | `fpl_getAccount` | `account_query` | `account` |
 | `fpl_orderBook` | `order_book_query` | `pair`, `levels` (max 200) |
 | `fpl_openOrders` | `open_orders_query` | `account` |
-| `fpl_fills` | `fills_query` | `pair?`, `account?`, `limit` (max 200) |
+| `fpl_fills` | fills-store when `[market_data]` is on, else the node ring | `pair?`, `account?`, `from?`, `to?`, `cursor?`, `limit` (max 500 on the store, 200 on the node) |
+| `fpl_pairs` | fills-store | none |
+| `fpl_ticker` | fills-store 24h stats (observer time) | `pair?` |
+| `fpl_candles` | fills-store (observer time, not verified UTC) | `pair`, `interval` (`1m`/`5m`/`15m`/`1h`/`4h`/`1d`), `from?`, `to?`, `limit` (max 500) |
 | `fpl_submitTx` | `submit_tx` | `tx` (signed tx object) |
 
 Nothing else is reachable: no admin (`WireMsg::is_admin`), mesh, snapshot or ctl
@@ -45,8 +48,27 @@ messages. Params can't set `type`. Errors: -32001 auth, -32005 rate/quota (HTTP 
 `Retry-After`), -32601 method not allowed, -32602 params, -32002 node unavailable (502).
 
 Other routes: `GET /v1/health` (gateway + node probe, no key), `GET /v1/tiers`,
-`GET /v1/usage` (caller's own month-to-date usage), `GET /metrics` on the metrics
+`GET /v1/usage` (caller's own month-to-date usage), `POST /v1/stream/session`
+(short-lived SSE ticket), `GET /v1/stream?channels=book:BTC4-FPL,trades:BTC4-FPL,ticker:BTC4-FPL`
+(SSE; send the API key or a ticket), `GET /metrics` on the metrics
 listener, `POST /v1/billing/stripe/webhook` (stub; 404 unless enabled).
+
+Streaming is charged at 1 unit to open and 1 unit per minute while open.
+Free keys may hold 2 concurrent streams (Builder 4, Scale 8).
+Candle and 24h times are **observer** arrival, not verified trade time.
+
+`fpl_status` is forced `brief` at the node and then trimmed in the gateway so
+Cloud users get tip height, version, and a slim rails summary only.
+
+[market_data] (off by default) points at the fills-store API on beartec-brain:
+
+```toml
+[market_data]
+enabled = true
+url = "http://100.96.215.37:9478"
+token_env = "FPL_GATEWAY_MARKET_TOKEN"
+timeout_ms = 5000
+```
 
 ## Abuse limits (`[abuse]`, all optional)
 Unauthenticated surfaces are capped so they can't be used to hammer the node:
@@ -87,7 +109,7 @@ Self-serve keys bought via Stripe are minted by the Falcon Cloud portal
 ```toml
 [portal]
 enabled = true
-url = "https://www.beartec.uk/api/falcon-cloud/internal/keys"
+url = "https://falcon-fpl.com/api/falcon-cloud/internal/keys"
 token_env = "FPL_GATEWAY_PORTAL_TOKEN"   # env var NAME; value = portal's FALCON_CLOUD_EXPORT_TOKEN
 interval_secs = 60
 timeout_ms = 5000

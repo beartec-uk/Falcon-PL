@@ -38,3 +38,9 @@ tolerance_secs = 300
 events_path = "/var/lib/fpl-gateway/billing-events.jsonl"
 
 [billing.price_tiers]
+
+[market_data]
+enabled = false
+url = "http://100.96.215.37:9478"
+token_env = "FPL_GATEWAY_MARKET_TOKEN"
+timeout_ms = 5000

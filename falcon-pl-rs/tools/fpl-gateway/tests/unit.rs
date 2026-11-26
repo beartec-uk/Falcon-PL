@@ -225,6 +225,10 @@ fn client_buckets_are_per_client_and_bounded() {
 #[test]
 fn every_method_declares_reply_types() {
     for m in fpl_gateway::allowlist::METHODS {
+        if m.market {
+            assert!(m.reply_types.contains(&"market"), "{}", m.name);
+            continue;
+        }
         assert!(!m.reply_types.is_empty(), "{}", m.name);
         for t in m.reply_types {
             assert!(fpl_gateway::upstream::REPLY_TYPES.contains(t), "{} reply {t} not terminal", m.name);

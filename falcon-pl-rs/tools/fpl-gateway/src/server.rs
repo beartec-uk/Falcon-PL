@@ -6,14 +6,19 @@
 //!   GET  /v1/health                    gateway + upstream liveness (no key)
 //!   GET  /v1/tiers                     published tier table (no key)
 //!   POST /v1/billing/stripe/webhook    stub, 404 unless [billing].enabled
+//!   POST /v1/stream/session            short-lived SSE ticket (API key required)
+//!   GET  /v1/stream                    SSE book/trades/ticker (API key or ticket)
 //! Metrics listener (loopback): GET /metrics
 
 use crate::allowlist::{self, BuildErr};
 use crate::auth::{self, KeyStore};
 use crate::billing;
+use crate::brief;
 use crate::config::{Config, Tier};
 use crate::limits::{now_unix, ClientBuckets, Deny, Limiter, SharedBucket};
+use crate::market::{self, MarketClient, MarketErr};
 use crate::metrics::Metrics;
+use crate::stream::{self, StreamGuards, StreamTickets};
 use crate::upstream;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
@@ -40,10 +45,24 @@ pub struct AppState {
     /// Missing/invalid API key: per-client and gateway-wide buckets.
     pub unauth_ip: ClientBuckets,
     pub unauth_global: SharedBucket,
+    pub market: Option<MarketClient>,
+    pub tickets: StreamTickets,
+    pub streams: StreamGuards,
 }
 
 impl AppState {
     pub fn new(cfg: Config, keys: KeyStore, limiter: Limiter) -> Arc<Self> {
+        let market = match MarketClient::from_config(&cfg.market_data) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("market data client not started: {e}");
+                None
+            }
+        };
+        Self::build(cfg, keys, limiter, market)
+    }
+
+    pub fn build(cfg: Config, keys: KeyStore, limiter: Limiter, market: Option<MarketClient>) -> Arc<Self> {
         let slots = cfg.max_upstream_concurrency;
         let a = cfg.abuse.clone();
         let now = Instant::now();
@@ -58,6 +77,9 @@ impl AppState {
             health_cache: parking_lot::Mutex::new(None),
             unauth_ip: ClientBuckets::new(a.unauth_ip_rps, a.unauth_ip_burst, a.max_tracked_ips),
             unauth_global: SharedBucket::new(a.unauth_global_rps, a.unauth_global_burst, now),
+            market,
+            tickets: StreamTickets::default(),
+            streams: StreamGuards::default(),
         })
     }
 }
@@ -72,6 +94,8 @@ pub fn router(st: Arc<AppState>) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/tiers", get(tiers))
         .route("/v1/billing/stripe/webhook", post(stripe_webhook))
+        .route("/v1/stream/session", post(stream::session).options(preflight))
+        .route("/v1/stream", get(stream::sse).options(preflight))
         .layer(DefaultBodyLimit::max(cap))
         .layer(axum::middleware::from_fn_with_state(st.clone(), cors))
         .with_state(st)
@@ -129,7 +153,7 @@ fn unauth_throttle(st: &AppState, headers: &HeaderMap) -> Option<u64> {
     ip.max(global)
 }
 
-fn unauthorized(st: &AppState, headers: &HeaderMap, id: &Value, msg: &str) -> Response {
+pub(crate) fn unauthorized(st: &AppState, headers: &HeaderMap, id: &Value, msg: &str) -> Response {
     if let Some(retry) = unauth_throttle(st, headers) {
         st.metrics.req("-", "-", "unauth_rate_limited");
         let mut r = reply(StatusCode::TOO_MANY_REQUESTS, rpc_err(id, -32005, "too many requests with a missing or invalid API key"));
@@ -195,7 +219,13 @@ async fn rpc(State(st): S, headers: HeaderMap, body: Bytes) -> Response {
         return r;
     }
 
-    // 4. forward
+    // 4. market-data methods (and fpl_fills when the store is configured)
+    let use_market = m.market || (m.name == "fpl_fills" && st.market.is_some());
+    if use_market {
+        return market_rpc(&st, t, m.name, &id, req.get("params").cloned().unwrap_or(Value::Null)).await;
+    }
+
+    // 5. forward to the node
     let Ok(_slot) = st.upstream_slots.try_acquire() else {
         st.metrics.req(t, m.name, "busy");
         return reply(StatusCode::SERVICE_UNAVAILABLE, rpc_err(&id, -32003, "gateway busy"));
@@ -218,7 +248,10 @@ async fn rpc(State(st): S, headers: HeaderMap, body: Bytes) -> Response {
                 return reply(StatusCode::OK, rpc_err(&id, -32000, msg));
             }
             st.metrics.req(t, m.name, "ok");
-            let result = v.get("body").cloned().or_else(|| v.get("msg").map(|m| json!({"msg": m}))).unwrap_or(v);
+            let mut result = v.get("body").cloned().or_else(|| v.get("msg").map(|m| json!({"msg": m}))).unwrap_or(v);
+            if m.name == "fpl_status" {
+                result = brief::slim_status(result);
+            }
             reply(StatusCode::OK, json!({"jsonrpc":"2.0","id":id,"result":result}))
         }
         Err(e) => {
@@ -339,3 +372,39 @@ async fn metrics(State(st): S) -> Response {
         .unwrap()
 }
 
+
+async fn market_rpc(st: &AppState, tier: &str, method: &str, id: &Value, params: Value) -> Response {
+    let Some(mkt) = st.market.as_ref() else {
+        st.metrics.req(tier, method, "upstream_error");
+        return reply(StatusCode::BAD_GATEWAY, rpc_err(id, -32002, "market data unavailable"));
+    };
+    let q = match market::query_for(method, &params) {
+        Ok(q) => q,
+        Err(MarketErr::BadParams(p)) => {
+            st.metrics.req(tier, method, "bad_params");
+            return reply(StatusCode::OK, rpc_err(id, -32602, &format!("invalid params: {p}")));
+        }
+        Err(_) => {
+            st.metrics.req(tier, method, "bad_params");
+            return reply(StatusCode::OK, rpc_err(id, -32602, "invalid params"));
+        }
+    };
+    let qref: Vec<(&str, String)> = q.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let started = Instant::now();
+    let res = mkt.get(market::path_for(method), &qref).await;
+    st.metrics.latency(method, started.elapsed().as_millis() as u64);
+    match res {
+        Ok(result) => {
+            st.metrics.req(tier, method, "ok");
+            reply(StatusCode::OK, json!({"jsonrpc":"2.0","id":id,"result":result}))
+        }
+        Err(MarketErr::BadParams(p)) => {
+            st.metrics.req(tier, method, "bad_params");
+            reply(StatusCode::OK, rpc_err(id, -32602, &format!("invalid params: {p}")))
+        }
+        Err(_) => {
+            st.metrics.req(tier, method, "upstream_error");
+            reply(StatusCode::BAD_GATEWAY, rpc_err(id, -32002, "market data unavailable"))
+        }
+    }
+}
