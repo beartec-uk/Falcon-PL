@@ -268,6 +268,16 @@ COORD_BACKOFF_SECS = _env_int("FPL_COORD_BACKOFF_SECS", 60)
 COORD_BACKOFF_MAX_SECS = _env_int("FPL_COORD_BACKOFF_MAX_SECS", 900)
 COORD_GRACE_SECS = _env_int("FPL_COORD_GRACE_SECS", 45)
 STALL_REALERT_SECS = _env_int("FPL_STALL_REALERT_SECS", 6 * 3600)
+# Incident 2026-11-25 (545a5ecf/8333b0b6/8e3688b7): a ceremony idle in awaiting_signature
+# (depositor's wallet closed) kept its memory reservation for 24 h, the 10G memcg could never
+# fit a second one, and two later deposits timed out in `funded` after 12 h. Now: the queue
+# is FIFO by funding time, an idle signature wait yields its slot to queued deposits after
+# FPL_SIGNATURE_YIELD_SECS (re-queued under a NEW request id, because seats never rejoin a
+# ceremony they already announced a key for), and a depositor that never signs expires
+# quietly (log only) instead of paging as a failure.
+SIGNATURE_YIELD_SECS = _env_int("FPL_SIGNATURE_YIELD_SECS", 2 * 3600)
+MAX_REQUEUES = _env_int("FPL_MAX_REQUEUES", 3)
+QUEUED_STATES = ("funded",)
 PROC = E("FPL_PROC", "/proc")
 COORD_BIN, PART_BIN = "fpl_ceremony_coordinator", "fpl_ceremony_participant"
 
@@ -293,6 +303,26 @@ DEFAULT_STAGE_TIMEOUTS = {
 
 def stage_timeout(state):
     return _env_int("FPL_STAGE_TIMEOUT_" + state.upper(), DEFAULT_STAGE_TIMEOUTS.get(state, 0))
+
+
+def ceremony_proc_timeout():
+    """--timeout-secs for coordinator/participant: outlives every ceremony stage timeout, so the
+    supervisor's stage timeout (clear reason) always fires before the processes exit on their
+    own (25-26 Nov: both used 86400 = the awaiting_signature limit, the participant exited 15 s
+    first and an unsigned deposit was reported as 'local ceremony signer died')."""
+    return sum(stage_timeout(s) for s in CEREMONY_STATES) + 3600
+
+
+def queue_key(r):
+    """FIFO order for ceremony slots: funding time, then id (was: id order = random)."""
+    return (int(r.get("queued_at") or r.get("state_since") or r.get("created") or 0), r["id"])
+
+
+def queued_ahead(r, reqs=None):
+    """Requests in `funded` that were queued before r."""
+    k = queue_key(r)
+    return [x for x in (all_reqs() if reqs is None else reqs)
+            if x["id"] != r["id"] and x.get("state") in QUEUED_STATES and queue_key(x) < k]
 
 
 def state_age(r, now):
@@ -564,14 +594,31 @@ def mem_available_mb():
     try:
         rel = [l.split("::", 1)[1].strip() for l in open("/proc/self/cgroup") if l.startswith("0::")][0]
         base = os.path.join(E("FPL_CGROUP_ROOT", "/sys/fs/cgroup"), rel.lstrip("/"))
-        mx = open(os.path.join(base, "memory.max")).read().strip()
-        if mx != "max":
-            cur = int(open(os.path.join(base, "memory.current")).read().strip())
-            cg = (int(mx) - cur) // (1 << 20)
+        cg = cgroup_free_mb(base)
+        if cg is not None:
             avail = cg if avail is None else min(avail, cg)
     except (OSError, IndexError, ValueError):
         pass
     return avail
+
+
+def cgroup_free_mb(base):
+    """memory.max - (memory.current - inactive_file) in MB, or None when unlimited. Inactive
+    page cache (graph files written by finished ceremonies) is reclaimed before the memcg
+    OOMs, so counting it as used starved the ceremony queue."""
+    mx = open(os.path.join(base, "memory.max")).read().strip()
+    if mx == "max":
+        return None
+    cur = int(open(os.path.join(base, "memory.current")).read().strip())
+    inactive = 0
+    try:
+        for line in open(os.path.join(base, "memory.stat")):
+            k, _, v = line.partition(" ")
+            if k == "inactive_file":
+                inactive = int(v)
+    except (OSError, ValueError):
+        pass
+    return (int(mx) - max(0, cur - inactive)) // (1 << 20)
 
 
 def ceremony_slot_free(exclude_dir=None):
@@ -602,7 +649,7 @@ def spawn_ceremony_coordinator(r, d, restart=False):
             os.replace(cache, cache + f".aside-{int(time.time())}")
     p = subprocess.Popen(coord_base(d) + ["--deposit-outpoint", r["funding"], "--deposit-amount", str(r["funding_sats"]),
                          "--evm-address", "fpl:" + r["account"], "--kickoff-outpoint", r["kickoff"],
-                         "--kickoff-amount", str(r["kickoff_sats"]), "--timeout-secs", "86400"],
+                         "--kickoff-amount", str(r["kickoff_sats"]), "--timeout-secs", str(ceremony_proc_timeout())],
                          stdout=lg, stderr=lg, start_new_session=True, cwd=d)
     lg.close()  # the child holds its own descriptor
     r["coord_pid"] = p.pid
@@ -659,7 +706,7 @@ def broadcast_seen(r):
     return False
 
 
-def fail_request(r, reason, kind, now, short=None):
+def fail_request(r, reason, kind, now, short=None, notify=True):
     """Mark failed (releases kickoff + funding reservation) only if nothing was broadcast
     AND the ceremony never produced fully signed graphs (final.json). Seats keep copies of
     final.json, so a presigned peg-in stays broadcastable; releasing its kickoff could let
@@ -678,6 +725,10 @@ def fail_request(r, reason, kind, now, short=None):
     killed = kill_ceremony_procs(gdir(r))
     r.update(state="failed", last_error=reason, failed_reason=kind, failed_at=int(now))
     r.pop("stalled", None)
+    if not notify:   # depositor-side expiry, not an ops failure: log only, no page
+        log("expired", r["id"], f"{reason}. Funds stay at the depositor address; kickoff "
+                                f"{(r.get('kickoff') or '-')[:16]} released; killed pids {killed}")
+        return True
     alert("failed", r, f"{reason}. Funds stay at the depositor address; kickoff "
                        f"{(r.get('kickoff') or '-')[:16]} released; killed pids {killed}", min_interval=0,
           short=f"❌ Peg-in {short_id(r)} failed: {short or reason}. Funds safe, kickoff released.")
@@ -707,6 +758,41 @@ def timeout_action(r, now):
     return ("fail" if s in PRE_BROADCAST_STATES else "stall", why)
 
 
+REQUEUABLE_FAIL_KINDS = ("stage_timeout_funded", "stage_timeout_waiting_operator_liquidity",
+                         "stage_timeout_ceremony_pubkeys", "participant_died", "depositor_signature_timeout",
+                         "stage_timeout_awaiting_signature", "coordinator_retries_exhausted")
+
+
+def requeue_request(r, reason, now, check_funding=False):
+    """Put a not-yet-signed deposit back at the end of the ceremony queue under a NEW request id
+    (seats never rejoin a ceremony id they already announced a key for). r becomes `expired`
+    (kickoff released, funding handed to the new request). Only when no fully signed graphs
+    exist and nothing was broadcast, so the depositor's coin is still only theirs.
+    Returns True if r changed (caller saves r)."""
+    d = gdir(r)
+    if os.path.exists(os.path.join(d, "final.json")):
+        return False
+    seen = broadcast_seen(r) if (r.get("deposit_txid") or r.get("peg_in_confirm_txid")) else False
+    if seen is not False:
+        return False
+    if check_funding:
+        txid, vout = r["funding"].rsplit(":", 1)
+        if not outpoint_unspent(txid, int(vout)) or r["funding"] in reserved_fundings(r["id"]):
+            return False
+    nid = secrets.token_hex(8)
+    while os.path.exists(path(nid)):
+        nid = secrets.token_hex(8)
+    n = {k: r[k] for k in ("account", "depositor_pubkey", "address", "funding", "funding_sats", "created") if k in r}
+    n.update(id=nid, state="funded", queued_at=int(now), requeued_from=r["id"],
+             requeues=int(r.get("requeues") or 0) + 1, last_error="re-queued: " + reason)
+    save(n)
+    killed = kill_ceremony_procs(d)
+    r.update(state="expired", last_error=f"re-queued as {nid}: {reason}", requeued_as=nid, failed_at=int(now))
+    r.pop("stalled", None)
+    log("requeue", r["id"], "->", nid, reason, "killed pids", killed)
+    return True
+
+
 def supervise(r, now=None):
     """Liveness + timeouts for one request (caller holds LOCK and saves on True)."""
     now = int(now or time.time())
@@ -715,9 +801,19 @@ def supervise(r, now=None):
     if ta:
         act, why = ta
         sp = stuck_phrase(s, state_age(r, now))
+        if act == "fail" and s == "awaiting_signature":
+            return fail_request(r, why + "; the depositor's wallet never signed (it signs only while "
+                                     "the wallet page is open)", "depositor_signature_timeout", now, notify=False)
         if act == "fail":
             return fail_request(r, why, "stage_timeout_" + s, now, short=sp)
         return mark_stalled(r, why, now, short=sp)
+
+    if s == "awaiting_signature" and SIGNATURE_YIELD_SECS and state_age(r, now) > SIGNATURE_YIELD_SECS \
+            and int(r.get("requeues") or 0) < MAX_REQUEUES and not os.path.exists(os.path.join(d, "final.json")):
+        waiting = [x for x in all_reqs() if x["id"] != r["id"] and x.get("state") in QUEUED_STATES]
+        if waiting and not ceremony_slot_free()[0]:
+            return requeue_request(r, f"yielded its ceremony slot to {len(waiting)} queued deposit(s): depositor "
+                                      f"has not signed for {human_age(state_age(r, now))}", now)
 
     if s in CEREMONY_STATES and not os.path.exists(os.path.join(d, "final.json")):
         if now - int(r.get("coord_spawned") or 0) < COORD_GRACE_SECS:
@@ -852,10 +948,11 @@ def step(r):
                 continue  # coin already bound to another request (shared per-pubkey address)
             if utxo_confirmed(u) and MIN_SATS + PEG_IN_FEE <= u["value"] <= MAX_SATS + PEG_IN_FEE \
                     and outpoint_unspent(u["txid"], u["vout"]):
-                r.update(state="funded", funding=f"{u['txid']}:{u['vout']}", funding_sats=u["value"]); return True
+                r.update(state="funded", funding=f"{u['txid']}:{u['vout']}", funding_sats=u["value"], queued_at=int(time.time())); return True
         return False
     if s in ("funded", "waiting_operator_liquidity"):
-        ok, why = ceremony_slot_free()
+        ahead = queued_ahead(r)
+        ok, why = (False, f"{len(ahead)} earlier deposit(s) queued first (FIFO)") if ahead else ceremony_slot_free()
         if not ok:
             reason = "waiting_ceremony_slot: " + why
             if r.get("last_error") != reason:
@@ -889,7 +986,7 @@ def step(r):
                           "--timeout-secs", "3600"], stdout=lg2, stderr=lg2, start_new_session=True, cwd=d)
         if E("FPL_LOCAL_SEAT"):
             lg3 = open(os.path.join(d, "participant.log"), "a")
-            subprocess.Popen([EX + "/fpl_ceremony_participant", "--dir", d, "--id", E("FPL_LOCAL_SEAT"), "--timeout-secs", "86400"],
+            subprocess.Popen([EX + "/fpl_ceremony_participant", "--dir", d, "--id", E("FPL_LOCAL_SEAT"), "--timeout-secs", str(ceremony_proc_timeout())],
                              stdout=lg3, stderr=lg3, start_new_session=True, cwd=d)
         r.update(state="ceremony_pubkeys", kickoff=ko, kickoff_sats=kv)
         r.pop("last_error", None)
@@ -1154,6 +1251,20 @@ if __name__ == "__main__":
         for row in plan(all_reqs()):
             print(json.dumps(row))
         sys.exit(0)
+    if "--requeue" in sys.argv[1:]:
+        # Recovery: re-queue failed, never-signed, never-broadcast deposits whose coin is still
+        # unspent at the depositor address. Safe while the service runs (terminal records only).
+        rc = 0
+        for rid in sys.argv[sys.argv.index("--requeue") + 1:]:
+            with LOCK:
+                r = load(rid)
+                if r["state"] != "failed" or r.get("failed_reason") not in REQUEUABLE_FAIL_KINDS:
+                    print(rid, "not requeued: state", r["state"], r.get("failed_reason")); rc = 1; continue
+                if requeue_request(r, "operator re-queue after " + r["failed_reason"], time.time(), check_funding=True):
+                    save(r); print(rid, "->", r["requeued_as"])
+                else:
+                    print(rid, "not requeued: signed graphs / broadcast / coin spent or bound"); rc = 1
+        sys.exit(rc)
     OP_ADDR, PEG_IN_FEE, PEG_OUT_FEE = funding_info()
     log("intake", NET, "operator funding", OP_ADDR, "seats", SEATS)
     threading.Thread(target=worker, daemon=True).start()

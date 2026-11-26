@@ -288,7 +288,8 @@ class StageTimeouts(Base):
                 I.worker_pass()
                 f = self.load(rid)
                 self.assertEqual(f["state"], "failed")
-                self.assertEqual(f["failed_reason"], "stage_timeout_" + s)
+                want = "depositor_signature_timeout" if s == "awaiting_signature" else "stage_timeout_" + s
+                self.assertEqual(f["failed_reason"], want)
                 self.assertIn("stage timeout", f["last_error"])
                 self.assertNotIn(r["kickoff"], I.reserved_kickoffs())
                 self.assertEqual(I.ceremony_procs(I.gdir(r)), [])
@@ -438,6 +439,117 @@ class ReviewFixes(Base):
         I.worker_pass()
         self.assertEqual(self.load(g["id"])["failed_reason"], "coordinator_died_mid_signing")
         self.assertEqual(self.load(x["id"])["failed_reason"], "coordinator_retries_exhausted")
+
+class QueueIncident20261125(Base):
+    """25-26 Nov: 545a5ecf sat 24 h in awaiting_signature (wallet closed) holding the memory
+    reservation; 8333b0b6 and 8e3688b7 timed out in `funded`; 545a5ecf was then reported as
+    'local ceremony signer died' because the participant's own 24 h timeout fired first."""
+
+    def test_fifo_by_funding_time_not_id(self):
+        I = self.I
+        now = int(time.time())
+        late = self.req("0000000000000001", "funded", kickoff=None, kickoff_sats=None, queued_at=now - 10)
+        early = self.req("ffff000000000001", "funded", kickoff=None, kickoff_sats=None, queued_at=now - 100)
+        kos = iter([(f"k{i}:0", 15000000) for i in range(10)])
+        with mock.patch.object(I, "pick_kickoff", lambda need: next(kos)), \
+                mock.patch.object(I.subprocess, "Popen", lambda *a, **k: mock.Mock(pid=1)), \
+                mock.patch.object(I, "MAX_CEREMONIES", 1), \
+                mock.patch.object(I, "PEG_IN_FEE", 590), mock.patch.object(I, "PEG_OUT_FEE", 1000):
+            I.worker_pass(); I.worker_pass()
+        self.assertEqual(self.load(early["id"])["state"], "ceremony_pubkeys")
+        f = self.load(late["id"])
+        self.assertEqual(f["state"], "funded")
+        self.assertIn("waiting_ceremony_slot", f["last_error"])
+
+    def test_idle_signature_wait_yields_slot_under_new_id(self):
+        I = self.I
+        a = self.req("545a000000000001", "awaiting_signature", age=I.SIGNATURE_YIELD_SECS + 60,
+                     coord_spawned=int(time.time()), deposit_txid=None, peg_in_confirm_txid=None)
+        pc = self.proc.add([I.EX + "/fpl_ceremony_coordinator", "--dir", I.gdir(a)], rss_mb=100)
+        self.participant(a)
+        q = self.req("8333000000000001", "funded", age=600, kickoff=None, kickoff_sats=None, funding="bb" * 32 + ":0")
+        self.mem = 9000          # the idle ceremony's ramp reservation blocks a second one
+        with mock.patch.object(I, "pick_kickoff", lambda need: ("kq:0", 15000000)), \
+                mock.patch.object(I.subprocess, "Popen", lambda *a, **k: mock.Mock(pid=1)), \
+                mock.patch.object(I, "PEG_IN_FEE", 590), mock.patch.object(I, "PEG_OUT_FEE", 1000):
+            I.worker_pass()
+        old = self.load(a["id"])
+        self.assertEqual(old["state"], "expired")
+        self.assertNotIn(a["kickoff"], I.reserved_kickoffs())
+        self.assertEqual(I.ceremony_procs(I.gdir(a)), [])
+        new = self.load(old["requeued_as"])
+        self.assertEqual(new["state"], "funded")
+        self.assertEqual((new["funding"], new["account"], new["requeues"]), (a["funding"], a["account"], 1))
+        self.assertFalse(new.get("kickoff"))
+        self.assertGreater(I.queue_key(new), I.queue_key(self.load(q["id"])))   # back of the queue
+        self.assertEqual(self.load(q["id"])["state"], "ceremony_pubkeys")      # queued deposit got the slot
+        self.assertEqual(self.alerts, [])                                      # no page
+        self.assertNotIn(pc, [p for p, _, _ in I.ceremony_procs()])
+
+    def test_no_yield_when_nothing_queued(self):
+        I = self.I
+        a = self.req("545a000000000002", "awaiting_signature", age=I.SIGNATURE_YIELD_SECS + 60,
+                     coord_spawned=int(time.time()))
+        self.coord(a); self.participant(a)
+        I.worker_pass()
+        self.assertEqual(self.load(a["id"])["state"], "awaiting_signature")
+
+    def test_no_yield_after_max_requeues(self):
+        I = self.I
+        a = self.req("545a000000000003", "awaiting_signature", age=I.SIGNATURE_YIELD_SECS + 60,
+                     coord_spawned=int(time.time()), requeues=I.MAX_REQUEUES)
+        self.coord(a); self.coord(self.req("0a00000000000001", "signed")); self.participant(a)
+        self.req("8333000000000002", "funded", kickoff=None, kickoff_sats=None)
+        with mock.patch.object(I, "pick_kickoff", lambda need: (None, 0)):
+            I.worker_pass()
+        self.assertEqual(self.load(a["id"])["state"], "awaiting_signature")
+
+    def test_signature_timeout_is_quiet_and_precedes_process_exit(self):
+        I = self.I
+        self.assertGreater(I.ceremony_proc_timeout(), I.stage_timeout("awaiting_signature"))
+        a = self.req("545a000000000004", "awaiting_signature", age=I.stage_timeout("awaiting_signature") + 30,
+                     coord_spawned=1)
+        I.worker_pass()    # participant already gone too: still reported as the signature timeout
+        f = self.load(a["id"])
+        self.assertEqual((f["state"], f["failed_reason"]), ("failed", "depositor_signature_timeout"))
+        self.assertEqual(self.alerts, [])
+
+    def test_requeue_failed_request_cli_path(self):
+        I = self.I
+        r = self.req("8e36000000000001", "failed", failed_reason="stage_timeout_funded", kickoff=None,
+                     deposit_txid=None, peg_in_confirm_txid=None)
+        with mock.patch.object(I, "outpoint_unspent", lambda t, v: True):
+            self.assertTrue(I.requeue_request(r, "test", time.time(), check_funding=True))
+        I.save(r)
+        self.assertEqual(self.load(r["id"])["state"], "expired")
+        self.assertEqual(self.load(r["requeued_as"])["state"], "funded")
+        # spent coin or one bound to a live request: refused
+        r2 = self.req("8e36000000000002", "failed", failed_reason="stage_timeout_funded", kickoff=None,
+                      deposit_txid=None, peg_in_confirm_txid=None, funding="cc" * 32 + ":1")
+        with mock.patch.object(I, "outpoint_unspent", lambda t, v: False):
+            self.assertFalse(I.requeue_request(r2, "test", time.time(), check_funding=True))
+        r3 = self.req("8e36000000000003", "failed", failed_reason="stage_timeout_funded", kickoff=None,
+                      deposit_txid=None, peg_in_confirm_txid=None)   # same coin as r's new request
+        with mock.patch.object(I, "outpoint_unspent", lambda t, v: True):
+            self.assertFalse(I.requeue_request(r3, "test", time.time(), check_funding=True))
+
+    def test_requeue_refused_when_signed_graphs_exist(self):
+        I = self.I
+        r = self.req("8e36000000000004", "failed", failed_reason="participant_died")
+        open(os.path.join(I.gdir(r), "final.json"), "w").write("{}")
+        self.assertFalse(I.requeue_request(r, "test", time.time()))
+
+    def test_cgroup_free_ignores_inactive_page_cache(self):
+        d = tempfile.mkdtemp()
+        for n, v in (("memory.max", str(10 << 30)), ("memory.current", str(6 << 30)),
+                     ("memory.stat", f"anon {1 << 30}\ninactive_file {5 << 30}\n")):
+            with open(os.path.join(d, n), "w") as fh:
+                fh.write(v)
+        self.assertEqual(self.I.cgroup_free_mb(d), 9 * 1024)
+        with open(os.path.join(d, "memory.max"), "w") as fh:
+            fh.write("max\n")
+        self.assertIsNone(self.I.cgroup_free_mb(d))
+
 
 class TxSeenEndpoint(unittest.TestCase):
     def test_uses_tx_endpoint_not_status(self):

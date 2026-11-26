@@ -15,8 +15,10 @@ User=root
 # the kernel still kills one coordinator (the supervisor then restarts or fails it, with
 # an alert) instead of stopping the whole unit. KillMode=process: an intake restart does
 # not kill in-flight ceremonies (they are re-adopted by /proc scan).
-MemoryHigh=9G
-MemoryMax=10G
+# 11G (was 10G): 2 x 4608 MB + 1024 MB headroom = 10240 MB, so with a 10G cap a second
+# ceremony could never pass the slot check (25 Nov incident). falcon1 has 16 GB.
+MemoryHigh=10G
+MemoryMax=11G
 OOMPolicy=continue
 KillMode=process
 [Install]
