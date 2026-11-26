@@ -269,8 +269,8 @@
 //!   finalized slot 11296672 / period 1378 because Gloas LC headers carry only
 //!   `execution_block_hash` (EIP-7732) and BeaconState gindices moved
 //!   (EIP-7688). Consensus change gated by
-//!   [`TESTNET_2300_ETH_LC_GLOAS_FROM_HEIGHT`] (TODO: placeholder `u64::MAX`
-//!   until rollout): from that height `EthLcUpdate`/`EthLcBootstrap` verify
+//!   [`TESTNET_2300_ETH_LC_GLOAS_FROM_HEIGHT`] (live from height 409134):
+//!   from that height `EthLcUpdate`/`EthLcBootstrap` verify
 //!   both header formats with per-slot gindices and the spec signature fork
 //!   slot, and the hash-only LC head takes its number/receipts root from the
 //!   stored RLP-verified execution header with that hash. Below it, apply is
@@ -859,10 +859,8 @@ pub const TESTNET_2300_VOTE_ROUNDS_RESUME_AT: u64 = 375_000;
 /// `EthLcBootstrap` / `EthExecHeaders` apply exactly as in 2.9.59 (Gloas
 /// updates are rejected, which is today's stuck state).
 ///
-/// TODO(rollout): placeholder — `u64::MAX` means "never". Set to a real height
-/// **above the current tip + margin** (roll time for all seven seats + review)
-/// in the rollout commit, rebuild portable, then roll. Do not ship with the
-/// placeholder expecting the LC to move.
+/// Rolled out at height 409134 (all seats). Changing it now would fork the
+/// chain: seats that disagree on this height disagree on every LC tx after it.
 pub const TESTNET_2300_ETH_LC_GLOAS_FROM_HEIGHT: u64 = 409134;
 
 /// Network-constant ETH LC Gloas activation height (`u64::MAX` = off).
@@ -26006,6 +26004,8 @@ mod btc4_most_work_tests;
 mod btc4_lend_scale_tests;
 #[cfg(test)]
 mod orderbook_tests;
+#[cfg(test)]
+mod swap_route_tests;
 
 #[cfg(test)]
 mod bitvm2_tree_capacity_tests;

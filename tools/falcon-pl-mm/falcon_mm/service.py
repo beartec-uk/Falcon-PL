@@ -93,6 +93,30 @@ class Engine:
             "paused": False,
             "cap_blocked": False,
         }
+        if pair.enabled and pair.cancel_all_requested(self.cfg.cancel_all_file):
+            # Kill switch beats pause: pull every resting order, place / rebalance nothing.
+            env = pair_to_mm_env(self.cfg, pair)
+            io = self.io_factory(env)
+            mm_state = state.setdefault("mm", {}).setdefault(pair.pair, {})
+            try:
+                res = mm.cancel_all_tick(env, io, mm_state)
+            except Exception as e:
+                res = {"remaining": None, "cancelled": 0, "busy": 0, "error": f"cancel-all failed: {type(e).__name__}"}
+            summ["paused"] = True
+            summ["cancel_all"] = res
+            summ["error"] = res.get("error")
+            print(
+                f"falcon-mm [{self.cfg.mode}] {pair.pair} CANCEL-ALL remaining={res.get('remaining')} "
+                f"cancelled={res.get('cancelled')} waiting={res.get('busy')}",
+                flush=True,
+            )
+            if res.get("remaining") == 0 and not res.get("error"):
+                self._alert(
+                    f"cancel-all:{pair.pair}",
+                    f"falcon-mm [{self.cfg.mode}] {pair.pair} cancel-all done: no open orders left",
+                    now=now,
+                )
+            return summ
         if not pair.enabled or pair.is_paused():
             summ["paused"] = True
             return summ

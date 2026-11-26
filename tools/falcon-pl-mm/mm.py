@@ -401,6 +401,46 @@ def tick(cfg, io, state):
     return summ
 
 
+def cancel_all_tick(cfg, io, state):
+    """Kill switch: cancel every open order on PAIR for every wallet, one per wallet per tick
+    (each cancel needs the wallet's sequence to move before the next). Places nothing.
+    Returns {"remaining", "cancelled", "busy", "error"}; remaining == 0 means the book is clear."""
+    wallets = [w.strip() for w in cfg["WALLETS"].split(",") if w.strip()]
+    pend_max = int(cfg.get("PENDING_MAX_TICKS", "5"))
+    pend = state.setdefault("pending", {})
+    out = {"remaining": 0, "cancelled": 0, "busy": 0, "error": None}
+    for w in wallets:
+        try:
+            bal = retry(lambda w=w: io.account(w), tries=2, io=io)
+            os_ = retry(lambda w=w: io.open_orders(w), tries=2, io=io)
+        except Exception as e:
+            out["error"] = f"read failed: {type(e).__name__}"
+            out["remaining"] += 1  # unknown: never report clear on a failed read
+            continue
+        out["remaining"] += len(os_)
+        p = pend.get(w)
+        if p is not None:
+            if bal[2] > p["seq"]:
+                del pend[w]
+            else:
+                p["ticks"] = p.get("ticks", 0) + 1
+                if p["ticks"] <= pend_max:
+                    out["busy"] += 1
+                    continue
+                print(f"NOT COMMITTED after {p['ticks']} ticks: {w} {p.get('what', '')}", flush=True)
+                del pend[w]
+        if not os_:
+            continue
+        oid = sorted(int(o["id"]) for o in os_)[0]
+        res = io.ctl_tx("cancel-order", "--who", w, "--order-id", str(oid))
+        if "accepted" in res:
+            pend[w] = {"seq": bal[2], "ticks": 0, "what": f"cancel-all {oid}"}
+            out["cancelled"] += 1
+        else:
+            print("cancel-all rejected", w, oid, short(res), flush=True)
+    return out
+
+
 def update_health(cfg, io, state, summ):
     path = cfg.get("HEALTH_FILE", "/var/lib/falcon-pl-mm/health.json")
     warn_ticks = int(cfg.get("EMPTY_WARN_TICKS", "3"))
@@ -452,8 +492,26 @@ def main():
     while True:
         cfg = load_env(path)
         if os.path.exists(cfg.get("MM_CANCEL_ALL", "/nonexistent")):
-            print("MM_CANCEL_ALL set: exit (cancel-all TODO)", flush=True)
-            return
+            # Kill switch: pull every resting order on this pair, then exit. Never places.
+            sp = cfg.get("STATE_FILE", "/var/lib/falcon-pl-mm/state.json")
+            state = load_json(sp, {})
+            res = cancel_all_tick(cfg, IO(cfg), state)
+            try:
+                save_json(sp, state)
+            except Exception as e:
+                print("state write failed", type(e).__name__, flush=True)
+            print(
+                f"MM_CANCEL_ALL remaining={res['remaining']} cancelled={res['cancelled']} "
+                f"waiting={res['busy']} error={res['error']}",
+                flush=True,
+            )
+            if res["remaining"] == 0 and not res["error"]:
+                print("MM_CANCEL_ALL: no open orders left, exiting", flush=True)
+                return
+            if cfg.get("ONCE") == "1":
+                return
+            time.sleep(float(cfg.get("TICK_S", "20")))
+            continue
         if os.path.exists(cfg.get("MM_PAUSE", "/nonexistent")):
             time.sleep(10)
             continue
