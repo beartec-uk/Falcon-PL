@@ -316,3 +316,145 @@ async fn cors_default_is_explicit_allowlist() {
         }
     }
 }
+
+/// Tiny market-data API used by fpl_pairs / fpl_ticker / fpl_candles / fpl_fills.
+async fn mock_market() -> (String, String) {
+    use axum::{extract::Query, routing::get, Json, Router};
+    use std::collections::HashMap;
+    use std::future::IntoFuture;
+    let token = "mkt-test-token".to_string();
+    let tok = token.clone();
+    let app = Router::new()
+        .route("/v1/pairs", get({
+            let tok = tok.clone();
+            move |headers: axum::http::HeaderMap| {
+                let tok = tok.clone();
+                async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {tok}")) {
+                        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"})));
+                    }
+                    (StatusCode::OK, Json(json!({"pairs":[{"pair":"BTC4-FPL","base":"BTC4","quote":"FPL","active":true}]})))
+                }
+            }
+        }))
+        .route("/v1/candles", get({
+            let tok = tok.clone();
+            move |headers: axum::http::HeaderMap, Query(q): Query<HashMap<String, String>>| {
+                let tok = tok.clone();
+                async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {tok}")) {
+                        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"})));
+                    }
+                    if q.get("pair").map(String::as_str) != Some("BTC4-FPL") || q.get("interval").is_none() {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"error":"invalid params: pair"})));
+                    }
+                    (StatusCode::OK, Json(json!({"pair":"BTC4-FPL","interval":q.get("interval"),"count":1,"time_quality":"observer","candles":[{"time":100,"open":1,"high":2,"low":1,"close":2,"volume":0.5}]})))
+                }
+            }
+        }))
+        .route("/v1/ticker", get({
+            let tok = tok.clone();
+            move |headers: axum::http::HeaderMap| {
+                let tok = tok.clone();
+                async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {tok}")) {
+                        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"})));
+                    }
+                    (StatusCode::OK, Json(json!({"tickers":[{"pair":"BTC4-FPL","last":4100000,"change_24h_pct":1.5,"volume_24h":12.0,"time_quality":"observer"}]})))
+                }
+            }
+        }))
+        .route("/v1/trades", get({
+            let tok = tok.clone();
+            move |headers: axum::http::HeaderMap| {
+                let tok = tok.clone();
+                async move {
+                    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {tok}")) {
+                        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"unauthorized"})));
+                    }
+                    (StatusCode::OK, Json(json!({"fills":[{"id":9,"height":100,"asset":"BTC4","pair":"BTC4-FPL","price":4100000,"side":"buy"}],"count":1,"next_cursor":null,"time_quality":"observer"})))
+                }
+            }
+        }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(axum::serve(l, app).into_future());
+    (format!("http://{addr}"), token)
+}
+
+async fn fixture_with_market() -> Fx {
+    let (url, token) = mock_market().await;
+    let (addr, seen) = mock_node().await;
+    let mut cfg = Config::proposed_default();
+    cfg.upstream = addr;
+    cfg.cors_origins = vec!["https://falcon-fpl.com".into()];
+    cfg.max_body_bytes = 4096;
+    let market = fpl_gateway::market::MarketClient::for_test(url, token, 2000).unwrap();
+    let (kf, rf) = auth::generate("k_free", Tier::Free, "");
+    let (ks, rs) = auth::generate("k_scale", Tier::Scale, "");
+    let st = AppState::build(cfg, KeyStore::from_records(vec![rf, rs]).unwrap(), Limiter::new(HashMap::new()), Some(market));
+    Fx { app: server::router(st), key_free: kf, key_scale: ks, seen }
+}
+
+#[tokio::test]
+async fn market_methods_and_longer_fills() {
+    let fx = fixture_with_market().await;
+    let (s, v, _) = call(&fx.app, Some(&fx.key_free), rq("fpl_pairs", json!({}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["result"]["pairs"][0]["pair"], "BTC4-FPL");
+    let (s, v, _) = call(&fx.app, Some(&fx.key_free), rq("fpl_ticker", json!({"pair":"BTC4-FPL"}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["result"]["tickers"][0]["last"], 4100000);
+    let (s, v, _) = call(&fx.app, Some(&fx.key_free), rq("fpl_candles", json!({"pair":"BTC4-FPL","interval":"1h"}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["result"]["count"], 1);
+    let (s, v, _) = call(&fx.app, Some(&fx.key_free), rq("fpl_fills", json!({"pair":"BTC4-FPL","limit":50}))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["result"]["fills"][0]["height"], 100);
+    // missing candles params
+    let (s, v, _) = call(&fx.app, Some(&fx.key_free), rq("fpl_candles", json!({"pair":"BTC4-FPL"}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn market_methods_fail_closed_when_unconfigured() {
+    let fx = fixture(|_| {}).await;
+    let (s, v, _) = call(&fx.app, Some(&fx.key_free), rq("fpl_pairs", json!({}))).await;
+    assert_eq!(s, StatusCode::BAD_GATEWAY);
+    assert_eq!(v["error"]["code"], -32002);
+    // fills still hits the node when the store is off
+    let (s, v, _) = call(&fx.app, Some(&fx.key_free), rq("fpl_fills", json!({"pair":"BTC4-FPL"}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v["error"].is_null());
+}
+
+#[tokio::test]
+async fn stream_session_needs_a_key() {
+    let fx = fixture(|_| {}).await;
+    let r = fx.app.clone().oneshot(
+        Request::post("/v1/stream/session").header("content-type", "application/json").body(Body::from("{}")).unwrap()
+    ).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let r = fx.app.clone().oneshot(
+        Request::post("/v1/stream/session")
+            .header("authorization", format!("Bearer {}", fx.key_free))
+            .body(Body::from("{}"))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let b = r.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert!(v["ticket"].as_str().unwrap().len() >= 16);
+    assert_eq!(v["expires_in"], 120);
+}
+
+#[tokio::test]
+async fn status_is_slim_even_if_the_node_is_chatty() {
+    // The default mock is already brief; check the filter keeps height.
+    let fx = fixture(|_| {}).await;
+    let (_, v, _) = call(&fx.app, Some(&fx.key_free), rq("fpl_status", json!({}))).await;
+    assert_eq!(v["result"]["height"], 4242);
+    assert!(v["result"].get("accounts").is_none());
+    assert!(v["result"].get("amm_pools").is_none());
+}

@@ -113,6 +113,9 @@ pub struct Config {
     /// Abuse limits for unauthenticated surfaces (health probe, bad/missing keys).
     #[serde(default)]
     pub abuse: AbuseLimits,
+    /// Optional fills-store market data API (candles, history, ticker, pairs).
+    #[serde(default)]
+    pub market_data: MarketConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -120,7 +123,7 @@ pub struct Config {
 pub struct PortalConfig {
     /// Master switch. false => only keys.json is used.
     pub enabled: bool,
-    /// Portal export endpoint, e.g. https://www.beartec.uk/api/falcon-cloud/internal/keys
+    /// Portal export endpoint, e.g. https://falcon-fpl.com/api/falcon-cloud/internal/keys
     pub url: String,
     /// Name of the env var holding the shared bearer token (never the token itself).
     pub token_env: String,
@@ -132,6 +135,23 @@ pub struct PortalConfig {
 impl Default for PortalConfig {
     fn default() -> Self {
         Self { enabled: false, url: String::new(), token_env: "FPL_GATEWAY_PORTAL_TOKEN".into(), interval_secs: 60, timeout_ms: 5_000 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MarketConfig {
+    pub enabled: bool,
+    /// Base URL of the fills-store market API, e.g. http://100.96.215.37:8787
+    pub url: String,
+    /// Name of the env var holding the shared bearer token (never the token itself).
+    pub token_env: String,
+    pub timeout_ms: u64,
+}
+
+impl Default for MarketConfig {
+    fn default() -> Self {
+        Self { enabled: false, url: String::new(), token_env: "FPL_GATEWAY_MARKET_TOKEN".into(), timeout_ms: 5_000 }
     }
 }
 
@@ -198,6 +218,15 @@ impl Config {
             anyhow::ensure!(self.portal.url.starts_with("https://") || self.portal.url.starts_with("http://127.0.0.1") || self.portal.url.starts_with("http://localhost"), "portal.url must be https (or loopback http)");
             anyhow::ensure!(self.portal.interval_secs >= 10, "portal.interval_secs must be >= 10");
         }
+        if self.market_data.enabled {
+            let u = &self.market_data.url;
+            let ok = u.starts_with("https://")
+                || u.starts_with("http://127.0.0.1")
+                || u.starts_with("http://localhost")
+                || u.starts_with("http://100."); // Tailscale CGNAT
+            anyhow::ensure!(ok, "market_data.url must be https, loopback http, or a Tailscale http://100. address");
+            anyhow::ensure!(self.market_data.timeout_ms >= 100, "market_data.timeout_ms must be >= 100");
+        }
         if self.cors_origins.iter().any(|o| o == "*") {
             tracing::warn!("cors_origins contains \"*\": any website can call this gateway from a browser");
         }
@@ -230,6 +259,7 @@ impl Config {
             billing: BillingConfig::default(),
             portal: PortalConfig::default(),
             abuse: AbuseLimits::default(),
+            market_data: MarketConfig::default(),
         }
     }
 }

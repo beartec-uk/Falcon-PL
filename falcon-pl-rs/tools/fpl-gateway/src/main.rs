@@ -52,6 +52,9 @@ async fn serve(path: PathBuf) -> anyhow::Result<()> {
     let limiter = Limiter::new(Limiter::load_usage(&cfg.usage_path));
     tracing::info!(keys = keys.len(), upstream = %cfg.upstream, "fpl-gateway starting (testnet)");
     let st = server::AppState::new(cfg.clone(), keys, limiter);
+    if cfg.market_data.enabled && st.market.is_none() {
+        anyhow::bail!("market_data.enabled but the client did not start (check env {})", cfg.market_data.token_env);
+    }
 
     let pub_l = tokio::net::TcpListener::bind(&cfg.listen).await?;
     let met_l = tokio::net::TcpListener::bind(&cfg.metrics_listen).await?;

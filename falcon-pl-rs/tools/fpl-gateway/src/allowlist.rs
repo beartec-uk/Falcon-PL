@@ -13,6 +13,8 @@ pub struct Method {
     /// Cost against the monthly quota.
     pub cost: u64,
     pub is_tx_submit: bool,
+    /// Served from the fills-store market API rather than the node.
+    pub market: bool,
     /// Node reply `type`s that answer this method (besides `err`). fd-pl
     /// v2.10.4 answers all three order-book queries with `order_book`
     /// (verified live 2026-11-04); `open_orders` / `fills` are accepted too in
@@ -21,13 +23,16 @@ pub struct Method {
 }
 
 pub const METHODS: &[Method] = &[
-    Method { name: "fpl_status", wire_type: "status_req", cost: 1, is_tx_submit: false, reply_types: &["status"] },
-    Method { name: "fpl_health", wire_type: "health_req", cost: 1, is_tx_submit: false, reply_types: &["health"] },
-    Method { name: "fpl_getAccount", wire_type: "account_query", cost: 1, is_tx_submit: false, reply_types: &["account"] },
-    Method { name: "fpl_orderBook", wire_type: "order_book_query", cost: 1, is_tx_submit: false, reply_types: &["order_book"] },
-    Method { name: "fpl_openOrders", wire_type: "open_orders_query", cost: 1, is_tx_submit: false, reply_types: &["order_book", "open_orders"] },
-    Method { name: "fpl_fills", wire_type: "fills_query", cost: 1, is_tx_submit: false, reply_types: &["order_book", "fills"] },
-    Method { name: "fpl_submitTx", wire_type: "submit_tx", cost: 5, is_tx_submit: true, reply_types: &["ok"] },
+    Method { name: "fpl_status", wire_type: "status_req", cost: 1, is_tx_submit: false, market: false, reply_types: &["status"] },
+    Method { name: "fpl_health", wire_type: "health_req", cost: 1, is_tx_submit: false, market: false, reply_types: &["health"] },
+    Method { name: "fpl_getAccount", wire_type: "account_query", cost: 1, is_tx_submit: false, market: false, reply_types: &["account"] },
+    Method { name: "fpl_orderBook", wire_type: "order_book_query", cost: 1, is_tx_submit: false, market: false, reply_types: &["order_book"] },
+    Method { name: "fpl_openOrders", wire_type: "open_orders_query", cost: 1, is_tx_submit: false, market: false, reply_types: &["order_book", "open_orders"] },
+    Method { name: "fpl_fills", wire_type: "fills_query", cost: 1, is_tx_submit: false, market: false, reply_types: &["order_book", "fills"] },
+    Method { name: "fpl_submitTx", wire_type: "submit_tx", cost: 5, is_tx_submit: true, market: false, reply_types: &["ok"] },
+    Method { name: "fpl_pairs", wire_type: "pairs_query", cost: 1, is_tx_submit: false, market: true, reply_types: &["market"] },
+    Method { name: "fpl_ticker", wire_type: "ticker_query", cost: 1, is_tx_submit: false, market: true, reply_types: &["market"] },
+    Method { name: "fpl_candles", wire_type: "candles_query", cost: 1, is_tx_submit: false, market: true, reply_types: &["market"] },
 ];
 
 /// Wire types the gateway must never send (mirrors `WireMsg::is_admin` plus
@@ -97,8 +102,37 @@ pub fn build_wire(m: &Method, params: Option<&Value>) -> Result<Value, BuildErr>
                     }
                 }
             }
-            let l = obj.get("limit").and_then(Value::as_u64).unwrap_or(50).min(200);
+            let max = if m.market { 500 } else { 200 };
+            let l = obj.get("limit").and_then(Value::as_u64).unwrap_or(50).min(max);
             out.insert("limit".into(), l.into());
+            for k in ["from", "to", "cursor"] {
+                if let Some(v) = obj.get(k) {
+                    if !v.is_null() { out.insert(k.into(), v.clone()); }
+                }
+            }
+        }
+        "pairs_query" => {}
+        "ticker_query" => {
+            if let Some(v) = obj.get("pair") {
+                if !v.is_null() {
+                    s(&obj, "pair")?;
+                    out.insert("pair".into(), v.clone());
+                }
+            }
+        }
+        "candles_query" => {
+            s(&obj, "pair")?;
+            s(&obj, "interval")?;
+            out.insert("pair".into(), obj["pair"].clone());
+            out.insert("interval".into(), obj["interval"].clone());
+            for k in ["from", "to", "limit"] {
+                if let Some(v) = obj.get(k) {
+                    if !v.is_null() { out.insert(k.into(), v.clone()); }
+                }
+            }
+            if let Some(l) = obj.get("limit").and_then(Value::as_u64) {
+                out.insert("limit".into(), l.min(500).into());
+            }
         }
         "submit_tx" => match obj.get("tx") {
             Some(Value::Object(_)) => {
