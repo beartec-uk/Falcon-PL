@@ -1,0 +1,19 @@
+[Unit]
+Description=Falcon testnet unified market-maker (shadow/live)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=falcon-mm
+Group=falcon-mm
+WorkingDirectory=/opt/falcon-mm
+ExecStart=/usr/bin/python3 /opt/falcon-mm/falcon_mm.py /etc/falcon-mm/config.json
+Restart=always
+RestartSec=5
+# Do not put API keys or webhook URLs in this unit. Point at 0600 files in config.json.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

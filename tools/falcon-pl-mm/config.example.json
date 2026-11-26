@@ -1,0 +1,88 @@
+{
+  "mode": "shadow",
+  "ctl": "falcon-pl-ctl",
+  "rpc_addr": "127.0.0.1:19313",
+  "scheme": "falcon",
+  "keys_dir": "/var/lib/falcon-pl-mm/keys",
+  "network_id": "2300",
+  "cloud_rpc_url": "https://rpc.falcon-fpl.com/v1/rpc",
+  "cloud_api_key_file": "/etc/falcon-mm/cloud-api-key",
+  "discord_env_file": "/etc/falcon-mm/discord.env",
+  "state_dir": "/var/lib/falcon-mm",
+  "health_file": "/var/lib/falcon-mm/health.json",
+  "state_file": "/var/lib/falcon-mm/state.json",
+  "rebalance_enabled": true,
+  "wallet_transfer_first": true,
+  "amm_max_pool_frac": "0.02",
+  "tick_s": 20,
+  "alert_min_interval_s": 900,
+  "treasury_wallets": ["mmtreasury01"],
+  "pairs": {
+    "ETH-FPL": {
+      "enabled": true,
+      "paused": false,
+      "pause_file": "/etc/falcon-mm/pause.ETH-FPL",
+      "base_asset": "ETH",
+      "base_decimals": 18,
+      "maker_wallets": ["mmeth01", "mmeth02", "mmeth03", "mmeth04"],
+      "taker_wallets": ["mmtakereth01"],
+      "inventory_targets": {
+        "ETH": "1000000000000000000",
+        "FPL": "2000"
+      },
+      "daily_cap_base": "5000000000000000000",
+      "daily_cap_fpl": "20000",
+      "band_lo": "48000",
+      "band_hi": "52000",
+      "period_s": "21600",
+      "levels": "2",
+      "spacing_bps": "25",
+      "quote_min_fpl": "500",
+      "quote_max_fpl": "1000",
+      "bias": "0.5",
+      "cross_bps": "15"
+    },
+    "USDC-FPL": {
+      "enabled": true,
+      "pause_file": "/etc/falcon-mm/pause.USDC-FPL",
+      "base_asset": "USDC",
+      "base_decimals": 6,
+      "maker_wallets": ["mmusdc01", "mmusdc02", "mmusdc03", "mmusdc04"],
+      "taker_wallets": ["mmtakerusdc01"],
+      "inventory_targets": {
+        "USDC": "1000000000",
+        "FPL": "2000"
+      },
+      "daily_cap_base": "20000000000",
+      "daily_cap_fpl": "20000",
+      "band_lo": "70",
+      "band_hi": "90",
+      "period_s": "21600",
+      "levels": "2",
+      "spacing_bps": "25",
+      "quote_min_fpl": "500",
+      "quote_max_fpl": "1000"
+    },
+    "BTC4-FPL": {
+      "enabled": true,
+      "pause_file": "/etc/falcon-mm/pause.BTC4-FPL",
+      "base_asset": "BTC4",
+      "base_decimals": 8,
+      "maker_wallets": ["mm01", "mm02", "mm03", "mm04"],
+      "taker_wallets": ["mmtaker01"],
+      "inventory_targets": {
+        "BTC4": "10000000",
+        "FPL": "2000"
+      },
+      "daily_cap_base": "200000000",
+      "daily_cap_fpl": "20000",
+      "band_lo": "4000000",
+      "band_hi": "4500000",
+      "period_s": "21600",
+      "levels": "2",
+      "spacing_bps": "25",
+      "quote_min_fpl": "500",
+      "quote_max_fpl": "1000"
+    }
+  }
+}
