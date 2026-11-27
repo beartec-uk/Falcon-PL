@@ -4090,6 +4090,9 @@ pub struct Node {
     pub btc4_most_work_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::btc4_lend_scale_from_height`]; runtime only.
     pub btc4_lend_scale_from_height: u64,
+    /// Lend reward weighting at the live pool price:
+    /// [`crate::params_v2::lend_live_price_from_height`]; runtime only.
+    pub lend_live_price_from_height: u64,
     /// Fix B (2300: 904,000): [`crate::params_v2::bitvm2_leaf_prune_from_height`]; runtime only.
     pub bitvm2_leaf_prune_from_height: u64,
     /// v2.10.4 (TBD): [`crate::params_v2::orderbook_from_height`] (= the single
@@ -4232,6 +4235,7 @@ impl Node {
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
         let btc4_most_work_from_height = crate::params_v2::btc4_most_work_from_height(cfg.network_id);
         let btc4_lend_scale_from_height = crate::params_v2::btc4_lend_scale_from_height(cfg.network_id);
+        let lend_live_price_from_height = crate::params_v2::lend_live_price_from_height(cfg.network_id);
         let bitvm2_leaf_prune_from_height = crate::params_v2::bitvm2_leaf_prune_from_height(cfg.network_id);
         let orderbook_from_height = crate::params_v2::orderbook_from_height(cfg.network_id);
         let hello_min_release_from_height = crate::params_v2::hello_min_release_from_height(cfg.network_id);
@@ -4401,6 +4405,7 @@ impl Node {
             btc4_fork_slot_from_height,
             btc4_most_work_from_height,
             btc4_lend_scale_from_height,
+            lend_live_price_from_height,
             bitvm2_leaf_prune_from_height,
             orderbook_from_height,
             hello_min_release_from_height,
@@ -4782,6 +4787,29 @@ impl Node {
     /// v2.10.4: BTC4 lend markets pin 1e8 raw/coin for the ledger applied now.
     pub fn btc4_lend_scale_open(&self) -> bool {
         self.tip_height.saturating_add(1) >= self.btc4_lend_scale_from_height
+    }
+
+    /// Lend reward weighting uses the live pool price for the ledger applied now.
+    pub fn lend_live_price_open(&self) -> bool {
+        self.tip_height.saturating_add(1) >= self.lend_live_price_from_height
+    }
+
+    /// `(price, scale)` that values one lend market's supply for rewards:
+    /// FPL per `scale` raw units. Before [`Self::lend_live_price_open`] this
+    /// is the stored price at the market's stored scale (byte-identical to
+    /// the old settle). After it, the deepest FPL pool's spot at the scale
+    /// the borrow path uses (BTC4 rescale applied when open), or the stored
+    /// price when no pool exists.
+    fn lend_reward_price(&self, m: &crate::defi::LendingMarket) -> (u128, u128) {
+        if !self.lend_live_price_open() {
+            return (m.price_native_per_scale as u128, m.scale());
+        }
+        let r = self.lend_market_rescaled(m);
+        let scale = r.scale();
+        let px = self
+            .pool_price_fpl_scaled(&r.asset, scale)
+            .unwrap_or(r.price_native_per_scale);
+        (px as u128, scale)
     }
 
     /// Market with the v2.10.4 BTC4 scale pinned when active (pure; no write).
@@ -5261,11 +5289,11 @@ impl Node {
             if m.share_supply == 0 {
                 continue;
             }
-            let scale = m.scale();
+            let (px, scale) = self.lend_reward_price(m);
             for (a, sh) in &m.supply_shares {
                 let h = held(format!("lend|{mid}|{a}"), *sh);
                 let amount = h as u128 * m.total_supply as u128 / m.share_supply as u128;
-                let v = (amount * m.price_native_per_scale as u128 / scale).min(u64::MAX as u128) as u64;
+                let v = (amount * px / scale).min(u64::MAX as u128) as u64;
                 if v > 0 {
                     *lend.entry(a.clone()).or_insert(0) = lend.get(a).copied().unwrap_or(0).saturating_add(v);
                 }
@@ -26002,6 +26030,8 @@ mod btc4_fork_fix_tests;
 mod btc4_most_work_tests;
 #[cfg(test)]
 mod btc4_lend_scale_tests;
+#[cfg(test)]
+mod lend_live_price_tests;
 #[cfg(test)]
 mod orderbook_tests;
 #[cfg(test)]
