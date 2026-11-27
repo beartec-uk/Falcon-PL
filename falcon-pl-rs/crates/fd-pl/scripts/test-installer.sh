@@ -262,4 +262,36 @@ AU_UPGRADE=upgrade_noop; rc="$(au_run)"
 export FALCON_AUTOUPGRADE_STALL_PROBE_SECS=0
 grep -q 'treating as a chain stall, not a bad binary' "$INSTALLER" || { echo "FAIL 7: stall log line missing" >&2; exit 1; }
 
-echo "PASS: all installer tests (Items #1, #8, #13, 2.10.1 autoupgrade default + adopt, 2.11.4 flat-tip stall) succeeded"
+# --- Test 8 (2.11.22): no-systemd (container) observers get auto-upgrade by default ---
+SERVICE_MODE=none NO_AUTOUPGRADE=0
+kv_set "$NODE_ENV" SERVICE_MODE none
+sed -i '/^AUTOUPGRADE/d' "$NODE_ENV"
+kv_set "$NODE_ENV" AUTOUPGRADE off   # what pre-2.11.22 installers wrote for no-systemd installs
+write_autoupgrade
+[[ -x "$BIN/falcon-node-autoupgrade-loop" ]] || { echo "FAIL: no-systemd autoupgrade loop not written" >&2; exit 1; }
+bash -n "$BIN/falcon-node-autoupgrade-loop"
+# Stub the hourly run; short timers so the loop fires within the test.
+printf '#!/usr/bin/env bash\necho ran >>"%s"\n' "$TMP/au-ran" >"$BIN/falcon-node-autoupgrade"; chmod 0755 "$BIN/falcon-node-autoupgrade"
+FALCON_AUTOUPGRADE_FIRST_SECS=0 FALCON_AUTOUPGRADE_EVERY_SECS=1 autoupgrade_apply_default >/dev/null
+[[ "$(kv_get "$NODE_ENV" AUTOUPGRADE)" == "on" ]] || { echo "FAIL: no-systemd re-install should turn old default-off on" >&2; exit 1; }
+LP="$(autoupgrade_loop_pid)" || { echo "FAIL: default-on must start the autoupgrade loop" >&2; exit 1; }
+autoupgrade_loop_start; [[ "$(autoupgrade_loop_pid)" == "$LP" ]] || { echo "FAIL: loop start not idempotent" >&2; exit 1; }
+for _ in $(seq 1 20); do [[ -s "$TMP/au-ran" ]] && break; sleep 0.5; done
+[[ -s "$TMP/au-ran" ]] || { echo "FAIL: autoupgrade loop never ran the upgrade" >&2; exit 1; }
+OUT8="$(AUTOUPGRADE_ACTION=status cmd_autoupgrade)"
+[[ "$OUT8" == *"autoupgrade: on (timer: loop running"* ]] || { echo "FAIL: status should show the loop (got: $OUT8)" >&2; exit 1; }
+NO_AUTOUPGRADE=1 autoupgrade_apply_default >/dev/null
+sleep 0.2
+kill -0 "$LP" 2>/dev/null && { echo "FAIL: --no-autoupgrade must stop the loop" >&2; exit 1; }
+[[ ! -f "$RUN/autoupgrade.pid" ]] || { echo "FAIL: loop pidfile left behind" >&2; exit 1; }
+NO_AUTOUPGRADE=0; autoupgrade_apply_default >/dev/null
+autoupgrade_loop_pid >/dev/null && { echo "FAIL: opted-out no-systemd node must not start the loop" >&2; exit 1; }
+# A loop whose node.env says off exits by itself (autoupgrade off from another shell).
+kv_set "$NODE_ENV" AUTOUPGRADE_OPTOUT 0; kv_set "$NODE_ENV" AUTOUPGRADE on
+FALCON_AUTOUPGRADE_FIRST_SECS=1 autoupgrade_loop_start; LP="$(autoupgrade_loop_pid)"
+kv_set "$NODE_ENV" AUTOUPGRADE off
+for _ in $(seq 1 20); do kill -0 "$LP" 2>/dev/null || break; sleep 0.25; done
+kill -0 "$LP" 2>/dev/null && { kill "$LP"; echo "FAIL: loop should exit when AUTOUPGRADE=off" >&2; exit 1; }
+rm -f "$RUN/autoupgrade.pid"
+
+echo "PASS: all installer tests (Items #1, #8, #13, 2.10.1 autoupgrade default + adopt, 2.11.4 flat-tip stall, 2.11.22 no-systemd autoupgrade) succeeded"
