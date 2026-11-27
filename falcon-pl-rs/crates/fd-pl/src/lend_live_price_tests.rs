@@ -41,9 +41,10 @@ fn lend_w(n: &Node) -> BTreeMap<String, u64> {
 }
 
 #[test]
-fn gate_is_off_on_2300_until_scott_picks_a_height() {
-    assert_eq!(crate::params_v2::TESTNET_2300_LEND_LIVE_PRICE_FROM_HEIGHT, u64::MAX);
-    assert_eq!(crate::params_v2::lend_live_price_from_height(NETWORK_ID_PUBLIC_TESTNET_2300), u64::MAX);
+fn gate_is_pinned_on_2300_at_the_approved_height() {
+    // Rollout commit: tip 1,011,322 (27 Nov 2026 02:38:02 GMT) + 10,000.
+    assert_eq!(crate::params_v2::TESTNET_2300_LEND_LIVE_PRICE_FROM_HEIGHT, 1_021_322);
+    assert_eq!(crate::params_v2::lend_live_price_from_height(NETWORK_ID_PUBLIC_TESTNET_2300), 1_021_322);
 }
 
 #[test]
@@ -117,4 +118,11 @@ fn deterministic_across_seats_and_calls() {
     let before = serde_json::to_string(&a.defi).unwrap();
     let _ = lend_w(&a);
     assert_eq!(serde_json::to_string(&a.defi).unwrap(), before, "weighting never writes state");
+}
+
+#[test]
+fn status_reports_the_activation_height_for_the_seat_roll_check() {
+    let n = node(1_021_322, u64::MAX);
+    let st = n.status_json();
+    assert_eq!(st["lend_live_price_from_height"], 1_021_322);
 }

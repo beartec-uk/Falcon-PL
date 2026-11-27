@@ -388,7 +388,7 @@ use thiserror::Error;
 
 pub const NETWORK_NAME: &str = "falcon-pl-private-v22";
 /// Product release line. One number on crate, status, Hello, and binaries.
-pub const PRODUCT_VERSION: &str = "2.11.20";
+pub const PRODUCT_VERSION: &str = "2.11.21";
 
 /// Version string a node puts in its Hello (`WireMsg::Hello::product_version`).
 ///
@@ -16548,6 +16548,8 @@ impl Node {
             "eth_exec_prune_floor": self.bridge.eth_exec_prune_floor,
             "eth_exec_window": crate::bridge::ETH_EXEC_HEADER_WINDOW,
             "eth_lc_gloas_from_height": self.eth_lc_gloas_from_height,
+            // Lend reward weighting at the live pool price (seat-roll check).
+            "lend_live_price_from_height": self.lend_live_price_from_height,
             "eth_v3_from_height": self.eth_v3_from_height,
             "rewards_v2_from_height": self.rewards_v2_from_height,
             "rewards_v2_epoch": self.rewards_v2_epoch,
@@ -18259,8 +18261,8 @@ mod tests {
 
     #[test]
     fn product_version_is_locked_to_crate() {
-        assert_eq!(PRODUCT_VERSION, "2.11.20");
-        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.20");
+        assert_eq!(PRODUCT_VERSION, "2.11.21");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "2.11.21");
         assert_eq!(NodeRole::from_exe_name("/opt/bin/falcon-pl-val"), Some(NodeRole::Val));
         assert_eq!(NodeRole::from_exe_name("falcon-pl-archive"), Some(NodeRole::Archive));
         assert_eq!(NodeRole::VAL_MAX_CHAIN, 128);

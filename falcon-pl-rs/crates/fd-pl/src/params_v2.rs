@@ -512,9 +512,11 @@ pub fn btc4_lend_scale_from_height(network_id: u32) -> u64 {
 /// own scale (BTC4: per 1e6 sats before the 2.10.4 rescale, per 1e8 after),
 /// falling back to the stored price when there is no FPL pool.
 ///
-/// `u64::MAX` = off. Picking a height needs Scott's OK; every committee seat
-/// must run a binary that knows the height before the tip reaches it.
-pub const TESTNET_2300_LEND_LIVE_PRICE_FROM_HEIGHT: u64 = u64::MAX;
+/// **H = 1,021,322** (approved by Scott 27 Nov 2026: tip 1,011,322 read from
+/// https://falcon-fpl.com/api/status at 02:38:02 GMT + 10,000). Every
+/// committee seat must run a binary that knows H before the tip reaches it;
+/// stop and cut a higher H if the tip reaches H - 500 = 1,020,822 first.
+pub const TESTNET_2300_LEND_LIVE_PRICE_FROM_HEIGHT: u64 = 1_021_322;
 
 /// Lend live-price activation. 2300: the constant above. Other networks:
 /// `FPL_LEND_LIVE_PRICE_FROM_HEIGHT`, else off.
