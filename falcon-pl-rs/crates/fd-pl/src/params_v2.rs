@@ -502,6 +502,31 @@ pub fn btc4_lend_scale_from_height(network_id: u32) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Lend reward weighting at the live pool price (consensus change).
+///
+/// Before this height the v2 settle values lend supply at the market's
+/// *stored* `price_native_per_scale`, which only moves on a borrow or
+/// `LendSetPrice`, so it can lag the pools by a lot (26 Nov: USDC stored 48
+/// vs ~85 FPL in the pool). From this height it uses the same deepest-pool
+/// spot the borrow/LTV checks use (`pool_price_fpl_scaled`), at the market's
+/// own scale (BTC4: per 1e6 sats before the 2.10.4 rescale, per 1e8 after),
+/// falling back to the stored price when there is no FPL pool.
+///
+/// **H = 1,021,322** (approved by Scott 27 Nov 2026: tip 1,011,322 read from
+/// https://falcon-fpl.com/api/status at 02:38:02 GMT + 10,000). Every
+/// committee seat must run a binary that knows H before the tip reaches it;
+/// stop and cut a higher H if the tip reaches H - 500 = 1,020,822 first.
+pub const TESTNET_2300_LEND_LIVE_PRICE_FROM_HEIGHT: u64 = 1_021_322;
+
+/// Lend live-price activation. 2300: the constant above. Other networks:
+/// `FPL_LEND_LIVE_PRICE_FROM_HEIGHT`, else off.
+pub fn lend_live_price_from_height(network_id: u32) -> u64 {
+    if network_id == NETWORK_ID_PUBLIC_TESTNET_2300 {
+        return TESTNET_2300_LEND_LIVE_PRICE_FROM_HEIGHT;
+    }
+    env_u64("FPL_LEND_LIVE_PRICE_FROM_HEIGHT").unwrap_or(u64::MAX)
+}
+
 /// Testnet 2300 height from which settled BitVM2 claim-tree leaves are pruned
 /// (fix B, 14 Nov 2026 claim tree full). **904,000**, chosen by Scott on
 /// 16 Nov 2026 (tip 891,771 at 03:36 GMT, ~1.3–1.4 days at 9–10 s/block).

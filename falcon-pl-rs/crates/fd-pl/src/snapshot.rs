@@ -566,6 +566,7 @@ impl Node {
         let btc4_fork_slot_from_height = crate::params_v2::btc4_fork_slot_from_height(cfg.network_id);
         let btc4_most_work_from_height = crate::params_v2::btc4_most_work_from_height(cfg.network_id);
         let btc4_lend_scale_from_height = crate::params_v2::btc4_lend_scale_from_height(cfg.network_id);
+        let lend_live_price_from_height = crate::params_v2::lend_live_price_from_height(cfg.network_id);
         let bitvm2_leaf_prune_from_height = crate::params_v2::bitvm2_leaf_prune_from_height(cfg.network_id);
         let orderbook_from_height = crate::params_v2::orderbook_from_height(cfg.network_id);
         let hello_min_release_from_height = crate::params_v2::hello_min_release_from_height(cfg.network_id);
@@ -744,6 +745,7 @@ impl Node {
             btc4_fork_slot_from_height,
             btc4_most_work_from_height,
             btc4_lend_scale_from_height,
+            lend_live_price_from_height,
             bitvm2_leaf_prune_from_height,
             orderbook_from_height,
             hello_min_release_from_height,
