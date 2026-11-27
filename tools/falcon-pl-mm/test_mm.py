@@ -197,5 +197,76 @@ class TestPairGenericDecimal(unittest.TestCase):
             os.unlink(path)
 
 
+class FakeBookIO:
+    """Wallet sequences + open orders; a cancel is included on the next read."""
+
+    def __init__(self, orders):
+        self.orders = {w: list(v) for w, v in orders.items()}
+        self.seq = {w: 1 for w in orders}
+        self.sent = []
+        self._pending = []
+
+    def _settle(self):
+        for w, oid in self._pending:
+            self.orders[w] = [o for o in self.orders[w] if int(o["id"]) != oid]
+            self.seq[w] += 1
+        self._pending = []
+
+    def account(self, w):
+        return (1000, 0, self.seq[w])
+
+    def open_orders(self, w):
+        return list(self.orders[w])
+
+    def ctl_tx(self, *a):
+        assert a[0] == "cancel-order", a  # cancel-all must never place
+        w, oid = a[2], int(a[4])
+        self.sent.append((w, oid))
+        self._pending.append((w, oid))
+        return "accepted"
+
+    def sleep(self, s):
+        pass
+
+
+class TestCancelAll(unittest.TestCase):
+    def test_cancels_every_order_one_per_wallet_per_tick_then_reports_clear(self):
+        io = FakeBookIO({
+            "mm1": [{"id": 5}, {"id": 3}],
+            "mm2": [{"id": 9}],
+            "mm3": [],
+        })
+        cfg = {"WALLETS": "mm1, mm2, mm3", "PAIR": "ETH-FPL"}
+        state = {}
+        r1 = mm.cancel_all_tick(cfg, io, state)
+        self.assertEqual(r1["remaining"], 3)
+        self.assertEqual(io.sent, [("mm1", 3), ("mm2", 9)])
+        io._settle()
+        r2 = mm.cancel_all_tick(cfg, io, state)
+        self.assertEqual(r2["remaining"], 1)
+        self.assertEqual(io.sent[-1], ("mm1", 5))
+        io._settle()
+        r3 = mm.cancel_all_tick(cfg, io, state)
+        self.assertEqual((r3["remaining"], r3["cancelled"], r3["error"]), (0, 0, None))
+        self.assertEqual(sorted(io.sent), [("mm1", 3), ("mm1", 5), ("mm2", 9)])
+
+    def test_waits_for_inclusion_before_next_cancel_and_never_reports_clear_on_read_error(self):
+        io = FakeBookIO({"mm1": [{"id": 1}, {"id": 2}]})
+        cfg = {"WALLETS": "mm1", "PAIR": "ETH-FPL"}
+        state = {}
+        mm.cancel_all_tick(cfg, io, state)
+        r = mm.cancel_all_tick(cfg, io, state)  # not included yet
+        self.assertEqual(r["busy"], 1)
+        self.assertEqual(io.sent, [("mm1", 1)])
+
+        class Broken(FakeBookIO):
+            def open_orders(self, w):
+                raise RuntimeError("rpc down")
+
+        r = mm.cancel_all_tick(cfg, Broken({"mm1": []}), {})
+        self.assertGreater(r["remaining"], 0)
+        self.assertIsNotNone(r["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

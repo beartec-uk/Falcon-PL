@@ -31,6 +31,8 @@ class PairConfig:
     enabled: bool = True
     paused: bool = False
     pause_file: str = ""
+    # Kill switch: while this file exists, cancel every open order on the pair and place nothing.
+    cancel_all_file: str = ""
     maker_wallets: list[str] = field(default_factory=list)
     taker_wallets: list[str] = field(default_factory=list)
     inventory_targets: dict[str, int] = field(default_factory=dict)
@@ -67,6 +69,9 @@ class PairConfig:
             return True
         return bool(self.pause_file and os.path.exists(self.pause_file))
 
+    def cancel_all_requested(self, global_file: str = "") -> bool:
+        return any(p and os.path.exists(p) for p in (self.cancel_all_file, global_file))
+
 
 @dataclass
 class MmConfig:
@@ -88,6 +93,8 @@ class MmConfig:
     cloud_rpc_url: str = "https://rpc.falcon-fpl.com/v1/rpc"
     cloud_api_key_file: str = ""
     read_source: str = "cloud"
+    # Kill switch for every pair (see PairConfig.cancel_all_file).
+    cancel_all_file: str = ""
     tick_s: float = 20.0
     alert_min_interval_s: int = 900
 
@@ -119,6 +126,7 @@ def _pair(name: str, raw: dict[str, Any]) -> PairConfig:
         enabled=str(raw.get("enabled", True)).lower() not in ("0", "false", "no"),
         paused=str(raw.get("paused", False)).lower() in ("1", "true", "yes"),
         pause_file=_s(raw.get("pause_file")),
+        cancel_all_file=_s(raw.get("cancel_all_file")),
         maker_wallets=[w.strip() for w in (raw.get("maker_wallets") or []) if str(w).strip()],
         taker_wallets=[w.strip() for w in (raw.get("taker_wallets") or []) if str(w).strip()],
         inventory_targets=targets,
@@ -172,6 +180,7 @@ def load_config(path: str) -> MmConfig:
         cloud_rpc_url=_s(raw.get("cloud_rpc_url"), "https://rpc.falcon-fpl.com/v1/rpc"),
         cloud_api_key_file=_s(raw.get("cloud_api_key_file")),
         read_source=_s(raw.get("read_source"), "cloud"),
+        cancel_all_file=_s(raw.get("cancel_all_file")),
         tick_s=float(raw.get("tick_s", 20)),
         alert_min_interval_s=int(raw.get("alert_min_interval_s", 900)),
     )

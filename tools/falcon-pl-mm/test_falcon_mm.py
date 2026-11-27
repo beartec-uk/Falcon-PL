@@ -239,5 +239,44 @@ class TestShadowEngine(unittest.TestCase):
             self.assertTrue(taker.get("ok"))
 
 
+class TestCancelAllEngine(unittest.TestCase):
+    def test_cancel_all_file_cancels_orders_and_places_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_cfg(tmp, mode="live")
+            cfg = load_config(path)
+            kill = os.path.join(tmp, "cancel-all")
+            cfg.cancel_all_file = kill
+            accounts = {
+                "mmeth01": (5000, 3 * 10 ** 18, 7),
+                "mmeth02": (5000, 0, 3),
+                "mmtakereth01": (8000, 10 ** 18, 2),
+            }
+            orders = {"mmeth01": [{"id": 4, "pair": "ETH-FPL"}, {"id": 2, "pair": "ETH-FPL"}], "mmeth02": [], "mmtakereth01": []}
+            ios = []
+
+            class OrdersIO(FakeIO):
+                def open_orders(self, w):
+                    return list(orders.get(w, []))
+
+            def factory(env):
+                io = OrdersIO(env, accounts=accounts)
+                ios.append(io)
+                return io
+
+            eng = Engine(cfg, io_factory=factory)
+            # Without the file: normal tick (no cancel_all key).
+            self.assertNotIn("cancel_all", eng.tick({})["pairs"]["ETH-FPL"])
+            open(kill, "w").close()
+            ios.clear()
+            state = {}
+            eth = eng.tick(state)["pairs"]["ETH-FPL"]
+            self.assertTrue(eth["paused"])
+            self.assertEqual(eth["cancel_all"]["remaining"], 2)
+            calls = [c for io in ios for c in io.ctl_calls]
+            self.assertEqual(calls, [("cancel-order", "--who", "mmeth01", "--order-id", "2")])
+            self.assertEqual(eth["placed"], [])
+            self.assertEqual(eth["transfers"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
